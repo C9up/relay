@@ -83,8 +83,14 @@ jobs:
         run: |
           local_v=$(node -p "require('./package.json').version")
           npm_err=$(mktemp)
-          npm_v=$(npm view --fetch-timeout=30000 @c9up/relay version 2>"$npm_err")
-          status=$?
+          # `if` form so `set -e` (bash -e) does not abort the step when
+          # `npm view` exits non-zero (e.g. E404 on a first publish) — a bare
+          # assignment would die before `status=$?` and skip the E404 path.
+          if npm_v=$(npm view --fetch-timeout=30000 @c9up/relay version 2>"$npm_err"); then
+            status=0
+          else
+            status=$?
+          fi
           err=$(cat "$npm_err"); rm -f "$npm_err"
           if [ "$status" -ne 0 ]; then
             if echo "$err" | grep -qE 'E404|404 Not Found'; then
