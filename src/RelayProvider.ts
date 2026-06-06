@@ -66,9 +66,12 @@ export default class RelayProvider {
 		// live in start/services.ts) are guaranteed to have been
 		// recorded by the time the customizer is applied to each route.
 		try {
-			const routerMod = (await import("@c9up/ream/services/router")) as {
-				default: ReamRouter;
-			};
+			// Variable specifier so tsc does not statically resolve the
+			// optional `@c9up/ream` peer at build time (keeps relay agnostic
+			// / standalone-buildable). The import returns the host router
+			// module only when relay actually runs inside Ream.
+			const routerSpecifier = "@c9up/ream/services/router";
+			const routerMod: { default: ReamRouter } = await import(routerSpecifier);
 			const relay = this.app.container.resolve<Relay>(Relay);
 			registerRelayRoutes(routerMod.default, relay);
 		} catch {
