@@ -1,19 +1,6 @@
+import type { AppContext, HttpContext, Request } from "@c9up/ream";
 import { Relay, type RelayConfig, type RelayRouteBuilder } from "./Relay.js";
 import { _setRelay } from "./services/main.js";
-
-interface RelayContainer {
-	singleton(token: unknown, factory: () => unknown): void;
-	resolve<T = unknown>(token: unknown): T;
-}
-
-interface RelayConfigStore {
-	get<T = unknown>(key: string): T | undefined;
-}
-
-export interface RelayAppContext {
-	container: RelayContainer;
-	config: RelayConfigStore;
-}
 
 /**
  * RelayProvider — registers the Relay singleton in the host container
@@ -21,9 +8,9 @@ export interface RelayAppContext {
  * `/__relay/subscribe`, `/__relay/unsubscribe`) when the host is Ream
  * (detected by importing `@c9up/ream/services/router`).
  *
- * The duck-typed `RelayAppContext` keeps this provider usable in any
- * framework that exposes a Container — non-Ream hosts get the
- * singleton bindings and skip the route registration silently.
+ * Typed against the framework's real `AppContext` (`import type`, erased at
+ * runtime) — `@c9up/ream` stays an optional runtime peer, so non-Ream hosts
+ * get the singleton bindings and skip the route registration silently.
  *
  * @example
  *   // reamrc.ts
@@ -37,7 +24,7 @@ export interface RelayAppContext {
  *   )
  */
 export default class RelayProvider {
-	constructor(protected app: RelayAppContext) {}
+	constructor(protected app: AppContext) {}
 
 	register(): void {
 		this.app.container.singleton(Relay, () => {
@@ -71,7 +58,8 @@ export default class RelayProvider {
 			// / standalone-buildable). The import returns the host router
 			// module only when relay actually runs inside Ream.
 			const routerSpecifier = "@c9up/ream/services/router";
-			const routerMod: { default: ReamRouter } = await import(routerSpecifier);
+			const routerMod: { default: RelayHostRouter } =
+				await import(routerSpecifier);
 			const relay = this.app.container.resolve<Relay>(Relay);
 			registerRelayRoutes(routerMod.default, relay);
 		} catch {
@@ -84,44 +72,24 @@ export default class RelayProvider {
 	async shutdown(): Promise<void> {}
 }
 
-interface ReamRequest {
-	header(name: string): string | undefined;
-	body(): Promise<unknown> | unknown;
-	qs?(): Record<string, unknown>;
-}
-interface ReamResponse {
-	status(code: number): ReamResponse;
-	header(name: string, value: string): ReamResponse;
-	json(data: unknown): void;
-	noContent(): void;
-	sse(): Promise<{
-		id: string;
-		isOpen(): boolean;
-		send(event: string, data: unknown, eventId?: string): Promise<boolean>;
-		onClose(cb: () => void): void;
-		end(): Promise<void>;
-	}>;
-}
-interface ReamHttpContext {
-	request: ReamRequest;
-	response: ReamResponse;
-	auth?: {
-		authenticated: boolean;
-		user?: { id: string; [key: string]: unknown };
-	};
-}
-interface ReamRouter {
+/**
+ * Relay's view of the host router: the framework `Router`'s call surface but
+ * typed to return relay's own `RelayRouteBuilder` (which carries
+ * use/role/permission — richer than ream's RouteBuilder) so apps can customize
+ * the SSE routes. The handler receives the framework's real `HttpContext`.
+ */
+interface RelayHostRouter {
 	get(
 		path: string,
-		handler: (ctx: ReamHttpContext) => Promise<void> | void,
+		handler: (ctx: HttpContext) => Promise<void> | void,
 	): RelayRouteBuilder;
 	post(
 		path: string,
-		handler: (ctx: ReamHttpContext) => Promise<void> | void,
+		handler: (ctx: HttpContext) => Promise<void> | void,
 	): RelayRouteBuilder;
 }
 
-function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
+function registerRelayRoutes(router: RelayHostRouter, relay: Relay): void {
 	const events = router.get("/__relay/events", async (ctx) => {
 		// The query `uid` is only a HINT now — the relay derives the
 		// canonical uid from `ctx.auth` (or generates one for anonymous
@@ -229,10 +197,7 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 	relay.applyRouteCustomization(unsubscribe);
 }
 
-function readQueryParam(
-	request: ReamRequest,
-	name: string,
-): string | undefined {
+function readQueryParam(request: Request, name: string): string | undefined {
 	const qs = request.qs?.();
 	if (!qs) return undefined;
 	const v = qs[name];
