@@ -1,15 +1,16 @@
-import type { AppContext } from "@c9up/ream";
 import { describe, expect, it } from "vitest";
 import { Relay, type RelayConfig } from "../../src/Relay.js";
-import RelayProvider from "../../src/RelayProvider.js";
+import RelayProvider, {
+	type RelayAppContext,
+} from "../../src/RelayProvider.js";
 
 function makeApp(relayConfig?: RelayConfig): {
-	app: AppContext;
+	app: RelayAppContext;
 	bindings: Map<unknown, () => unknown>;
 } {
 	const bindings = new Map<unknown, () => unknown>();
 	const cache = new Map<unknown, unknown>();
-	const app: AppContext = {
+	const app: RelayAppContext = {
 		container: {
 			singleton(token, factory) {
 				bindings.set(token, factory);
