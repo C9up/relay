@@ -1,5 +1,5 @@
 import { Relay, type RelayConfig, type RelayRouteBuilder } from "./Relay.js";
-import { _setRelay } from "./services/main.js";
+import { setRelay } from "./services/main.js";
 
 interface RelayContainer {
 	singleton(token: unknown, factory: () => unknown): void;
@@ -43,7 +43,7 @@ export default class RelayProvider {
 		this.app.container.singleton(Relay, () => {
 			const config = this.app.config.get<RelayConfig>("relay");
 			const instance = new Relay(config);
-			_setRelay(instance);
+			setRelay(instance);
 			return instance;
 		});
 		this.app.container.singleton("relay", () =>
@@ -52,12 +52,12 @@ export default class RelayProvider {
 	}
 
 	async boot(): Promise<void> {
-		// Force-resolve the Relay singleton so `_setRelay` runs even
+		// Force-resolve the Relay singleton so `setRelay` runs even
 		// when the app never imports it explicitly. Apps can then call
 		// `relay.registerRoutes(...)` from a preload BEFORE the routes
 		// are actually registered (that happens in `start()` below).
 		const relay = this.app.container.resolve<Relay>(Relay);
-		_setRelay(relay);
+		setRelay(relay);
 	}
 
 	async start(): Promise<void> {

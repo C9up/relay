@@ -11,27 +11,27 @@
 
 import { Relay } from "../Relay.js";
 
-let _instance: Relay | undefined;
+let instance: Relay | undefined;
 
 /** @internal Replace the singleton (used by the provider on first boot). */
-export function _setRelay(instance: Relay): void {
-	_instance = instance;
+export function setRelay(value: Relay): void {
+	instance = value;
 }
 
 /** @internal Get the underlying instance (or `undefined` pre-boot). */
-export function _getRelay(): Relay | undefined {
-	return _instance;
+export function getRelay(): Relay | undefined {
+	return instance;
 }
 
 const relay: Relay = new Proxy({} as Relay, {
 	get(_target, prop) {
-		if (!_instance) {
+		if (!instance) {
 			// Lazy default — apps that never registered the provider get a
 			// usable broadcast surface (no-op until a client connects).
-			_instance = new Relay();
+			instance = new Relay();
 		}
-		const value = Reflect.get(_instance, prop, _instance);
-		return typeof value === "function" ? value.bind(_instance) : value;
+		const value = Reflect.get(instance, prop, instance);
+		return typeof value === "function" ? value.bind(instance) : value;
 	},
 });
 
