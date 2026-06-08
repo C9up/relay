@@ -1,6 +1,6 @@
 {
   "name": "@c9up/relay",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Relay — Realtime client transport for the Ream framework (SSE + WebSocket Hub + SignalR)",
   "license": "MIT",
   "type": "module",
