@@ -116,6 +116,25 @@ describe("relay-security > connect() identity binding", () => {
 		expect(reconnect).toEqual({ outcome: "ok", uid: "u1" });
 		expect(r.clientCount()).toBe(1);
 	});
+
+	// Audit 2026-06-13: reconnect dropped the prior client from #clients but never
+	// end()-ed its stream → an orphaned writer leaked per refresh. It must be
+	// closed, and the stale onClose must NOT drop the new client (count stays 1).
+	it("ends the prior SSE stream on reconnect and keeps the new one", () => {
+		const r = new Relay({ maxClients: 5 });
+		const oldSse = fakeSse("s-old");
+		r.connect(undefined, oldSse, {
+			auth: { authenticated: true, user: { id: "u1" } },
+		});
+		expect(oldSse.isOpen()).toBe(true);
+		const newSse = fakeSse("s-new");
+		r.connect(undefined, newSse, {
+			auth: { authenticated: true, user: { id: "u1" } },
+		});
+		expect(oldSse.isOpen()).toBe(false); // orphaned stream closed (no leak)
+		expect(newSse.isOpen()).toBe(true); // new stream survives the stale onClose
+		expect(r.clientCount()).toBe(1);
+	});
 });
 
 describe("relay-security > subscribe() ownership", () => {

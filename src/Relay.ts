@@ -308,7 +308,11 @@ export class Relay {
 			channels: new Set(),
 			auth: ctx.auth,
 		});
-		sse.onClose(() => this.#dropClient(uid));
+		// Identity-guarded: a stale stream's onClose must not drop a newer client
+		// that reused the same uid after a reconnect.
+		sse.onClose(() => {
+			if (this.#clients.get(uid)?.sse.id === sse.id) this.#dropClient(uid);
+		});
 		// Initial frame: confirms the connection to the JS client. Adonis
 		// Transmit ships `{ uid }` too. The client uses this uid for the
 		// subscribe/unsubscribe round trips.
@@ -451,6 +455,13 @@ export class Relay {
 			this.#indexRemove(channel, uid);
 		}
 		this.#clients.delete(uid);
+		// Close the underlying stream so a reconnect (drop + re-add) doesn't leak
+		// the prior writer — once it's out of #clients, broadcast()'s dead-writer
+		// sweep can never reach it. Already-closed streams (the onClose path)
+		// no-op via isOpen().
+		if (client.sse.isOpen()) {
+			void client.sse.end().catch(() => {});
+		}
 		this.#emit("disconnect", { uid });
 	}
 
