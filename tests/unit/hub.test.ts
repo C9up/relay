@@ -91,9 +91,12 @@ describe("relay > Hub > dispatch — handler routing", () => {
 		expect(c.sent).toContainEqual({ event: "pong", data: { x: 1 } });
 	});
 
-	it("silently drops a dispatch for an unknown client", async () => {
+	it("returns false (handled=no) for an unknown client without throwing", async () => {
 		const hub = new TestHub();
-		await expect(hub.dispatch("ghost", "ping", {})).resolves.toBeUndefined();
+		// dispatch() reports outcome via its boolean return so a correlated
+		// transport (SignalR) can answer with an error Completion; an unknown
+		// client is a non-handled dispatch → false, but never throws.
+		await expect(hub.dispatch("ghost", "ping", {})).resolves.toBe(false);
 	});
 
 	it("returns UNKNOWN_EVENT for unmapped events", async () => {

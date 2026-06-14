@@ -168,19 +168,28 @@ export abstract class Hub {
 		}
 	}
 
-	/** Dispatch an incoming message to the appropriate handler method. */
+	/**
+	 * Dispatch an incoming message to the appropriate handler method.
+	 *
+	 * Returns `true` when the handler ran to completion, `false` on any failure
+	 * (unknown client/event, auth rejection, or a throwing handler). A bare
+	 * `error` event is still emitted to the client for each failure (transport
+	 * agnostic), and the boolean lets a correlated transport — SignalR, whose
+	 * invocations carry an `invocationId` — answer with an error Completion
+	 * instead of a misleading success one.
+	 */
 	async dispatch(
 		clientId: string,
 		event: string,
 		data: unknown,
-	): Promise<void> {
+	): Promise<boolean> {
 		const client = this.clients.get(clientId);
-		if (!client) return;
+		if (!client) return false;
 
 		const authError = this.#checkDispatchAuth(client);
 		if (authError) {
 			client.send("error", authError);
-			return;
+			return false;
 		}
 
 		// Find handler from allowlist (never dispatches to lifecycle hooks or inherited methods)
@@ -190,15 +199,17 @@ export abstract class Hub {
 				code: "UNKNOWN_EVENT",
 				message: `No handler for: ${event}`,
 			});
-			return;
+			return false;
 		}
 
 		// Reuse existing ctx if available, otherwise create
 		const ctx = this.buildContext(client);
 		try {
 			await handler.call(this, ctx, data);
+			return true;
 		} catch {
 			client.send("error", { code: "HANDLER_ERROR", message: "Handler error" });
+			return false;
 		}
 	}
 

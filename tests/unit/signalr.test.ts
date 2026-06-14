@@ -138,6 +138,42 @@ describe("relay > SignalRAdapter", () => {
 		expect(completion).toEqual({ type: 3, invocationId: "i1" });
 	});
 
+	it("a throwing handler with an invocationId answers with an error Completion, not success", async () => {
+		const { adapter, clientId } = makeAdapter();
+		await adapter.handleFrame(
+			clientId,
+			JSON.stringify({ protocol: "json", version: 1 }) + RS,
+		);
+		// onBoom throws; before the fix the client got a SUCCESS Completion
+		// {type:3,invocationId} and the real failure only as an uncorrelated
+		// 'error' event (audit 2026-06-13).
+		const inv =
+			JSON.stringify({
+				type: 1,
+				invocationId: "boom-1",
+				target: "boom",
+				arguments: [],
+			}) + RS;
+		const out = await adapter.handleFrame(clientId, inv);
+		expect(out).toHaveLength(1);
+		const completion = JSON.parse(out[0]?.replace(RS, ""));
+		expect(completion.type).toBe(3);
+		expect(completion.invocationId).toBe("boom-1");
+		expect(completion.error).toBeDefined();
+		expect(completion).not.toHaveProperty("result");
+	});
+
+	it("a throwing handler WITHOUT an invocationId emits no Completion (fire-and-forget)", async () => {
+		const { adapter, clientId } = makeAdapter();
+		await adapter.handleFrame(
+			clientId,
+			JSON.stringify({ protocol: "json", version: 1 }) + RS,
+		);
+		const inv = JSON.stringify({ type: 1, target: "boom", arguments: [] }) + RS;
+		const out = await adapter.handleFrame(clientId, inv);
+		expect(out).toHaveLength(0);
+	});
+
 	it("responds to a Ping (type 6) with a Ping", async () => {
 		const { adapter, clientId } = makeAdapter();
 		await adapter.handleFrame(

@@ -153,19 +153,33 @@ export class SignalRAdapter {
 					// Invocation
 					if (!isInvocationMessage(msg)) break;
 					const inv = msg;
+					let ok = false;
 					try {
-						await this.#hub.dispatch(clientId, inv.target, inv.arguments?.[0]);
-						if (inv.invocationId) {
-							out.push(this.#encodeCompletion(inv.invocationId));
-						}
-					} catch (err) {
-						const errorMsg =
-							err instanceof Error ? err.message : "Handler error";
-						if (inv.invocationId) {
-							out.push(
-								this.#encodeCompletion(inv.invocationId, undefined, errorMsg),
-							);
-						}
+						ok = await this.#hub.dispatch(
+							clientId,
+							inv.target,
+							inv.arguments?.[0],
+						);
+					} catch {
+						// dispatch() reports failures via its boolean return; guard
+						// against an unexpected throw so one bad invocation can't
+						// abort the whole frame batch.
+						ok = false;
+					}
+					// Only a request-style invocation (with an invocationId) expects
+					// a Completion. A failed handler MUST answer with an error
+					// Completion, not a success one — else the client's invoke()
+					// promise resolves as if the call succeeded.
+					if (inv.invocationId) {
+						out.push(
+							ok
+								? this.#encodeCompletion(inv.invocationId)
+								: this.#encodeCompletion(
+										inv.invocationId,
+										undefined,
+										"Handler error",
+									),
+						);
 					}
 					break;
 				}
