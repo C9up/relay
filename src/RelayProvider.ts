@@ -4,6 +4,7 @@ import { setRelay } from "./services/main.js";
 interface RelayContainer {
 	singleton(token: unknown, factory: () => unknown): void;
 	resolve<T = unknown>(token: unknown): T;
+	has(token: unknown): boolean;
 }
 
 interface RelayConfigStore {
@@ -65,38 +66,22 @@ export default class RelayProvider {
 		// Apps' `relay.registerRoutes(customizer)` calls (which typically
 		// live in start/services.ts) are guaranteed to have been
 		// recorded by the time the customizer is applied to each route.
-		let routerMod: { default: ReamRouter };
-		try {
-			// Variable specifier so tsc does not statically resolve the
-			// optional `@c9up/ream` peer at build time (keeps relay agnostic
-			// / standalone-buildable). The import returns the host router
-			// module only when relay actually runs inside Ream.
-			const routerSpecifier = "@c9up/ream/services/router";
-			routerMod = await import(routerSpecifier);
-		} catch (err) {
-			// Host is not Ream — the optional peer isn't installed. Broadcast /
-			// authorize still work via the singleton and the user wires their
-			// own SSE routes. ONLY a genuinely-absent peer is swallowed; a peer
-			// that exists but fails to import is a real error and propagates.
-			if (isModuleNotFound(err)) return;
-			throw err;
-		}
-		// Past this point Ream IS present — route-registration failures
-		// (duplicate route, router throwing, a bad customizer) must surface,
-		// not be hidden as "host is not Ream".
+		//
+		// Resolve the host router from the container, where Ream registers it as
+		// `'router'` (Ignitor) — instead of importing `@c9up/ream/services/router`
+		// — which keeps relay runtime-agnostic. A non-Ream host never registers
+		// `'router'`: broadcast / authorize still work via the singleton and the
+		// user wires their own SSE routes. Past the guard Ream IS present, so
+		// route-registration failures (duplicate route, router throwing, a bad
+		// customizer) surface instead of being hidden as "host is not Ream".
+		if (!this.app.container.has("router")) return;
+		const router = this.app.container.resolve<ReamRouter>("router");
 		const relay = this.app.container.resolve<Relay>(Relay);
-		registerRelayRoutes(routerMod.default, relay);
+		registerRelayRoutes(router, relay);
 	}
 
 	async ready(): Promise<void> {}
 	async shutdown(): Promise<void> {}
-}
-
-/** True for an ESM "module not found" import failure (the optional peer is absent). */
-function isModuleNotFound(err: unknown): boolean {
-	if (typeof err !== "object" || err === null) return false;
-	const code = (err as { code?: unknown }).code;
-	return code === "ERR_MODULE_NOT_FOUND" || code === "ENOENT";
 }
 
 interface ReamRequest {

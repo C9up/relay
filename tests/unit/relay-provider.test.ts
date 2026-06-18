@@ -23,6 +23,9 @@ function makeApp(relayConfig?: RelayConfig): {
 				cache.set(token, value);
 				return value as T;
 			},
+			has(token: unknown): boolean {
+				return cache.has(token) || bindings.has(token);
+			},
 		},
 		config: {
 			get<T = unknown>(key: string): T | undefined {
