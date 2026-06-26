@@ -8,6 +8,17 @@
  * @implements MISS-20
  */
 
+import type { RelayConfig } from "./Relay.js";
+
+/**
+ * Author-time config helper for `config/relay.ts` — AdonisJS `defineConfig`
+ * parity (Transmit ships the same). Identity at runtime; the generic preserves
+ * literal types for inference.
+ */
+export function defineConfig<T extends RelayConfig>(config: T): T {
+	return config;
+}
+
 export { Hub, type HubContext, type HubGuardOptions } from "./Hub.js";
 export {
 	type ChannelAuthorizer,
