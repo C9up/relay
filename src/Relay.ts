@@ -41,7 +41,7 @@ export interface RelaySseStream {
 
 /** Auth state forwarded to authorize callbacks. */
 export interface RelayAuth {
-	authenticated: boolean;
+	isAuthenticated: boolean;
 	user?: { id: string; [key: string]: unknown };
 	roles?: string[];
 	permissions?: string[];
@@ -274,7 +274,9 @@ export class Relay {
 		| { outcome: "ok"; uid: string }
 		| { outcome: "capped" }
 		| { outcome: "forbidden"; reason: string } {
-		const authUserId = ctx.auth?.authenticated ? ctx.auth.user?.id : undefined;
+		const authUserId = ctx.auth?.isAuthenticated
+			? ctx.auth.user?.id
+			: undefined;
 		let uid: string;
 		if (authUserId !== undefined) {
 			// Authenticated: identity is fixed. A mismatched hint is a hijack
@@ -435,11 +437,11 @@ export class Relay {
 		client: { auth?: RelayAuth },
 		ctx: RelayContext,
 	): SubscribeResult | null {
-		const connectedUserId = client.auth?.authenticated
+		const connectedUserId = client.auth?.isAuthenticated
 			? client.auth.user?.id
 			: undefined;
 		if (connectedUserId === undefined) return null;
-		const requesterUserId = ctx.auth?.authenticated
+		const requesterUserId = ctx.auth?.isAuthenticated
 			? ctx.auth.user?.id
 			: undefined;
 		if (requesterUserId !== connectedUserId) {

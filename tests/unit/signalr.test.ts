@@ -27,7 +27,7 @@ function makeAdapter(): {
 	hub.registerClient({
 		id: clientId,
 		groups: new Set(),
-		auth: { authenticated: false },
+		auth: { isAuthenticated: false },
 		send: () => {},
 	});
 	return { hub, adapter, clientId };

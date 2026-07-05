@@ -106,7 +106,7 @@ interface ReamHttpContext {
 	request: ReamRequest;
 	response: ReamResponse;
 	auth?: {
-		authenticated: boolean;
+		isAuthenticated: boolean;
 		user?: { id: string; [key: string]: unknown };
 	};
 }
@@ -146,7 +146,9 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 		// stream. The `capped` case still needs an SSE upgrade (the slot
 		// count is genuine instance state), but it's rarely hit and is
 		// noted as residual TODO if/when an app actually trips it.
-		const authUserId = ctx.auth?.authenticated ? ctx.auth.user?.id : undefined;
+		const authUserId = ctx.auth?.isAuthenticated
+			? ctx.auth.user?.id
+			: undefined;
 		if (
 			uidHint !== undefined &&
 			authUserId !== undefined &&

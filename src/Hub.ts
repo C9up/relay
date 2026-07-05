@@ -28,7 +28,7 @@ export interface HubContext {
 	readonly clientId: string;
 	/** Auth state from the upgrade request. */
 	readonly auth: {
-		authenticated: boolean;
+		isAuthenticated: boolean;
 		strategy?: string;
 		user?: Record<string, unknown>;
 		roles?: string[];
@@ -230,7 +230,7 @@ export abstract class Hub {
 			(this.guards.roles?.length ?? 0) > 0 ||
 			(this.guards.permissions?.length ?? 0) > 0;
 
-		if (needsAuth && !client.auth.authenticated) {
+		if (needsAuth && !client.auth.isAuthenticated) {
 			return { code: "UNAUTHORIZED", message: "Not authenticated" };
 		}
 
