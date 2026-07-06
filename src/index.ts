@@ -30,6 +30,7 @@ export {
 	type RelayRouteBuilder,
 	type RelayRouteCustomizer,
 	type RelaySseStream,
+	type RelayTransport,
 	type SubscribeFailure,
 	type SubscribeResult,
 	type SubscribeSuccess,

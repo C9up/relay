@@ -1,0 +1,203 @@
+/**
+ * Tests for the Transmit-parity broadcast surface:
+ *   - broadcastExcept(channel, payload, senderUid) skips the excluded uid(s)
+ *   - multi-instance sync via an injected `transport` bus
+ *   - shutdown() releases the bus
+ *   - on() returns a detacher
+ *   - getSubscribersFor(channel) lists the subscribed uids
+ */
+
+import { describe, expect, it, vi } from "vitest";
+import {
+	Relay,
+	type RelaySseStream,
+	type RelayTransport,
+} from "../../src/Relay.js";
+
+/** Minimal SSE double that records every `send(event, data)`. */
+function fakeSse(id = `s_${Math.random()}`): RelaySseStream & {
+	sent: Array<{ event: string; data: unknown }>;
+} {
+	let open = true;
+	let closeCb: (() => void) | undefined;
+	const sent: Array<{ event: string; data: unknown }> = [];
+	return {
+		id,
+		sent,
+		isOpen: () => open,
+		async send(event, data) {
+			sent.push({ event, data });
+			return open;
+		},
+		onClose(cb) {
+			closeCb = cb;
+		},
+		async end() {
+			open = false;
+			closeCb?.();
+		},
+	};
+}
+
+/** Subscribe a fresh authenticated client and return its stream + uid. */
+async function connectAndSubscribe(
+	r: Relay,
+	userId: string,
+	channel: string,
+): Promise<{ sse: ReturnType<typeof fakeSse>; uid: string }> {
+	const sse = fakeSse(`s-${userId}`);
+	const outcome = r.connect(undefined, sse, {
+		auth: { isAuthenticated: true, user: { id: userId } },
+	});
+	if (outcome.outcome !== "ok") throw new Error("connect failed");
+	const sub = await r.subscribe(outcome.uid, channel, {
+		auth: { isAuthenticated: true, user: { id: userId } },
+	});
+	if (!sub.ok) throw new Error("subscribe failed");
+	// Drop the `connected` frame so assertions only see broadcasts.
+	sse.sent.length = 0;
+	return { sse, uid: outcome.uid };
+}
+
+describe("relay-broadcast > broadcastExcept", () => {
+	it("delivers to every subscriber except the excluded uid", async () => {
+		const r = new Relay({ allowUnauthorizedChannels: true });
+		const a = await connectAndSubscribe(r, "u-a", "room/1");
+		const b = await connectAndSubscribe(r, "u-b", "room/1");
+
+		const reached = r.broadcastExcept("room/1", { hi: true }, a.uid);
+
+		expect(reached).toBe(1);
+		expect(a.sse.sent).toEqual([]); // excluded sender got nothing
+		expect(b.sse.sent).toEqual([{ event: "room/1", data: { hi: true } }]);
+	});
+
+	it("accepts an array of excluded uids", async () => {
+		const r = new Relay({ allowUnauthorizedChannels: true });
+		const a = await connectAndSubscribe(r, "u-a", "room/1");
+		const b = await connectAndSubscribe(r, "u-b", "room/1");
+		const c = await connectAndSubscribe(r, "u-c", "room/1");
+
+		const reached = r.broadcastExcept("room/1", { n: 1 }, [a.uid, b.uid]);
+
+		expect(reached).toBe(1);
+		expect(a.sse.sent).toEqual([]);
+		expect(b.sse.sent).toEqual([]);
+		expect(c.sse.sent).toEqual([{ event: "room/1", data: { n: 1 } }]);
+	});
+
+	it("does NOT mirror onto the bus (local-only, like Transmit)", async () => {
+		const publish = vi.fn();
+		const transport: RelayTransport = { publish, subscribe: vi.fn() };
+		const r = new Relay({ allowUnauthorizedChannels: true, transport });
+		const a = await connectAndSubscribe(r, "u-a", "room/1");
+
+		r.broadcastExcept("room/1", { x: 1 }, a.uid);
+
+		expect(publish).not.toHaveBeenCalled();
+	});
+});
+
+describe("relay-broadcast > multi-instance transport sync", () => {
+	it("publishes every broadcast onto the bus envelope", async () => {
+		const publish = vi.fn();
+		const transport: RelayTransport = { publish, subscribe: vi.fn() };
+		const r = new Relay({ transport, transportChannel: "custom::bus" });
+
+		r.broadcast("news", { headline: "hi" });
+
+		expect(publish).toHaveBeenCalledWith("custom::bus", {
+			type: "broadcast",
+			channel: "news",
+			payload: { headline: "hi" },
+		});
+	});
+
+	it("re-delivers a bus message to THIS instance's local clients (no re-publish loop)", async () => {
+		// Capture the bus handler so the test can inject a remote message.
+		let busHandler: ((message: unknown) => void) | undefined;
+		const publish = vi.fn();
+		const transport: RelayTransport = {
+			publish,
+			subscribe: (_channel, handler) => {
+				busHandler = handler;
+			},
+		};
+		const r = new Relay({ allowUnauthorizedChannels: true, transport });
+		const a = await connectAndSubscribe(r, "u-a", "room/1");
+
+		// A broadcast originating on ANOTHER instance arrives over the bus.
+		busHandler?.({
+			type: "broadcast",
+			channel: "room/1",
+			payload: { remote: 1 },
+		});
+
+		expect(a.sse.sent).toEqual([{ event: "room/1", data: { remote: 1 } }]);
+		// Re-delivery is local-only — it must NOT re-publish (would loop forever).
+		expect(publish).not.toHaveBeenCalled();
+	});
+
+	it("drops malformed bus messages instead of trusting them", async () => {
+		let busHandler: ((message: unknown) => void) | undefined;
+		const transport: RelayTransport = {
+			publish: vi.fn(),
+			subscribe: (_channel, handler) => {
+				busHandler = handler;
+			},
+		};
+		const r = new Relay({ allowUnauthorizedChannels: true, transport });
+		const a = await connectAndSubscribe(r, "u-a", "room/1");
+
+		busHandler?.(null);
+		busHandler?.({ type: "nope" });
+		busHandler?.({ type: "broadcast", channel: 42, payload: {} });
+
+		expect(a.sse.sent).toEqual([]);
+	});
+
+	it("shutdown() unsubscribes from and disconnects the bus", async () => {
+		const unsubscribe = vi.fn();
+		const disconnect = vi.fn();
+		const transport: RelayTransport = {
+			publish: vi.fn(),
+			subscribe: vi.fn(),
+			unsubscribe,
+			disconnect,
+		};
+		const r = new Relay({ transport, transportChannel: "custom::bus" });
+
+		await r.shutdown();
+
+		expect(unsubscribe).toHaveBeenCalledWith("custom::bus");
+		expect(disconnect).toHaveBeenCalled();
+	});
+
+	it("shutdown() is a no-op without a transport", async () => {
+		const r = new Relay();
+		await expect(r.shutdown()).resolves.toBeUndefined();
+	});
+});
+
+describe("relay-broadcast > on() detacher + getSubscribersFor", () => {
+	it("on() returns a detacher that stops further events", () => {
+		const r = new Relay();
+		const seen: string[] = [];
+		const off = r.on("broadcast", (evt) => seen.push(evt.channel));
+
+		r.broadcast("a", {});
+		off();
+		r.broadcast("b", {});
+
+		expect(seen).toEqual(["a"]);
+	});
+
+	it("getSubscribersFor lists the uids subscribed to a channel", async () => {
+		const r = new Relay({ allowUnauthorizedChannels: true });
+		const a = await connectAndSubscribe(r, "u-a", "room/1");
+		const b = await connectAndSubscribe(r, "u-b", "room/1");
+
+		expect(r.getSubscribersFor("room/1").sort()).toEqual([a.uid, b.uid].sort());
+		expect(r.getSubscribersFor("empty")).toEqual([]);
+	});
+});

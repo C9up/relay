@@ -81,7 +81,14 @@ export default class RelayProvider {
 	}
 
 	async ready(): Promise<void> {}
-	async shutdown(): Promise<void> {}
+
+	async shutdown(): Promise<void> {
+		// Graceful shutdown: release the Relay's bus subscription/connection so
+		// a multi-instance deploy doesn't leak transport handles on SIGTERM.
+		// No-op for single-instance relays (no transport configured).
+		const relay = this.app.container.resolve<Relay>(Relay);
+		await relay.shutdown();
+	}
 }
 
 interface ReamRequest {

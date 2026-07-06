@@ -56,6 +56,28 @@ export type ChannelAuthorizer<TParams = Record<string, string>> = (
 	params: TParams,
 ) => Promise<boolean> | boolean;
 
+/**
+ * Duck-typed message bus used to synchronize broadcasts across multiple
+ * app instances (horizontal scaling). Mirrors Adonis Transmit's injected
+ * `@boringnode/bus` `Transport`, but kept structural so relay never has to
+ * import a concrete driver: objects exposing `publish`/`subscribe` work —
+ * `@c9up/pulsar`, a Redis/NATS bus, or an in-memory fake in tests.
+ *
+ * Each broadcast is published on `transportChannel`; every instance
+ * (including the originator) is subscribed and re-emits the payload to its
+ * OWN local SSE clients. The re-emit is local-only — it never re-publishes,
+ * so messages don't loop between instances.
+ */
+export interface RelayTransport {
+	publish(channel: string, message: unknown): void | Promise<void>;
+	subscribe(
+		channel: string,
+		handler: (message: unknown) => void,
+	): void | Promise<void>;
+	unsubscribe?(channel: string): void | Promise<void>;
+	disconnect?(): void | Promise<void>;
+}
+
 export interface RelayConfig {
 	/**
 	 * Allow subscription to channels that have no authorizer registered.
@@ -74,6 +96,25 @@ export interface RelayConfig {
 	 * `channelIndex`; an unbounded cap would let one socket pin memory.
 	 */
 	maxChannelsPerClient?: number;
+	/**
+	 * Optional message bus for multi-instance broadcast sync. When set,
+	 * every `broadcast(...)` is mirrored onto the bus and re-delivered to
+	 * the SSE clients of every other instance. Adonis Transmit parity
+	 * (its injected `transport`). Absent → single-instance, no bus.
+	 */
+	transport?: RelayTransport;
+	/**
+	 * Bus channel the broadcasts are published on. Default
+	 * `relay::broadcast`. Mirrors Transmit's `transport.channel`.
+	 */
+	transportChannel?: string;
+}
+
+/** Cross-instance broadcast envelope carried over `RelayTransport`. */
+interface RelayTransportMessage {
+	type: "broadcast";
+	channel: string;
+	payload: unknown;
 }
 
 export interface RelayLifecycleEvents {
@@ -134,7 +175,14 @@ export class Relay {
 	#authorizers = new Map<string, ChannelAuthorizer<Record<string, string>>>();
 	#listeners: { [E in LifecycleEventName]?: Set<LifecycleListener<E>> } = {};
 	#routeCustomizer?: RelayRouteCustomizer;
-	readonly #config: Required<RelayConfig>;
+	readonly #config: Required<
+		Pick<
+			RelayConfig,
+			"allowUnauthorizedChannels" | "maxClients" | "maxChannelsPerClient"
+		>
+	>;
+	readonly #transport?: RelayTransport;
+	readonly #transportChannel: string;
 
 	constructor(config?: RelayConfig) {
 		this.#config = {
@@ -142,6 +190,18 @@ export class Relay {
 			maxClients: config?.maxClients ?? 10_000,
 			maxChannelsPerClient: config?.maxChannelsPerClient ?? 100,
 		};
+		this.#transport = config?.transport;
+		this.#transportChannel = config?.transportChannel ?? "relay::broadcast";
+		// Multi-instance sync: subscribe to the bus and re-deliver every remote
+		// broadcast to THIS instance's local SSE clients. Local-only re-emit —
+		// no re-publish — so a message published by instance A reaches B, C … but
+		// never bounces back onto the bus. Mirrors Transmit's `#broadcastLocally`
+		// off the transport subscription.
+		void this.#transport?.subscribe(this.#transportChannel, (message) => {
+			if (isRelayTransportMessage(message)) {
+				this.#deliver(message.channel, message.payload);
+			}
+		});
 	}
 
 	// ─── Channel authorization ────────────────────────────────
@@ -201,16 +261,60 @@ export class Relay {
 	 * Send a payload to every SSE client subscribed to `channel`.
 	 * Returns the number of clients reached. Dead writers (client gone)
 	 * are reaped during the iteration.
+	 *
+	 * With a `transport` configured, the payload is also mirrored onto the
+	 * bus so the SSE clients of every OTHER instance receive it too.
 	 */
 	broadcast(channel: string, payload: unknown): number {
+		const reached = this.#deliver(channel, payload);
+		this.#publishToBus(channel, payload);
+		this.#emit("broadcast", { channel, payload });
+		return reached;
+	}
+
+	/**
+	 * Broadcast to every subscriber of `channel` EXCEPT the given uid(s).
+	 * Returns the number of clients reached. Mirrors Adonis Transmit's
+	 * `broadcastExcept` — used to skip the socket that originated an action
+	 * (e.g. optimistic-UI echo suppression). Local-only, like Transmit: it
+	 * does not mirror onto the bus, so the exclusion is honored on the
+	 * originating instance where the sender lives.
+	 */
+	broadcastExcept(
+		channel: string,
+		payload: unknown,
+		senderUid: string | string[],
+	): number {
+		return this.#deliver(channel, payload, senderUid);
+	}
+
+	/**
+	 * Fan a payload out to the local SSE clients subscribed to `channel`,
+	 * skipping any uid in `exclude`. Reaps dead writers during the walk.
+	 * Shared by `broadcast` / `broadcastExcept` and the transport re-emit.
+	 */
+	#deliver(
+		channel: string,
+		payload: unknown,
+		exclude?: string | string[],
+	): number {
 		const subscribers = this.#channelIndex.get(channel);
-		if (!subscribers || subscribers.size === 0) {
-			this.#emit("broadcast", { channel, payload });
-			return 0;
-		}
+		if (!subscribers || subscribers.size === 0) return 0;
+		const excluded =
+			exclude === undefined
+				? null
+				: Array.isArray(exclude)
+					? new Set(exclude)
+					: exclude;
 		let reached = 0;
 		const dead: string[] = [];
 		for (const uid of subscribers) {
+			if (
+				excluded !== null &&
+				(typeof excluded === "string" ? excluded === uid : excluded.has(uid))
+			) {
+				continue;
+			}
 			const client = this.#clients.get(uid);
 			if (!client?.sse.isOpen()) {
 				dead.push(uid);
@@ -222,16 +326,30 @@ export class Relay {
 			reached++;
 		}
 		for (const uid of dead) this.#dropClient(uid);
-		this.#emit("broadcast", { channel, payload });
 		return reached;
+	}
+
+	#publishToBus(channel: string, payload: unknown): void {
+		if (!this.#transport) return;
+		const message: RelayTransportMessage = {
+			type: "broadcast",
+			channel,
+			payload,
+		};
+		void this.#transport.publish(this.#transportChannel, message);
 	}
 
 	// ─── Lifecycle hooks ──────────────────────────────────────
 
+	/**
+	 * Register a lifecycle listener. Returns a detacher that removes it —
+	 * mirrors Adonis Transmit's `on` (built on Emittery, whose `on` returns
+	 * an unsubscribe function).
+	 */
 	on<E extends LifecycleEventName>(
 		event: E,
 		listener: LifecycleListener<E>,
-	): void {
+	): () => void {
 		const set = (this.#listeners[event] ?? new Set()) as Set<
 			LifecycleListener<E>
 		>;
@@ -241,6 +359,9 @@ export class Relay {
 		// the assignability check by re-typing the whole structure with the
 		// added entry (the same variance dance as the upstream read cast).
 		this.#listeners = { ...this.#listeners, [event]: set };
+		return () => {
+			set.delete(listener);
+		};
 	}
 
 	// ─── Connection / subscription (called by the provider routes) ─
@@ -416,6 +537,29 @@ export class Relay {
 		return this.#channelIndex.get(channel)?.size ?? 0;
 	}
 
+	/**
+	 * List the uids currently subscribed to `channel`. Adonis Transmit
+	 * parity (`getSubscribersFor`). Returns a fresh array snapshot.
+	 */
+	getSubscribersFor(channel: string): string[] {
+		const set = this.#channelIndex.get(channel);
+		return set ? Array.from(set) : [];
+	}
+
+	// ─── Shutdown ─────────────────────────────────────────────
+
+	/**
+	 * Release external resources: unsubscribe from and disconnect the bus.
+	 * Mirrors Adonis Transmit's `shutdown` (clear timers + disconnect the
+	 * transport). Call from the provider's graceful-shutdown hook. Idempotent
+	 * — both bus methods are optional on the duck-typed transport.
+	 */
+	async shutdown(): Promise<void> {
+		if (!this.#transport) return;
+		await this.#transport.unsubscribe?.(this.#transportChannel);
+		await this.#transport.disconnect?.();
+	}
+
 	// ─── Internals ────────────────────────────────────────────
 
 	/**
@@ -527,6 +671,21 @@ export interface SubscribeFailure {
 	code: string;
 }
 export type SubscribeResult = SubscribeSuccess | SubscribeFailure;
+
+/**
+ * Type guard for a cross-instance broadcast envelope arriving over the
+ * bus. The transport carries `unknown`, so validate the shape before
+ * re-delivering — a malformed / foreign message is dropped, not trusted.
+ */
+function isRelayTransportMessage(
+	value: unknown,
+): value is RelayTransportMessage {
+	if (typeof value !== "object" || value === null) return false;
+	if (!("type" in value) || !("channel" in value) || !("payload" in value)) {
+		return false;
+	}
+	return value.type === "broadcast" && typeof value.channel === "string";
+}
 
 /**
  * Match `pattern` against `channel`. Patterns can contain `:param`

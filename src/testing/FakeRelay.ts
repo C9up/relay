@@ -50,6 +50,17 @@ export class FakeRelay {
 		return 0;
 	}
 
+	/** Mirrors the real `Relay.broadcastExcept` — captures the call
+	 *  (the excluded uid(s) are irrelevant to assertions, since the fake
+	 *  holds no real clients) and returns 0. */
+	broadcastExcept(
+		channel: string,
+		data: unknown,
+		_senderUid: string | string[],
+	): number {
+		return this.broadcast(channel, data);
+	}
+
 	/** Defensive snapshot of every captured broadcast. */
 	getSent(): CapturedBroadcast[] {
 		return this.#captured.map((c) => ({
