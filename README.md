@@ -8,8 +8,10 @@ Part of **[Ream](https://github.com/C9up/ream)** — a Rust-powered, AdonisJS-co
 
 ```bash
 pnpm add @c9up/relay
-ream configure @c9up/relay
 ```
+
+Relay ships no auto-`configure` hook — register the provider and add
+`config/relay.ts` manually (see Usage below).
 
 ## Usage
 

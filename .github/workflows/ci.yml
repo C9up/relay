@@ -33,6 +33,9 @@ jobs:
         with:
           node-version: '22'
       - run: pnpm install
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm build
       - run: pnpm test
 
   # Publish job — gated on workflow_dispatch (manual maintainer trigger).
@@ -118,8 +121,9 @@ jobs:
           fi
 
       - run: pnpm install
+      # Fail the publish on a broken build — the published package points to
+      # `dist` (publishConfig), so a failed `tsc` must NOT be ignored.
       - run: pnpm build
-        continue-on-error: true  # not every package has a build script
       - run: pnpm publish --access public --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
