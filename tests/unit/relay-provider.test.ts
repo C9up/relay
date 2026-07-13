@@ -15,11 +15,11 @@ function makeApp(relayConfig?: RelayConfig): {
 			singleton(token, factory) {
 				bindings.set(token, factory);
 			},
-			resolve<T = unknown>(token: unknown): T {
+			async resolve<T = unknown>(token: unknown): Promise<T> {
 				if (cache.has(token)) return cache.get(token) as T;
 				const factory = bindings.get(token);
 				if (!factory) throw new Error("not registered");
-				const value = factory();
+				const value = await factory();
 				cache.set(token, value);
 				return value as T;
 			},
@@ -38,25 +38,25 @@ function makeApp(relayConfig?: RelayConfig): {
 }
 
 describe("relay > RelayProvider", () => {
-	it("registers Relay class + 'relay' string token resolving to the same singleton", () => {
+	it("registers Relay class + 'relay' string token resolving to the same singleton", async () => {
 		const { app } = makeApp();
 		new RelayProvider(app).register();
 
-		const byClass = app.container.resolve(Relay);
-		const byToken = app.container.resolve("relay");
+		const byClass = await app.container.resolve(Relay);
+		const byToken = await app.container.resolve("relay");
 		expect(byClass).toBeInstanceOf(Relay);
 		expect(byToken).toBe(byClass);
 	});
 
-	it("instantiates Relay successfully with a user-provided 'relay' config", () => {
+	it("instantiates Relay successfully with a user-provided 'relay' config", async () => {
 		const { app } = makeApp({ allowUnauthorizedChannels: true });
 		new RelayProvider(app).register();
-		expect(app.container.resolve(Relay)).toBeInstanceOf(Relay);
+		expect(await app.container.resolve(Relay)).toBeInstanceOf(Relay);
 	});
 
-	it("instantiates Relay with defaults when no 'relay' config is set", () => {
+	it("instantiates Relay with defaults when no 'relay' config is set", async () => {
 		const { app } = makeApp();
 		new RelayProvider(app).register();
-		expect(app.container.resolve(Relay)).toBeInstanceOf(Relay);
+		expect(await app.container.resolve(Relay)).toBeInstanceOf(Relay);
 	});
 });

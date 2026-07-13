@@ -3,7 +3,7 @@ import { setRelay } from "./services/main.js";
 
 interface RelayContainer {
 	singleton(token: unknown, factory: () => unknown): void;
-	resolve<T = unknown>(token: unknown): T;
+	resolve<T = unknown>(token: unknown): Promise<T>;
 	has(token: unknown): boolean;
 }
 
@@ -57,7 +57,7 @@ export default class RelayProvider {
 		// when the app never imports it explicitly. Apps can then call
 		// `relay.registerRoutes(...)` from a preload BEFORE the routes
 		// are actually registered (that happens in `start()` below).
-		const relay = this.app.container.resolve<Relay>(Relay);
+		const relay = await this.app.container.resolve<Relay>(Relay);
 		setRelay(relay);
 	}
 
@@ -75,8 +75,8 @@ export default class RelayProvider {
 		// route-registration failures (duplicate route, router throwing, a bad
 		// customizer) surface instead of being hidden as "host is not Ream".
 		if (!this.app.container.has("router")) return;
-		const router = this.app.container.resolve<ReamRouter>("router");
-		const relay = this.app.container.resolve<Relay>(Relay);
+		const router = await this.app.container.resolve<ReamRouter>("router");
+		const relay = await this.app.container.resolve<Relay>(Relay);
 		registerRelayRoutes(router, relay);
 	}
 
@@ -86,7 +86,7 @@ export default class RelayProvider {
 		// Graceful shutdown: release the Relay's bus subscription/connection so
 		// a multi-instance deploy doesn't leak transport handles on SIGTERM.
 		// No-op for single-instance relays (no transport configured).
-		const relay = this.app.container.resolve<Relay>(Relay);
+		const relay = await this.app.container.resolve<Relay>(Relay);
 		await relay.shutdown();
 	}
 }
