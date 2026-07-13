@@ -33,7 +33,7 @@ jobs:
         with:
           node-version: '22'
       - run: pnpm install
-      - run: pnpm typecheck
+      - run: pnpm exec tsc -p tsconfig.build.json --noEmit
       - run: pnpm lint
       - run: pnpm build
       - run: pnpm test
