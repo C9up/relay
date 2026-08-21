@@ -1,6 +1,10 @@
 # @c9up/relay
 
 > Realtime client transport for the Ream framework — SSE + WebSocket Hub + SignalR.
+>
+> **Transport status:** only SSE has a working server transport today. `Hub` and
+> `SignalRAdapter` implement their protocols in full, but Ream's Rust HTTP server
+> exposes no WebSocket upgrade point, so the caller must supply the socket itself.
 
 Part of **[Ream](https://github.com/C9up/ream)** — a Rust-powered, AdonisJS-compatible Node.js framework. Independent, publishable package.
 
