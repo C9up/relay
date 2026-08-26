@@ -77,17 +77,28 @@ export class SignalRAdapter {
 		this.#maxFrameSize = options?.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE;
 	}
 
-	/** Build a SignalR /negotiate response for an HTTP POST. */
-	negotiate(connectionId: string): NegotiateResponse {
+	/**
+	 * Build a SignalR `/negotiate` response for an HTTP POST.
+	 *
+	 * `transports` names what the caller can actually serve. The default is
+	 * Server-Sent Events, which is the transport `@c9up/relay` provides and a
+	 * first-class SignalR transport — announcing WebSockets when nothing can
+	 * upgrade would send every client down a road that dead-ends.
+	 */
+	negotiate(
+		connectionId: string,
+		transports: readonly string[] = ["ServerSentEvents"],
+	): NegotiateResponse {
 		const connectionToken = randomUUID();
 		this.#tokenToId.set(connectionToken, connectionId);
 		return {
 			connectionId,
 			connectionToken,
 			negotiateVersion: 1,
-			availableTransports: [
-				{ transport: "WebSockets", transferFormats: ["Text"] },
-			],
+			availableTransports: transports.map((transport) => ({
+				transport,
+				transferFormats: ["Text"],
+			})),
 		};
 	}
 

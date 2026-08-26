@@ -39,6 +39,15 @@ export interface RelaySseStream {
 	end(): Promise<void>;
 }
 
+/**
+ * What {@link Relay.hub} accepts. Structural on purpose: the relay records a
+ * hub and hands it to the transport, and never calls into it itself.
+ */
+export type HubLike = object;
+
+/** Likewise for an optional pre-built SignalR adapter. */
+export type SignalRAdapterLike = object;
+
 /** Auth state forwarded to authorize callbacks. */
 export interface RelayAuth {
 	isAuthenticated: boolean;
@@ -175,6 +184,11 @@ export class Relay {
 	#authorizers = new Map<string, ChannelAuthorizer<Record<string, string>>>();
 	#listeners: { [E in LifecycleEventName]?: Set<LifecycleListener<E>> } = {};
 	#routeCustomizer?: RelayRouteCustomizer;
+	/** Hubs mounted with {@link hub}, keyed by path. */
+	readonly #hubs = new Map<
+		string,
+		{ path: string; hub: HubLike; adapter?: SignalRAdapterLike }
+	>();
 	readonly #config: Required<
 		Pick<
 			RelayConfig,
@@ -245,6 +259,38 @@ export class Relay {
 	 */
 	registerRoutes(customizer: RelayRouteCustomizer): void {
 		this.#routeCustomizer = customizer;
+	}
+
+	/**
+	 * Mount a {@link Hub} at `path`, reachable over SignalR's Server-Sent
+	 * Events transport.
+	 *
+	 *   relay.hub("/hubs/chat", new ChatHub())
+	 *
+	 * Call it from a preload (`start/services.ts`), like
+	 * {@link registerRoutes}: the provider registers the routes in `start()`,
+	 * after preloads have run, so a hub recorded there is always picked up.
+	 *
+	 * Mounting the same path twice throws rather than replacing the first hub —
+	 * a route silently shadowed is how half an application stops answering with
+	 * nothing in the log.
+	 */
+	hub(path: string, hub: HubLike, adapter?: SignalRAdapterLike): void {
+		if (this.#hubs.has(path)) {
+			throw new Error(
+				`A hub is already mounted at "${path}" — unmount it or pick another path.`,
+			);
+		}
+		this.#hubs.set(path, { path, hub, adapter });
+	}
+
+	/** @internal The hubs recorded so far, read by the provider at `start()`. */
+	mountedHubs(): Array<{
+		path: string;
+		hub: HubLike;
+		adapter?: SignalRAdapterLike;
+	}> {
+		return [...this.#hubs.values()];
 	}
 
 	/**

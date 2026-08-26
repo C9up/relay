@@ -63,8 +63,10 @@ interface ConnectedHubClient {
 /**
  * Base Hub class — extend to create typed hubs.
  *
- * Methods starting with "on" are auto-registered as message handlers.
- * The method name after "on" becomes the event name (camelCase → dot.separated).
+ * Methods starting with "on" are auto-registered as message handlers. The
+ * event name is the method name after "on", with its first letter lowercased:
+ * `onTaskUpdate` handles `taskUpdate`. (`onConnect` / `onDisconnect` are
+ * lifecycle hooks and are not dispatchable.)
  */
 export abstract class Hub {
 	private clients: Map<string, ConnectedHubClient> = new Map();

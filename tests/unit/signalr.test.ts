@@ -34,15 +34,27 @@ function makeAdapter(): {
 }
 
 describe("relay > SignalRAdapter", () => {
-	it("builds a negotiate response with WebSockets transport", () => {
+	it("negotiates the transport it can actually serve", () => {
+		// Server-Sent Events by default: that is what relay provides, and
+		// announcing WebSockets when nothing can upgrade sends every client
+		// down a road that dead-ends.
 		const adapter = new SignalRAdapter(new TestHub());
 		const res = adapter.negotiate("abc-123");
 		expect(res.connectionId).toBe("abc-123");
 		expect(res.connectionToken).toBeDefined();
 		expect(res.connectionToken).not.toBe(res.connectionId);
 		expect(res.negotiateVersion).toBe(1);
-		expect(res.availableTransports[0]?.transport).toBe("WebSockets");
+		expect(res.availableTransports[0]?.transport).toBe("ServerSentEvents");
 		expect(res.availableTransports[0]?.transferFormats).toContain("Text");
+	});
+
+	it("announces whatever transports the caller can serve", () => {
+		const adapter = new SignalRAdapter(new TestHub());
+		const res = adapter.negotiate("abc-123", ["WebSockets", "LongPolling"]);
+		expect(res.availableTransports.map((t) => t.transport)).toEqual([
+			"WebSockets",
+			"LongPolling",
+		]);
 	});
 
 	describe("containsClose", () => {

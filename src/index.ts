@@ -41,3 +41,11 @@ export {
 	SignalRAdapter,
 	type SignalRMessageType,
 } from "./SignalRAdapter.js";
+export {
+	type HubHttpContext,
+	type HubRouter,
+	type HubSseStream,
+	type MountedHub,
+	registerHubRoutes,
+	splitFrames,
+} from "./SignalRTransport.js";

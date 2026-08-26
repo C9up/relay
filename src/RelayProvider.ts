@@ -1,4 +1,7 @@
+import type { Hub } from "./Hub.js";
 import { Relay, type RelayConfig, type RelayRouteBuilder } from "./Relay.js";
+import { SignalRAdapter } from "./SignalRAdapter.js";
+import { type HubRouter, registerHubRoutes } from "./SignalRTransport.js";
 import { setRelay } from "./services/main.js";
 
 interface RelayContainer {
@@ -78,6 +81,7 @@ export default class RelayProvider {
 		const router = await this.app.container.resolve<ReamRouter>("router");
 		const relay = await this.app.container.resolve<Relay>(Relay);
 		registerRelayRoutes(router, relay);
+		registerMountedHubs(router, relay);
 	}
 
 	async ready(): Promise<void> {}
@@ -126,6 +130,29 @@ interface ReamRouter {
 		path: string,
 		handler: (ctx: ReamHttpContext) => Promise<void> | void,
 	): RelayRouteBuilder;
+}
+
+/**
+ * Mount every hub recorded with `relay.hub(path, hub)`.
+ *
+ * Each gets the three routes SignalR's SSE transport needs, and the same route
+ * customizer the relay's own routes get — a hub is as much in need of `auth`
+ * middleware as the event stream is.
+ */
+function registerMountedHubs(router: ReamRouter, relay: Relay): void {
+	for (const mounted of relay.mountedHubs()) {
+		const hub = mounted.hub as Hub;
+		const routes = registerHubRoutes(router as unknown as HubRouter, {
+			path: mounted.path,
+			hub,
+			adapter:
+				(mounted.adapter as SignalRAdapter | undefined) ??
+				new SignalRAdapter(hub),
+		});
+		for (const route of [routes.negotiate, routes.stream, routes.send]) {
+			relay.applyRouteCustomization(route as RelayRouteBuilder);
+		}
+	}
 }
 
 function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
