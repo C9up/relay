@@ -75,7 +75,7 @@ export abstract class Hub {
 	/** Allowlist of dispatchable handler methods (populated at construction). */
 	private handlerMethods: Map<
 		string,
-		(ctx: HubContext, data: unknown) => Promise<void> | void
+		(ctx: HubContext, ...args: unknown[]) => Promise<void> | void
 	> = new Map();
 
 	constructor() {
@@ -183,7 +183,7 @@ export abstract class Hub {
 	async dispatch(
 		clientId: string,
 		event: string,
-		data: unknown,
+		...args: unknown[]
 	): Promise<boolean> {
 		const client = this.clients.get(clientId);
 		if (!client) return false;
@@ -207,7 +207,11 @@ export abstract class Hub {
 		// Reuse existing ctx if available, otherwise create
 		const ctx = this.buildContext(client);
 		try {
-			await handler.call(this, ctx, data);
+			// EVERY argument, not just the first. A SignalR client calling
+			// `connection.invoke('Method', a, b, c)` sends three; passing only
+			// `a` dropped the rest without a word. A handler declaring one
+			// parameter is unaffected — JavaScript ignores the extras.
+			await handler.call(this, ctx, ...args);
 			return true;
 		} catch {
 			client.send("error", { code: "HANDLER_ERROR", message: "Handler error" });

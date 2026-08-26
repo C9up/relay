@@ -273,3 +273,134 @@ describe("relay > SignalRAdapter", () => {
 		expect(out[0]).toContain("Invalid handshake");
 	});
 });
+
+class MultiArgHub extends Hub {
+	public seen: unknown[] = [];
+
+	async onSum(_ctx: HubContext, ...args: unknown[]) {
+		this.seen = args;
+	}
+
+	async onOne(_ctx: HubContext, first: unknown) {
+		this.seen = [first];
+	}
+}
+
+function multiArgAdapter(): {
+	hub: MultiArgHub;
+	adapter: SignalRAdapter;
+	clientId: string;
+} {
+	const hub = new MultiArgHub();
+	const adapter = new SignalRAdapter(hub);
+	const clientId = "client-multi";
+	hub.registerClient({
+		id: clientId,
+		groups: new Set(),
+		auth: { isAuthenticated: false },
+		send: () => {},
+	});
+	return { hub, adapter, clientId };
+}
+
+async function doHandshake(
+	adapter: SignalRAdapter,
+	clientId: string,
+): Promise<void> {
+	await adapter.handleFrame(
+		clientId,
+		`${JSON.stringify({ protocol: "json", version: 1 })}${RS}`,
+	);
+}
+
+describe("relay > SignalRAdapter invocation arguments", () => {
+	it("passes every argument, not just the first", async () => {
+		const { hub, adapter, clientId } = multiArgAdapter();
+		await doHandshake(adapter, clientId);
+
+		await adapter.handleFrame(
+			clientId,
+			`${JSON.stringify({
+				type: 1,
+				target: "sum",
+				arguments: [1, 2, 3],
+			})}${RS}`,
+		);
+
+		// `connection.invoke('Sum', 1, 2, 3)` used to reach the handler as `1`.
+		// The other two were dropped without a word, which is data loss the
+		// caller cannot see.
+		expect(hub.seen).toEqual([1, 2, 3]);
+	});
+
+	it("leaves a one-parameter handler working unchanged", async () => {
+		const { hub, adapter, clientId } = multiArgAdapter();
+		await doHandshake(adapter, clientId);
+
+		await adapter.handleFrame(
+			clientId,
+			`${JSON.stringify({ type: 1, target: "one", arguments: [{ a: 1 }, "extra"] })}${RS}`,
+		);
+
+		expect(hub.seen).toEqual([{ a: 1 }]);
+	});
+
+	it("handles an invocation with no arguments at all", async () => {
+		const { hub, adapter, clientId } = multiArgAdapter();
+		await doHandshake(adapter, clientId);
+
+		await adapter.handleFrame(
+			clientId,
+			`${JSON.stringify({ type: 1, target: "sum", arguments: [] })}${RS}`,
+		);
+
+		expect(hub.seen).toEqual([]);
+	});
+});
+
+describe("relay > SignalRAdapter unsupported message types", () => {
+	it("answers a stream invocation with an error Completion", async () => {
+		const { adapter, clientId } = multiArgAdapter();
+		await doHandshake(adapter, clientId);
+
+		const out = await adapter.handleFrame(
+			clientId,
+			`${JSON.stringify({
+				type: 4,
+				invocationId: "inv-9",
+				target: "sum",
+				arguments: [],
+			})}${RS}`,
+		);
+
+		// Dropped, the client's observable waits for the lifetime of the
+		// connection: the protocol promises a Completion, so there is no
+		// timeout to fall back on.
+		const messages = out
+			.join("")
+			.split(RS)
+			.filter(Boolean)
+			.map((m) => JSON.parse(m));
+		const completion = messages.find((m) => m.type === 3);
+		expect(completion).toMatchObject({
+			invocationId: "inv-9",
+			error: expect.stringContaining("Streaming is not supported"),
+		});
+	});
+
+	it("ignores a stream item and a cancellation without answering", async () => {
+		const { adapter, clientId } = multiArgAdapter();
+		await doHandshake(adapter, clientId);
+
+		const out = await adapter.handleFrame(
+			clientId,
+			`${JSON.stringify({ type: 2, invocationId: "inv-9", item: 1 })}${RS}` +
+				`${JSON.stringify({ type: 5, invocationId: "inv-9" })}${RS}`,
+		);
+
+		// Neither carries a reply in the protocol: the item belongs to a stream
+		// whose opening invocation was already refused, and the cancel targets a
+		// stream that was never started.
+		expect(out.join("")).toBe("");
+	});
+});

@@ -24,7 +24,7 @@ import type { Hub } from "./Hub.js";
 const RS = "\x1e";
 const DEFAULT_MAX_FRAME_SIZE = 65_536;
 
-export type SignalRMessageType = 1 | 2 | 3 | 5 | 6 | 7;
+export type SignalRMessageType = 1 | 2 | 3 | 4 | 5 | 6 | 7;
 
 interface InvocationMessage {
 	type: 1;
@@ -39,6 +39,20 @@ interface CompletionMessage {
 	invocationId: string;
 	result?: unknown;
 	error?: string;
+}
+
+/**
+ * A client asking the hub to STREAM results back (`connection.stream(...)`).
+ *
+ * Unlike a plain invocation, the invocationId is required: it is the handle the
+ * client's observable is waiting on.
+ */
+interface StreamInvocationMessage {
+	type: 4;
+	invocationId: string;
+	target: string;
+	arguments?: unknown[];
+	[key: string]: unknown;
 }
 
 interface PingMessage {
@@ -169,7 +183,7 @@ export class SignalRAdapter {
 						ok = await this.#hub.dispatch(
 							clientId,
 							inv.target,
-							inv.arguments?.[0],
+							...(inv.arguments ?? []),
 						);
 					} catch {
 						// dispatch() reports failures via its boolean return; guard
@@ -194,13 +208,37 @@ export class SignalRAdapter {
 					}
 					break;
 				}
+				case 4: {
+					// StreamInvocation. Streaming is not implemented, and dropping
+					// this left the client's observable pending for the lifetime of
+					// the connection — the caller has no timeout to fall back on
+					// because the protocol promises a Completion. Say so instead.
+					const stream = msg as Partial<StreamInvocationMessage>;
+					if (typeof stream.invocationId === "string") {
+						out.push(
+							this.#encodeCompletion(
+								stream.invocationId,
+								undefined,
+								"Streaming is not supported by this hub",
+							),
+						);
+					}
+					break;
+				}
+				// StreamItem (2) and CancelInvocation (5) carry no reply of their
+				// own in the protocol: an item belongs to a stream whose opening
+				// invocation was already answered with the error above, and a
+				// cancel targets a stream that was never started. Ignoring them is
+				// the correct response, not a gap.
+				case 2:
+				case 5:
+					break;
 				case 6: // Ping
 					out.push(this.#encode({ type: 6 } satisfies PingMessage));
 					break;
 				case 7: // Close
 					this.#handshakes.delete(clientId);
 					break;
-				// Stream / Cancel not supported — drop silently
 			}
 		}
 
