@@ -1,6 +1,6 @@
 {
   "name": "@c9up/relay",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Relay — Realtime client transport for the Ream framework (SSE + WebSocket Hub + SignalR)",
   "license": "MIT",
   "type": "module",
@@ -25,7 +25,7 @@
     }
   },
   "peerDependencies": {
-    "@c9up/ream": "^0.1.0"
+    "@c9up/ream": "^0.2.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
