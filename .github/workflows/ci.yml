@@ -45,6 +45,9 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    permissions:
+      # Creating the release needs write; the workflow default is read.
+      contents: write
     timeout-minutes: 15
     needs: [build-and-test]
     if: github.event_name == 'workflow_dispatch'
@@ -127,3 +130,28 @@ jobs:
       - run: pnpm publish --access public --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Create the GitHub release
+        # Notes from the commits this tag contains. Without it a published
+        # version arrives with no explanation of what changed, and the only way
+        # to find out is to read a diff.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::notice::not built from a tag - no release to create"
+            exit 0
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::release $tag already exists - leaving it alone"
+            exit 0
+          fi
+          prev="$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)"
+          range="${tag}"
+          [ -n "$prev" ] && range="${prev}..${tag}"
+          notes="$(git log "$range" --no-merges --format='### %s%n%n%b%n' \
+            | grep -vE '^### [a-z0-9@/.-]+ [0-9]+\.[0-9]+\.[0-9]+$' || true)"
+          [ -z "${notes// }" ] && notes="_Version bump only - no behavioural change._"
+          [ -n "$prev" ] && notes="${notes}"$'\n\n---\n\n'"Changes since \`${prev}\`."
+          printf '%s\n' "$notes" | gh release create "$tag" --title "$tag" --notes-file -
