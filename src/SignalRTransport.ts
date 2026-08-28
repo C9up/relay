@@ -62,9 +62,17 @@ export interface MountedHub {
 }
 
 /** The router methods this transport needs. */
-export interface HubRouter {
-	get(path: string, handler: (ctx: HubHttpContext) => Promise<void>): unknown;
-	post(path: string, handler: (ctx: HubHttpContext) => Promise<void>): unknown;
+/**
+ * The slice of a router the hub routes need.
+ *
+ * Generic over the context so a host router whose handlers receive a RICHER
+ * context still satisfies it. Pinned to `HubHttpContext`, a host's own router
+ * type never matched — handler parameters are contravariant — and the caller
+ * had to lie with a double cast.
+ */
+export interface HubRouter<Ctx extends HubHttpContext = HubHttpContext> {
+	get(path: string, handler: (ctx: Ctx) => Promise<void> | void): unknown;
+	post(path: string, handler: (ctx: Ctx) => Promise<void> | void): unknown;
 }
 
 /** The `id` query parameter — SignalR's connection token. */
@@ -112,8 +120,8 @@ export function splitFrames(body: string): string[] {
  * Returns the route objects so a caller can apply middleware to them the way
  * `relay.registerRoutes()` customizes the relay's own.
  */
-export function registerHubRoutes(
-	router: HubRouter,
+export function registerHubRoutes<Ctx extends HubHttpContext>(
+	router: HubRouter<Ctx>,
 	mounted: MountedHub,
 ): { negotiate: unknown; stream: unknown; send: unknown } {
 	const { path, hub, adapter } = mounted;

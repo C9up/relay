@@ -1,7 +1,7 @@
 import type { Hub } from "./Hub.js";
 import { Relay, type RelayConfig, type RelayRouteBuilder } from "./Relay.js";
 import { SignalRAdapter } from "./SignalRAdapter.js";
-import { type HubRouter, registerHubRoutes } from "./SignalRTransport.js";
+import { registerHubRoutes } from "./SignalRTransport.js";
 import { setRelay } from "./services/main.js";
 
 interface RelayContainer {
@@ -99,6 +99,12 @@ interface ReamRequest {
 	header(name: string): string | undefined;
 	body(): Promise<unknown> | unknown;
 	qs?(): Record<string, unknown>;
+	// Declared because the hub routes read them, and ream's Request has both.
+	// Leaving them out is what made this context fail to satisfy HubHttpContext,
+	// and the caller reach for a double cast rather than describe the object it
+	// actually had.
+	url(includeQs?: boolean): string;
+	raw(): string;
 }
 interface ReamResponse {
 	status(code: number): ReamResponse;
@@ -142,7 +148,7 @@ interface ReamRouter {
 function registerMountedHubs(router: ReamRouter, relay: Relay): void {
 	for (const mounted of relay.mountedHubs()) {
 		const hub = mounted.hub as Hub;
-		const routes = registerHubRoutes(router as unknown as HubRouter, {
+		const routes = registerHubRoutes(router, {
 			path: mounted.path,
 			hub,
 			adapter:
