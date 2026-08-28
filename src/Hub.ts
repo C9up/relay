@@ -69,11 +69,11 @@ interface ConnectedHubClient {
  * lifecycle hooks and are not dispatchable.)
  */
 export abstract class Hub {
-	private clients: Map<string, ConnectedHubClient> = new Map();
-	private groupIndex: Map<string, Set<string>> = new Map();
-	private guards: HubGuardOptions = {};
+	#clients: Map<string, ConnectedHubClient> = new Map();
+	#groupIndex: Map<string, Set<string>> = new Map();
+	#guards: HubGuardOptions = {};
 	/** Allowlist of dispatchable handler methods (populated at construction). */
-	private handlerMethods: Map<
+	#handlerMethods: Map<
 		string,
 		(ctx: HubContext, ...args: unknown[]) => Promise<void> | void
 	> = new Map();
@@ -91,14 +91,14 @@ export abstract class Hub {
 			) {
 				// Convert onTaskUpdate → taskUpdate (event name)
 				const eventName = name.charAt(2).toLowerCase() + name.slice(3);
-				this.handlerMethods.set(eventName, proto[name]);
+				this.#handlerMethods.set(eventName, proto[name]);
 			}
 		}
 	}
 
 	/** Set guard options for the entire hub. Normalizes singular guard/guards. */
 	useGuards(options: HubGuardOptions): void {
-		this.guards = {
+		this.#guards = {
 			guards: [
 				...(options.guards ?? []),
 				...(options.guard ? [options.guard] : []),
@@ -115,21 +115,22 @@ export abstract class Hub {
 	async onDisconnect(_clientId: string): Promise<void> {}
 
 	/** Build a HubContext for a client. */
-	private buildContext(client: ConnectedHubClient): HubContext {
+	#buildContext(client: ConnectedHubClient): HubContext {
 		const ctx: HubContext = {
 			clientId: client.id,
 			auth: client.auth,
 			joinGroup: (group: string) => {
 				client.groups.add(group);
-				if (!this.groupIndex.has(group)) this.groupIndex.set(group, new Set());
-				this.groupIndex.get(group)?.add(client.id);
+				if (!this.#groupIndex.has(group))
+					this.#groupIndex.set(group, new Set());
+				this.#groupIndex.get(group)?.add(client.id);
 			},
 			leaveGroup: (group: string) => {
 				client.groups.delete(group);
-				const members = this.groupIndex.get(group);
+				const members = this.#groupIndex.get(group);
 				if (members) {
 					members.delete(client.id);
-					if (members.size === 0) this.groupIndex.delete(group);
+					if (members.size === 0) this.#groupIndex.delete(group);
 				}
 			},
 			send: (event: string, data: unknown) => {
@@ -137,11 +138,11 @@ export abstract class Hub {
 			},
 			group: (name: string) => ({
 				send: (event: string, data: unknown) => {
-					this.sendToGroup(name, event, data);
+					this.#sendToGroup(name, event, data);
 				},
 			}),
 			broadcast: (event: string, data: unknown) => {
-				this.broadcastAll(event, data);
+				this.#broadcastAll(event, data);
 			},
 		};
 
@@ -150,22 +151,22 @@ export abstract class Hub {
 
 	/** Register a client connection. */
 	registerClient(client: ConnectedHubClient): HubContext {
-		this.clients.set(client.id, client);
-		return this.buildContext(client);
+		this.#clients.set(client.id, client);
+		return this.#buildContext(client);
 	}
 
 	/** Remove a client. */
 	removeClient(clientId: string): void {
-		const client = this.clients.get(clientId);
+		const client = this.#clients.get(clientId);
 		if (client) {
 			for (const group of client.groups) {
-				const members = this.groupIndex.get(group);
+				const members = this.#groupIndex.get(group);
 				if (members) {
 					members.delete(clientId);
-					if (members.size === 0) this.groupIndex.delete(group);
+					if (members.size === 0) this.#groupIndex.delete(group);
 				}
 			}
-			this.clients.delete(clientId);
+			this.#clients.delete(clientId);
 			this.onDisconnect(clientId).catch(() => {});
 		}
 	}
@@ -185,7 +186,7 @@ export abstract class Hub {
 		event: string,
 		...args: unknown[]
 	): Promise<boolean> {
-		const client = this.clients.get(clientId);
+		const client = this.#clients.get(clientId);
 		if (!client) return false;
 
 		const authError = this.#checkDispatchAuth(client);
@@ -195,7 +196,7 @@ export abstract class Hub {
 		}
 
 		// Find handler from allowlist (never dispatches to lifecycle hooks or inherited methods)
-		const handler = this.handlerMethods.get(event);
+		const handler = this.#handlerMethods.get(event);
 		if (!handler) {
 			client.send("error", {
 				code: "UNKNOWN_EVENT",
@@ -205,7 +206,7 @@ export abstract class Hub {
 		}
 
 		// Reuse existing ctx if available, otherwise create
-		const ctx = this.buildContext(client);
+		const ctx = this.#buildContext(client);
 		try {
 			// EVERY argument, not just the first. A SignalR client calling
 			// `connection.invoke('Method', a, b, c)` sends three; passing only
@@ -228,13 +229,13 @@ export abstract class Hub {
 		client: ConnectedHubClient,
 	): { code: string; message: string } | null {
 		const requiredStrategies: string[] = [
-			...(this.guards.guard ? [this.guards.guard] : []),
-			...(this.guards.guards ?? []),
+			...(this.#guards.guard ? [this.#guards.guard] : []),
+			...(this.#guards.guards ?? []),
 		];
 		const needsAuth =
 			requiredStrategies.length > 0 ||
-			(this.guards.roles?.length ?? 0) > 0 ||
-			(this.guards.permissions?.length ?? 0) > 0;
+			(this.#guards.roles?.length ?? 0) > 0 ||
+			(this.#guards.permissions?.length ?? 0) > 0;
 
 		if (needsAuth && !client.auth.isAuthenticated) {
 			return { code: "UNAUTHORIZED", message: "Not authenticated" };
@@ -250,16 +251,16 @@ export abstract class Hub {
 			}
 		}
 
-		if (this.guards.roles && this.guards.roles.length > 0) {
+		if (this.#guards.roles && this.#guards.roles.length > 0) {
 			const userRoles = client.auth.roles ?? [];
-			if (!this.guards.roles.some((r) => userRoles.includes(r))) {
+			if (!this.#guards.roles.some((r) => userRoles.includes(r))) {
 				return { code: "FORBIDDEN", message: "Insufficient role" };
 			}
 		}
 
-		if (this.guards.permissions && this.guards.permissions.length > 0) {
+		if (this.#guards.permissions && this.#guards.permissions.length > 0) {
 			const userPerms = client.auth.permissions ?? [];
-			if (!this.guards.permissions.every((p) => userPerms.includes(p))) {
+			if (!this.#guards.permissions.every((p) => userPerms.includes(p))) {
 				return { code: "FORBIDDEN", message: "Insufficient permissions" };
 			}
 		}
@@ -268,12 +269,12 @@ export abstract class Hub {
 	}
 
 	/** Send to all clients in a group. */
-	private sendToGroup(group: string, event: string, data: unknown): void {
-		const members = this.groupIndex.get(group);
+	#sendToGroup(group: string, event: string, data: unknown): void {
+		const members = this.#groupIndex.get(group);
 		if (!members) return;
 		const dead: string[] = [];
 		for (const id of members) {
-			const client = this.clients.get(id);
+			const client = this.#clients.get(id);
 			if (client) {
 				client.send(event, data);
 			} else {
@@ -284,14 +285,14 @@ export abstract class Hub {
 	}
 
 	/** Broadcast to all connected clients. */
-	private broadcastAll(event: string, data: unknown): void {
-		for (const client of this.clients.values()) {
+	#broadcastAll(event: string, data: unknown): void {
+		for (const client of this.#clients.values()) {
 			client.send(event, data);
 		}
 	}
 
 	/** Get stats. */
 	stats(): { clients: number; groups: number } {
-		return { clients: this.clients.size, groups: this.groupIndex.size };
+		return { clients: this.#clients.size, groups: this.#groupIndex.size };
 	}
 }
