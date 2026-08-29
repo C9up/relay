@@ -108,10 +108,15 @@ export interface RelayConfig {
 	/**
 	 * Optional message bus for multi-instance broadcast sync. When set,
 	 * every `broadcast(...)` is mirrored onto the bus and re-delivered to
-	 * the SSE clients of every other instance. Adonis Transmit parity
-	 * (its injected `transport`). Absent → single-instance, no bus.
+	 * the SSE clients of every other instance. Absent → single-instance, no
+	 * bus: a broadcast reaches the clients of the instance that made it, and
+	 * no further.
+	 *
+	 * Takes a transport, or a factory answering one — which is what the
+	 * `transports.*` helpers return, so a config file can name a bus it has no
+	 * way of building yet.
 	 */
-	transport?: RelayTransport;
+	transport?: RelayTransport | (() => RelayTransport);
 	/**
 	 * Bus channel the broadcasts are published on. Default
 	 * `relay::broadcast`. Mirrors Transmit's `transport.channel`.
@@ -204,7 +209,8 @@ export class Relay {
 			maxClients: config?.maxClients ?? 10_000,
 			maxChannelsPerClient: config?.maxChannelsPerClient ?? 100,
 		};
-		this.#transport = config?.transport;
+		const transport = config?.transport;
+		this.#transport = typeof transport === "function" ? transport() : transport;
 		this.#transportChannel = config?.transportChannel ?? "relay::broadcast";
 		// Multi-instance sync: subscribe to the bus and re-deliver every remote
 		// broadcast to THIS instance's local SSE clients. Local-only re-emit —

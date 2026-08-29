@@ -28,6 +28,18 @@ providers: [
 ]
 ```
 
+Running more than one instance? A broadcast only reaches the SSE clients of the
+instance that made it, unless you give relay a bus:
+
+```ts
+// config/relay.ts
+import { defineConfig, transports } from '@c9up/relay'
+
+export default defineConfig({
+  transport: transports.redis({ connection: 'main' }),
+})
+```
+
 ## Entry points
 
 - `@c9up/relay` — main API
