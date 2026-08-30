@@ -77,7 +77,7 @@ describe("@c9up/relay published shape", () => {
 		if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
 	});
 
-	it("advertises the 4 sub-paths and every export target lands in the tarball", () => {
+	it("advertises the 5 sub-paths and every export target lands in the tarball", () => {
 		const tarLocal = process.platform === "win32" ? ["--force-local"] : [];
 		const pkgJsonRaw = execFileSync(
 			"tar",
@@ -91,6 +91,7 @@ describe("@c9up/relay published shape", () => {
 
 		expect(Object.keys(parsed.exports).sort()).toEqual([
 			".",
+			"./configure",
 			"./provider",
 			"./services/main",
 			"./testing",

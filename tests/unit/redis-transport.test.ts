@@ -136,10 +136,13 @@ describe("relay > redis transport", () => {
 		expect(resolve).toHaveBeenCalledTimes(1);
 	});
 
-	it("names the missing package when a connection name has nothing to resolve", async () => {
+	it("says what is missing when a connection name has nothing to resolve", async () => {
+		// Either quasar is absent, or it is present and nothing registered its
+		// provider yet. Both name the thing to fix, and neither publishes into
+		// a connection that does not exist.
 		const transport = transports.redis({ connection: "main" })();
 		await expect(
 			transport.publish("relay::broadcast", { type: "broadcast" }),
-		).rejects.toThrow(/quasar/);
+		).rejects.toThrow(/quasar|redis/i);
 	});
 });
