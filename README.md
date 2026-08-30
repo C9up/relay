@@ -6,6 +6,18 @@
 > `SignalRAdapter` implement their protocols in full, but Ream's Rust HTTP server
 > exposes no WebSocket upgrade point, so the caller must supply the socket itself.
 
+### What "no server transport" means
+
+`Hub` and `SignalRAdapter` are **protocol** implementations: they parse an
+inbound text frame and hand back the frames to send. They do not open, own or
+close a socket, and this package cannot give you one — Ream's Rust HTTP server
+exposes no WebSocket upgrade point yet.
+
+So a SignalR or Hub deployment needs a WebSocket server you supply and drive
+(`ws`, `uWebSockets.js`, a reverse proxy). Installing this package does not
+give you a working SignalR endpoint. `Transmit` (SSE) is the transport that
+runs end to end here today.
+
 Part of **[Ream](https://github.com/C9up/ream)** — a Rust-powered, AdonisJS-compatible Node.js framework. Independent, publishable package.
 
 ## Installation

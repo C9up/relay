@@ -5,8 +5,11 @@
  *   - Negotiate (HTTP POST /<endpoint>/negotiate)
  *   - Handshake (first message from client: { protocol: 'json', version: 1 })
  *   - Invocation (type 1): client → server method invocation
- *   - StreamItem / Completion (types 2, 3): not implemented (rare)
- *   - CancelInvocation (type 5): not implemented
+ *   - StreamItem (2) / CancelInvocation (5): accepted and ignored, which is
+ *     what the protocol asks for once streaming has been refused — see the
+ *     dispatch below. Server→client streaming itself is not offered: a hub
+ *     method that returns a stream is answered with an explicit error, never
+ *     with silence.
  *   - Ping (type 6): bidirectional keep-alive
  *   - Close (type 7): graceful disconnect
  *
