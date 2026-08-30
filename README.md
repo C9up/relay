@@ -14,12 +14,8 @@ Part of **[Ream](https://github.com/C9up/ream)** — a Rust-powered, AdonisJS-co
 pnpm add @c9up/relay
 ```
 
-Relay ships no auto-`configure` hook — register the provider and add
-`config/relay.ts` manually (see Usage below).
-
-## Usage
-
-Register the provider in your app, then configure it under `config/relay.ts`:
+`ream add @c9up/relay` installs it, registers the provider and writes
+`config/relay.ts`. To do it by hand:
 
 ```ts
 // reamrc.ts
@@ -27,6 +23,8 @@ providers: [
   () => import('@c9up/relay/provider'),
 ]
 ```
+
+## Usage
 
 Running more than one instance? A broadcast only reaches the SSE clients of the
 instance that made it, unless you give relay a bus:
