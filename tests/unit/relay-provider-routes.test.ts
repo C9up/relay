@@ -6,7 +6,11 @@
  * decides whether a browser can connect at all.
  */
 import { describe, expect, it, vi } from "vitest";
-import { Relay, type RelaySseStream } from "../../src/Relay.js";
+import {
+	Relay,
+	type RelayConfig,
+	type RelaySseStream,
+} from "../../src/Relay.js";
 import RelayProvider from "../../src/RelayProvider.js";
 import { getRelay } from "../../src/services/main.js";
 
@@ -30,7 +34,9 @@ function fakeRouter() {
 }
 
 /** A container that caches, because `singleton` is the whole point. */
-function fakeApp(options: { withRouter?: boolean } = {}) {
+function fakeApp(
+	options: { withRouter?: boolean; relayConfig?: RelayConfig } = {},
+) {
 	const factories = new Map<unknown, () => unknown>();
 	const built = new Map<unknown, unknown>();
 	const router = fakeRouter();
@@ -54,7 +60,9 @@ function fakeApp(options: { withRouter?: boolean } = {}) {
 		factories,
 		app: {
 			container,
-			config: { get: <T>() => undefined as T | undefined },
+			config: {
+				get: <T>() => options.relayConfig as T | undefined,
+			},
 		},
 	};
 }
@@ -62,9 +70,12 @@ function fakeApp(options: { withRouter?: boolean } = {}) {
 /** A response double recording what the handler answered with. */
 function fakeResponse() {
 	const sent: Array<{ status?: number; body?: unknown }> = [];
+	const frames: Array<{ event: string; data: unknown }> = [];
 	let status: number | undefined;
 	const response = {
 		sent,
+		frames,
+		sseEnded: false,
 		sseOpened: false,
 		status(code: number) {
 			status = code;
@@ -84,11 +95,14 @@ function fakeResponse() {
 			return {
 				id: "s-1",
 				isOpen: () => true,
-				async send() {
+				async send(event: string, data: unknown) {
+					frames.push({ event, data });
 					return true;
 				},
 				onClose() {},
-				async end() {},
+				async end() {
+					response.sseEnded = true;
+				},
 			};
 		},
 	};
@@ -157,6 +171,42 @@ describe("relay > provider > the routes", () => {
 		await provider.start();
 
 		expect(router.routes.size).toBe(0);
+	});
+
+	it("closes a capped connection with an error frame, not half-open", async () => {
+		const { app, router } = fakeApp({
+			withRouter: true,
+			relayConfig: { maxClients: 1 },
+		});
+		const provider = new RelayProvider(app as never);
+		provider.register();
+		await provider.boot();
+		await provider.start();
+
+		const events = router.routes.get("GET /__relay/events");
+		const first = fakeResponse();
+		await events?.({
+			request: fakeRequest(),
+			response: first,
+			auth: { isAuthenticated: true, user: { id: "u-a" } },
+		});
+		expect(first.sseEnded).toBe(false);
+
+		const capped = fakeResponse();
+		await events?.({
+			request: fakeRequest(),
+			response: capped,
+			auth: { isAuthenticated: true, user: { id: "u-b" } },
+		});
+
+		// The stream is already open by the time the cap is known, so the
+		// client is told why and the stream is closed. It used to be
+		// documented as unreachable in tests, and as losing the frame to a
+		// registry race that has since been fixed.
+		expect(capped.frames).toEqual([
+			{ event: "error", data: { code: "E_MAX_CLIENTS" } },
+		]);
+		expect(capped.sseEnded).toBe(true);
 	});
 
 	it("refuses a uid hint that claims someone else, without opening a stream", async () => {

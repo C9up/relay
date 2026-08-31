@@ -210,13 +210,9 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 			// frame and close cleanly so the client sees a structured
 			// shutdown instead of a half-open connection.
 			//
-			// NOTE: this hits the same close/take_receiver race as the
-			// hint-mismatch case used to. In practice "capped" only fires
-			// when maxClients is reached, so the test suite doesn't
-			// exercise it. The proper fix is on the Rust side
-			// (StreamRegistry::close should drop the sender but leave the
-			// entry until take_receiver consumes the receiver). Filed as
-			// follow-up; until then a maxed-out relay logs the error.
+			// The frame does arrive: the stream registry keeps a closed
+			// entry until its receiver has been taken, so a send followed
+			// immediately by an end no longer loses the body.
 			await sse.send("error", { code: "E_MAX_CLIENTS" });
 			await sse.end();
 		} else if (outcome.outcome === "forbidden") {
