@@ -506,7 +506,7 @@ export class Relay {
 		ctx: RelayContext,
 	): Promise<SubscribeResult> {
 		if (!uid || !channel) {
-			return { ok: false, status: 400, code: "E_BAD_REQUEST" };
+			return { ok: false, status: 400, code: "E_RELAY_BAD_REQUEST" };
 		}
 		if (channel.length > 256) {
 			return { ok: false, status: 400, code: "E_CHANNEL_TOO_LONG" };

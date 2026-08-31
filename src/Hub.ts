@@ -199,7 +199,7 @@ export abstract class Hub {
 		const handler = this.#handlerMethods.get(event);
 		if (!handler) {
 			client.send("error", {
-				code: "E_UNKNOWN_EVENT",
+				code: "E_RELAY_UNKNOWN_EVENT",
 				message: `No handler for: ${event}`,
 			});
 			return false;
@@ -216,7 +216,7 @@ export abstract class Hub {
 			return true;
 		} catch {
 			client.send("error", {
-				code: "E_HANDLER_ERROR",
+				code: "E_RELAY_HANDLER_ERROR",
 				message: "Handler error",
 			});
 			return false;
@@ -241,14 +241,14 @@ export abstract class Hub {
 			(this.#guards.permissions?.length ?? 0) > 0;
 
 		if (needsAuth && !client.auth.isAuthenticated) {
-			return { code: "UNAUTHORIZED", message: "Not authenticated" };
+			return { code: "E_RELAY_UNAUTHORIZED", message: "Not authenticated" };
 		}
 
 		if (requiredStrategies.length > 0) {
 			const actualStrategy = client.auth.strategy;
 			if (!actualStrategy || !requiredStrategies.includes(actualStrategy)) {
 				return {
-					code: "UNAUTHORIZED",
+					code: "E_RELAY_UNAUTHORIZED",
 					message: `Authentication strategy mismatch (expected: ${requiredStrategies.join(", ")})`,
 				};
 			}
@@ -257,14 +257,17 @@ export abstract class Hub {
 		if (this.#guards.roles && this.#guards.roles.length > 0) {
 			const userRoles = client.auth.roles ?? [];
 			if (!this.#guards.roles.some((r) => userRoles.includes(r))) {
-				return { code: "FORBIDDEN", message: "Insufficient role" };
+				return { code: "E_RELAY_FORBIDDEN", message: "Insufficient role" };
 			}
 		}
 
 		if (this.#guards.permissions && this.#guards.permissions.length > 0) {
 			const userPerms = client.auth.permissions ?? [];
 			if (!this.#guards.permissions.every((p) => userPerms.includes(p))) {
-				return { code: "FORBIDDEN", message: "Insufficient permissions" };
+				return {
+					code: "E_RELAY_FORBIDDEN",
+					message: "Insufficient permissions",
+				};
 			}
 		}
 

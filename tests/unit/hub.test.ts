@@ -56,7 +56,10 @@ describe("relay > Hub > construction + allowlist", () => {
 		return hub.dispatch("c1", "nonsense", {}).then(() => {
 			expect(c.sent).toContainEqual({
 				event: "error",
-				data: { code: "E_UNKNOWN_EVENT", message: "No handler for: nonsense" },
+				data: {
+					code: "E_RELAY_UNKNOWN_EVENT",
+					message: "No handler for: nonsense",
+				},
 			});
 		});
 	});
@@ -105,7 +108,9 @@ describe("relay > Hub > dispatch — handler routing", () => {
 		hub.registerClient(c);
 		await hub.dispatch("a", "unknown", {});
 		expect(c.sent[0]?.event).toBe("error");
-		expect((c.sent[0]?.data as { code: string }).code).toBe("E_UNKNOWN_EVENT");
+		expect((c.sent[0]?.data as { code: string }).code).toBe(
+			"E_RELAY_UNKNOWN_EVENT",
+		);
 	});
 
 	it("catches handler errors and emits HANDLER_ERROR", async () => {
@@ -113,7 +118,9 @@ describe("relay > Hub > dispatch — handler routing", () => {
 		const c = makeClient("a", { isAuthenticated: true });
 		hub.registerClient(c);
 		await hub.dispatch("a", "boom", {});
-		expect((c.sent[0]?.data as { code: string }).code).toBe("E_HANDLER_ERROR");
+		expect((c.sent[0]?.data as { code: string }).code).toBe(
+			"E_RELAY_HANDLER_ERROR",
+		);
 	});
 });
 
@@ -124,7 +131,9 @@ describe("relay > Hub > guards — auth / strategy / roles / permissions", () =>
 		const c = makeClient("a", { isAuthenticated: false });
 		hub.registerClient(c);
 		await hub.dispatch("a", "ping", {});
-		expect((c.sent[0]?.data as { code: string }).code).toBe("UNAUTHORIZED");
+		expect((c.sent[0]?.data as { code: string }).code).toBe(
+			"E_RELAY_UNAUTHORIZED",
+		);
 	});
 
 	it("rejects mismatched auth strategy", async () => {
@@ -133,7 +142,9 @@ describe("relay > Hub > guards — auth / strategy / roles / permissions", () =>
 		const c = makeClient("a", { isAuthenticated: true, strategy: "api-key" });
 		hub.registerClient(c);
 		await hub.dispatch("a", "ping", {});
-		expect((c.sent[0]?.data as { code: string }).code).toBe("UNAUTHORIZED");
+		expect((c.sent[0]?.data as { code: string }).code).toBe(
+			"E_RELAY_UNAUTHORIZED",
+		);
 	});
 
 	it("rejects missing required role", async () => {
@@ -142,7 +153,9 @@ describe("relay > Hub > guards — auth / strategy / roles / permissions", () =>
 		const c = makeClient("a", { isAuthenticated: true, roles: ["user"] });
 		hub.registerClient(c);
 		await hub.dispatch("a", "ping", {});
-		expect((c.sent[0]?.data as { code: string }).code).toBe("FORBIDDEN");
+		expect((c.sent[0]?.data as { code: string }).code).toBe(
+			"E_RELAY_FORBIDDEN",
+		);
 	});
 
 	it("rejects missing required permission", async () => {
@@ -154,7 +167,9 @@ describe("relay > Hub > guards — auth / strategy / roles / permissions", () =>
 		});
 		hub.registerClient(c);
 		await hub.dispatch("a", "ping", {});
-		expect((c.sent[0]?.data as { code: string }).code).toBe("FORBIDDEN");
+		expect((c.sent[0]?.data as { code: string }).code).toBe(
+			"E_RELAY_FORBIDDEN",
+		);
 	});
 
 	it("admits a client that meets every guard", async () => {
