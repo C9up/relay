@@ -47,12 +47,26 @@ export class RedisRelayTransport implements RelayTransport {
 		this.#source = client;
 	}
 
-	/** The client, resolved once and kept. */
+	/**
+	 * The client, resolved once — but a FAILED resolution is not kept.
+	 *
+	 * Caching the rejected promise meant one blip at start-up was permanent:
+	 * every later publish and subscribe rejected instantly, with the original
+	 * error, long after Redis came back. The in-flight promise is still shared,
+	 * so concurrent callers do not each open a connection; only the failure is
+	 * forgotten, so the next call gets to try again.
+	 */
 	#client(): Promise<RelayPubSubClient> {
 		if (!this.#resolved) {
-			this.#resolved = Promise.resolve(
+			const attempt = Promise.resolve(
 				typeof this.#source === "function" ? this.#source() : this.#source,
-			);
+			).catch((err: unknown) => {
+				// Forget it only while it is still the current attempt, so a
+				// retry already under way is not cleared out from under itself.
+				if (this.#resolved === attempt) this.#resolved = undefined;
+				throw err;
+			});
+			this.#resolved = attempt;
 		}
 		return this.#resolved;
 	}

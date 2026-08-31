@@ -146,3 +146,60 @@ describe("relay > redis transport", () => {
 		).rejects.toThrow(/quasar|redis/i);
 	});
 });
+
+describe("relay > a failed resolution is not kept forever", () => {
+	const fakeClient = () => ({
+		publish: async () => undefined,
+		subscribe: async () => undefined,
+		unsubscribe: async () => undefined,
+	});
+
+	it("tries again after a blip, instead of failing for the life of the process", async () => {
+		let attempts = 0;
+		const transport = new RedisRelayTransport(() => {
+			attempts += 1;
+			if (attempts === 1) throw new Error("ECONNREFUSED");
+			return fakeClient();
+		});
+
+		await expect(transport.publish("c", {})).rejects.toThrow(/ECONNREFUSED/);
+
+		// Caching the rejected promise made one blip at start-up permanent:
+		// every later call failed instantly, with the original error, long
+		// after Redis came back.
+		await expect(transport.publish("c", {})).resolves.toBeUndefined();
+		expect(attempts).toBe(2);
+	});
+
+	it("still shares one in-flight resolution between concurrent callers", async () => {
+		let attempts = 0;
+		const transport = new RedisRelayTransport(async () => {
+			attempts += 1;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			return fakeClient();
+		});
+
+		await Promise.all([
+			transport.publish("a", {}),
+			transport.publish("b", {}),
+			transport.subscribe("c", () => {}),
+		]);
+
+		// Forgetting only the FAILURE — three concurrent calls must not open
+		// three connections.
+		expect(attempts).toBe(1);
+	});
+
+	it("keeps a successful resolution", async () => {
+		let attempts = 0;
+		const transport = new RedisRelayTransport(() => {
+			attempts += 1;
+			return fakeClient();
+		});
+
+		await transport.publish("a", {});
+		await transport.publish("b", {});
+
+		expect(attempts).toBe(1);
+	});
+});
