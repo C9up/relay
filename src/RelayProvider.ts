@@ -173,19 +173,16 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 
 		// Pre-flight uid-hint check BEFORE upgrading to SSE.
 		//
-		// Previously: we always upgraded to SSE first, then `relay.connect`
-		// would return `forbidden`, the handler sent an `error` frame and
-		// called `sse.end()` — which removes the stream entry from the
-		// Rust registry. The response builder then called `take_receiver`
-		// AFTER removal, returning None → 500 E_STREAM_UNKNOWN. The TS
-		// handler's "open + close" in the same tick races the Rust response
-		// build that hasn't picked up the receiver yet.
+		// A hint that claims someone else is a pure auth-vs-claim
+		// comparison, so it is answered with a real 403 rather than a 200
+		// stream carrying an error frame. That distinction is what a client
+		// can act on: an EventSource sees a successful connection either
+		// way, and only the status code tells a fetch caller that the
+		// request was refused.
 		//
-		// The hint-mismatch case is a pure auth-vs-claim comparison and
-		// can be answered with a buffered 403 response that never opens a
-		// stream. The `capped` case still needs an SSE upgrade (the slot
-		// count is genuine instance state), but it's rarely hit and is
-		// noted as residual TODO if/when an app actually trips it.
+		// The `capped` case cannot be answered this early — the slot count
+		// is instance state that `relay.connect` owns — so it is handled
+		// below on the open stream.
 		const authUserId = ctx.auth?.isAuthenticated
 			? ctx.auth.user?.id
 			: undefined;
