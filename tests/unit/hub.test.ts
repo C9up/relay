@@ -56,7 +56,7 @@ describe("relay > Hub > construction + allowlist", () => {
 		return hub.dispatch("c1", "nonsense", {}).then(() => {
 			expect(c.sent).toContainEqual({
 				event: "error",
-				data: { code: "UNKNOWN_EVENT", message: "No handler for: nonsense" },
+				data: { code: "E_UNKNOWN_EVENT", message: "No handler for: nonsense" },
 			});
 		});
 	});
@@ -105,7 +105,7 @@ describe("relay > Hub > dispatch — handler routing", () => {
 		hub.registerClient(c);
 		await hub.dispatch("a", "unknown", {});
 		expect(c.sent[0]?.event).toBe("error");
-		expect((c.sent[0]?.data as { code: string }).code).toBe("UNKNOWN_EVENT");
+		expect((c.sent[0]?.data as { code: string }).code).toBe("E_UNKNOWN_EVENT");
 	});
 
 	it("catches handler errors and emits HANDLER_ERROR", async () => {
@@ -113,7 +113,7 @@ describe("relay > Hub > dispatch — handler routing", () => {
 		const c = makeClient("a", { isAuthenticated: true });
 		hub.registerClient(c);
 		await hub.dispatch("a", "boom", {});
-		expect((c.sent[0]?.data as { code: string }).code).toBe("HANDLER_ERROR");
+		expect((c.sent[0]?.data as { code: string }).code).toBe("E_HANDLER_ERROR");
 	});
 });
 

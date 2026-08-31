@@ -199,7 +199,7 @@ export abstract class Hub {
 		const handler = this.#handlerMethods.get(event);
 		if (!handler) {
 			client.send("error", {
-				code: "UNKNOWN_EVENT",
+				code: "E_UNKNOWN_EVENT",
 				message: `No handler for: ${event}`,
 			});
 			return false;
@@ -215,7 +215,10 @@ export abstract class Hub {
 			await handler.call(this, ctx, ...args);
 			return true;
 		} catch {
-			client.send("error", { code: "HANDLER_ERROR", message: "Handler error" });
+			client.send("error", {
+				code: "E_HANDLER_ERROR",
+				message: "Handler error",
+			});
 			return false;
 		}
 	}
