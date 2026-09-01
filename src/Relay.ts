@@ -389,7 +389,16 @@ export class Relay {
 			}
 			// Fire-and-forget — the underlying SSE writer queues onto a
 			// bounded mpsc, so a slow client cannot block the broadcast.
-			void client.sse.send(channel, payload);
+			//
+			// Not awaited, but not unhandled either: a write that rejects is a
+			// client that cannot receive, so it is dropped rather than left in
+			// the map to fail on every later broadcast. Unhandled, that
+			// rejection took the process down on a default Node — one dead
+			// socket ending the broadcast for everybody.
+			void client.sse.send(channel, payload).catch((error: unknown) => {
+				this.#warn(`delivery to ${uid} on '${channel}' failed`, error);
+				this.#dropClient(uid);
+			});
 			reached++;
 		}
 		for (const uid of dead) this.#dropClient(uid);
@@ -403,7 +412,26 @@ export class Relay {
 			channel,
 			payload,
 		};
-		void this.#transport.publish(this.#transportChannel, message);
+		// A publish that fails means the other instances never hear this
+		// broadcast — the same split-brain a failed subscribe causes, and worth
+		// the same line on stderr rather than an unhandled rejection.
+		const transport = this.#transport;
+		void (async () =>
+			transport.publish(this.#transportChannel, message))().catch(
+			(error: unknown) => {
+				this.#warn(
+					`publishing '${channel}' to the bus failed — other instances will not see it`,
+					error,
+				);
+			},
+		);
+	}
+
+	/** One place for the "it kept going, but you should know" line. */
+	#warn(what: string, error: unknown): void {
+		process.stderr.write(
+			`[relay] ${what}: ${error instanceof Error ? error.message : String(error)}\n`,
+		);
 	}
 
 	// ─── Lifecycle hooks ──────────────────────────────────────

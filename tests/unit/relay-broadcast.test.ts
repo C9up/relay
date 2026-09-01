@@ -229,3 +229,45 @@ describe("relay > a transport that cannot subscribe says so", () => {
 		}
 	});
 });
+
+describe("relay > a delivery that rejects", () => {
+	it("drops the client and keeps broadcasting to the others", async () => {
+		const written: string[] = [];
+		const original = process.stderr.write.bind(process.stderr);
+		process.stderr.write = (chunk: string | Uint8Array): boolean => {
+			written.push(String(chunk));
+			return true;
+		};
+		const rejections: unknown[] = [];
+		const onUnhandled = (reason: unknown): void => {
+			rejections.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			const r = new Relay({ allowUnauthorizedChannels: true });
+			const good = await connectAndSubscribe(r, "u-good", "room/1");
+			const bad = await connectAndSubscribe(r, "u-bad", "room/1");
+			// This client's socket write fails from here on.
+			bad.sse.send = async () => {
+				throw new Error("socket gone");
+			};
+
+			r.broadcast("room/1", { n: 1 });
+			await new Promise((resolve) => setTimeout(resolve, 10));
+
+			// The healthy client still got it, and the failing write did not
+			// surface as an unhandled rejection — which on a default Node ends
+			// the process, so one dead socket ended everybody's stream.
+			expect(good.sse.sent).toEqual([
+				{ event: "room/1", data: { n: 1 } },
+			]);
+			expect(rejections).toEqual([]);
+			expect(written.join("")).toContain("delivery to");
+			// …and the client that cannot receive is no longer subscribed.
+			expect(r.getSubscribersFor("room/1")).toEqual([good.uid]);
+		} finally {
+			process.stderr.write = original;
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+})
