@@ -201,3 +201,31 @@ describe("relay-broadcast > on() detacher + getSubscribersFor", () => {
 		expect(r.getSubscribersFor("empty")).toEqual([]);
 	});
 });
+
+describe("relay > a transport that cannot subscribe says so", () => {
+	it("reports instead of failing silently", async () => {
+		const written: string[] = [];
+		const original = process.stderr.write.bind(process.stderr);
+		process.stderr.write = (chunk: string | Uint8Array): boolean => {
+			written.push(String(chunk));
+			return true;
+		};
+		try {
+			const transport: RelayTransport = {
+				publish: async () => {},
+				subscribe: async () => {
+					throw new Error("no route to the bus");
+				},
+			};
+			new Relay({ transport });
+			await new Promise((resolve) => setTimeout(resolve, 10));
+
+			// A failed subscribe is how an instance stops hearing the others: it
+			// keeps serving its own clients and misses everything published
+			// elsewhere. Unawaited, that split-brain was invisible.
+			expect(written.join("")).toContain("will not receive messages");
+		} finally {
+			process.stderr.write = original;
+		}
+	});
+});

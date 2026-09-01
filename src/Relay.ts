@@ -217,11 +217,26 @@ export class Relay {
 		// no re-publish — so a message published by instance A reaches B, C … but
 		// never bounces back onto the bus. Mirrors Transmit's `#broadcastLocally`
 		// off the transport subscription.
-		void this.#transport?.subscribe(this.#transportChannel, (message) => {
-			if (isRelayTransportMessage(message)) {
-				this.#deliver(message.channel, message.payload);
-			}
-		});
+		// `subscribe` may answer synchronously or with a promise, so it goes
+		// through `Promise.resolve` before the catch.
+		void Promise.resolve(
+			this.#transport?.subscribe(this.#transportChannel, (message) => {
+				if (isRelayTransportMessage(message)) {
+					this.#deliver(message.channel, message.payload);
+				}
+			}),
+		)
+			// A subscribe that fails is how an instance stops hearing the others:
+			// it keeps serving its own clients and quietly misses every message
+			// published elsewhere. Unawaited, the rejection had nowhere to go, so
+			// the split-brain was invisible.
+			.catch((error: unknown) => {
+				process.stderr.write(
+					`[relay] transport subscribe failed — this instance will not receive messages published elsewhere: ${
+						error instanceof Error ? error.message : String(error)
+					}\n`,
+				);
+			});
 	}
 
 	// ─── Channel authorization ────────────────────────────────
