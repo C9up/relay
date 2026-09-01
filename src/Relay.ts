@@ -211,21 +211,27 @@ export class Relay {
 		};
 		const transport = config?.transport;
 		this.#transport = typeof transport === "function" ? transport() : transport;
-		this.#transportChannel = config?.transportChannel ?? "relay::broadcast";
+		const channel = config?.transportChannel ?? "relay::broadcast";
+		this.#transportChannel = channel;
 		// Multi-instance sync: subscribe to the bus and re-deliver every remote
 		// broadcast to THIS instance's local SSE clients. Local-only re-emit —
 		// no re-publish — so a message published by instance A reaches B, C … but
 		// never bounces back onto the bus. Mirrors Transmit's `#broadcastLocally`
 		// off the transport subscription.
-		// `subscribe` may answer synchronously or with a promise, so it goes
-		// through `Promise.resolve` before the catch.
-		void Promise.resolve(
-			this.#transport?.subscribe(this.#transportChannel, (message) => {
+		// `subscribe` may answer synchronously or with a promise, and it is
+		// called INSIDE the async function rather than before it:
+		// `Promise.resolve(x())` runs `x()` first, so a transport that threw
+		// synchronously — a bad URL, a client built without a connection —
+		// escaped the constructor entirely and never reached the catch below.
+		//
+		// The channel is read from the local rather than the field, because a
+		// deferred body cannot promise the compiler the field is assigned yet.
+		void (async () =>
+			this.#transport?.subscribe(channel, (message) => {
 				if (isRelayTransportMessage(message)) {
 					this.#deliver(message.channel, message.payload);
 				}
-			}),
-		)
+			}))()
 			// A subscribe that fails is how an instance stops hearing the others:
 			// it keeps serving its own clients and quietly misses every message
 			// published elsewhere. Unawaited, the rejection had nowhere to go, so
@@ -534,7 +540,14 @@ export class Relay {
 		// Initial frame: confirms the connection to the JS client. Adonis
 		// Transmit ships `{ uid }` too. The client uses this uid for the
 		// subscribe/unsubscribe round trips.
-		void sse.send("connected", { uid });
+		// A `connected` frame that never arrives leaves the client without the
+		// uid it needs to subscribe or unsubscribe — it is connected to nothing
+		// it can use, so it is dropped rather than kept as a silent tenant of
+		// the client map. Unhandled, this rejection also ended the process.
+		void sse.send("connected", { uid }).catch((error: unknown) => {
+			this.#warn(`the connected frame for ${uid} failed`, error);
+			this.#dropClient(uid);
+		});
 		this.#emit("connect", { uid });
 		return { outcome: "ok", uid };
 	}

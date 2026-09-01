@@ -154,7 +154,18 @@ export function registerHubRoutes<Ctx extends HubHttpContext>(
 		// An SSE event with NO name arrives as `onmessage`, which is where the
 		// SignalR client reads its frames.
 		const send = (event: string, data: unknown): void => {
-			void sse.send("", adapter.encodeInvocation(event, [data]));
+			// A hub send is fire-and-forget by contract — the caller returns
+			// nothing — so a rejection here had nobody to reject to and took the
+			// process down over one client's socket.
+			void sse.send("", adapter.encodeInvocation(event, [data])).catch(
+				(error: unknown) => {
+					process.stderr.write(
+						`[relay/signalr] send to ${clientId} failed: ${
+							error instanceof Error ? error.message : String(error)
+						}\n`,
+					);
+				},
+			);
 		};
 		const context = hub.registerClient({
 			id: clientId,

@@ -271,3 +271,67 @@ describe("relay > a delivery that rejects", () => {
 		}
 	});
 })
+
+describe("relay > rejections that used to escape", () => {
+	/** Capture unhandled rejections and stderr for the duration of `fn`. */
+	async function watch(fn: () => Promise<void>) {
+		const written: string[] = [];
+		const rejections: unknown[] = [];
+		const originalWrite = process.stderr.write.bind(process.stderr);
+		const onUnhandled = (reason: unknown): void => {
+			rejections.push(reason);
+		};
+		process.stderr.write = (chunk: string | Uint8Array): boolean => {
+			written.push(String(chunk));
+			return true;
+		};
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await fn();
+			await new Promise((resolve) => setTimeout(resolve, 15));
+		} finally {
+			process.stderr.write = originalWrite;
+			process.off("unhandledRejection", onUnhandled);
+		}
+		return { written: written.join(""), rejections };
+	}
+
+	it("drops a client whose `connected` frame fails", async () => {
+		const r = new Relay({ allowUnauthorizedChannels: true });
+		const sse = fakeSse("s-bad-connect");
+		sse.send = async () => {
+			throw new Error("socket gone before the first frame");
+		};
+
+		const { rejections, written } = await watch(async () => {
+			const outcome = r.connect(undefined, sse, {
+				auth: { isAuthenticated: true, user: { id: "u" } },
+			});
+			expect(outcome.outcome).toBe("ok");
+		});
+
+		// Without the uid from that frame the client can neither subscribe nor
+		// unsubscribe — it is connected to nothing it can use.
+		expect(rejections).toEqual([]);
+		expect(written).toContain("connected frame");
+		expect(r.getSubscribersFor("anything")).toEqual([]);
+	});
+
+	it("reports a transport whose subscribe throws SYNCHRONOUSLY", async () => {
+		// `Promise.resolve(x())` calls `x()` first, so a synchronous throw never
+		// reached the `.catch` — it came straight out of `new Relay(...)`.
+		const transport: RelayTransport = {
+			publish: async () => {},
+			subscribe: () => {
+				throw new Error("no connection on this client");
+			},
+		};
+
+		const { rejections, written } = await watch(async () => {
+			expect(() => new Relay({ transport })).not.toThrow();
+		});
+
+		expect(rejections).toEqual([]);
+		expect(written).toContain("will not receive messages");
+	});
+})
