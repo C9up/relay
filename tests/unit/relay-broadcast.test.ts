@@ -437,3 +437,105 @@ describe("relay > broadcast payloads", () => {
 		]);
 	});
 });
+
+describe("relay > the transport key, in both shapes", () => {
+	it("takes upstream's { driver, channel }", async () => {
+		const published: Array<{ channel: string; payload: unknown }> = [];
+		const bus: RelayTransport = {
+			publish: (channel, payload) => {
+				published.push({ channel, payload });
+			},
+			subscribe: vi.fn(),
+		};
+		const relay = new Relay({
+			allowUnauthorizedChannels: true,
+			transport: { driver: bus, channel: "app::bus" },
+		});
+
+		relay.broadcast("feed", { hello: true });
+
+		expect(published).toHaveLength(1);
+		expect(published[0]?.channel).toBe("app::bus");
+	});
+
+	it("defaults the channel when the block leaves it out", async () => {
+		const published: string[] = [];
+		const bus: RelayTransport = {
+			publish: (channel) => {
+				published.push(channel);
+			},
+			subscribe: vi.fn(),
+		};
+		const relay = new Relay({
+			allowUnauthorizedChannels: true,
+			transport: { driver: bus },
+		});
+
+		relay.broadcast("feed", {});
+
+		expect(published).toEqual(["relay::broadcast"]);
+	});
+
+	it("lets the block's channel win over the flat one beside it", async () => {
+		const published: string[] = [];
+		const bus: RelayTransport = {
+			publish: (channel) => {
+				published.push(channel);
+			},
+			subscribe: vi.fn(),
+		};
+		const relay = new Relay({
+			allowUnauthorizedChannels: true,
+			transport: { driver: bus, channel: "block::wins" },
+			transportChannel: "flat::loses",
+		});
+
+		relay.broadcast("feed", {});
+
+		expect(published).toEqual(["block::wins"]);
+	});
+
+	it("still takes the driver on its own, with transportChannel", async () => {
+		const published: string[] = [];
+		const bus: RelayTransport = {
+			publish: (channel) => {
+				published.push(channel);
+			},
+			subscribe: vi.fn(),
+		};
+		const relay = new Relay({
+			allowUnauthorizedChannels: true,
+			transport: bus,
+			transportChannel: "flat::bus",
+		});
+
+		relay.broadcast("feed", {});
+
+		expect(published).toEqual(["flat::bus"]);
+	});
+
+	it("takes null for no bus at all", async () => {
+		const relay = new Relay({
+			allowUnauthorizedChannels: true,
+			transport: null,
+		});
+
+		// Nothing to publish to, and nothing thrown for saying so explicitly.
+		expect(relay.broadcast("feed", {})).toBe(0);
+	});
+
+	it("builds a factory exactly once", () => {
+		let built = 0;
+		const bus: RelayTransport = { publish: vi.fn(), subscribe: vi.fn() };
+		new Relay({
+			transport: {
+				driver: () => {
+					built++;
+					return bus;
+				},
+			},
+		});
+
+		expect(built).toBe(1);
+	});
+});

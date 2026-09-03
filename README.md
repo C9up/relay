@@ -49,9 +49,15 @@ instance that made it, unless you give relay a bus:
 import { defineConfig, transports } from '@c9up/relay'
 
 export default defineConfig({
-  transport: transports.redis({ connection: 'main' }),
+  transport: { driver: transports.redis({ connection: 'main' }) },
 })
 ```
+
+`transport` takes `{ driver, channel? }`, and `null` for no bus at all. The
+channel is what every instance publishes on and listens to — leave it out and
+it is `relay::broadcast`. Passing the driver on its own
+(`transport: transports.redis(…)`, with `transportChannel` beside it) is the
+form this config had before and still resolves.
 
 ### Keeping a stream alive
 

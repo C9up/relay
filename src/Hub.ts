@@ -270,14 +270,24 @@ export abstract class Hub {
 	 * Enforce the hub's guard / strategy / role / permission requirements against
 	 * the client's auth state. Returns the error envelope to send, or null when
 	 * the client is authorised.
+	 *
+	 * Roles are ANY-of and permissions are ALL-of, and the asymmetry is
+	 * deliberate: a role names who someone is, and holding one of several
+	 * accepted roles is enough; a permission names one thing they may do, and a
+	 * handler asking for two of them needs both. It is the rule the rest of the
+	 * framework applies at every other entry point — HTTP middleware, the RPC
+	 * router, the GraphQL resolver guard — so a hub agrees with the route next
+	 * to it. Written down here because reading `some` beside `every` otherwise
+	 * looks like one of them is a typo.
 	 */
 	#checkDispatchAuth(
 		client: ConnectedHubClient,
 	): { code: string; message: string } | null {
-		const requiredStrategies: string[] = [
-			...(this.#guards.guard ? [this.#guards.guard] : []),
-			...(this.#guards.guards ?? []),
-		];
+		// `useGuards` already folded the singular `guard` into `guards`, so
+		// reading it again here answered undefined every time — a branch that
+		// could not fire, sitting next to the one that does. The normalisation
+		// has exactly one home now.
+		const requiredStrategies: string[] = this.#guards.guards ?? [];
 		const needsAuth =
 			requiredStrategies.length > 0 ||
 			(this.#guards.roles?.length ?? 0) > 0 ||

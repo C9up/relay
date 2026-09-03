@@ -359,3 +359,72 @@ describe("Hub > a client id that connects twice", () => {
 		expect(hub.stats()).toEqual({ clients: 0, groups: 0 });
 	});
 });
+
+describe("Hub > the singular guard reaches the check", () => {
+	class GuardedHub extends Hub {
+		ran = 0;
+		async onPing(_ctx: HubContext): Promise<void> {
+			this.ran++;
+		}
+	}
+
+	function connect(
+		hub: Hub,
+		auth: HubContext["auth"],
+	): { sent: Array<{ event: string; data: unknown }> } {
+		const sent: Array<{ event: string; data: unknown }> = [];
+		hub.registerClient({
+			id: "c1",
+			groups: new Set(),
+			auth,
+			send: (event, data) => {
+				sent.push({ event, data });
+			},
+		});
+		return { sent };
+	}
+
+	it("refuses a strategy that does not match `guard`", async () => {
+		const hub = new GuardedHub();
+		hub.useGuards({ guard: "session" });
+		const { sent } = connect(hub, { isAuthenticated: true, strategy: "jwt" });
+
+		// `useGuards` folds the singular into `guards`, and the check reads that
+		// one list. It used to read a `guard` key nothing ever wrote as well.
+		expect(await hub.dispatch("c1", "ping")).toBe(false);
+		expect(sent[0]?.data).toMatchObject({ code: "E_RELAY_UNAUTHORIZED" });
+		expect(hub.ran).toBe(0);
+	});
+
+	it("accepts the strategy `guard` names", async () => {
+		const hub = new GuardedHub();
+		hub.useGuards({ guard: "session" });
+		connect(hub, { isAuthenticated: true, strategy: "session" });
+
+		expect(await hub.dispatch("c1", "ping")).toBe(true);
+		expect(hub.ran).toBe(1);
+	});
+
+	it("accepts either of `guard` and `guards` together", async () => {
+		const hub = new GuardedHub();
+		hub.useGuards({ guard: "session", guards: ["jwt"] });
+		connect(hub, { isAuthenticated: true, strategy: "jwt" });
+
+		expect(await hub.dispatch("c1", "ping")).toBe(true);
+	});
+
+	it("needs every permission and only one of the roles", async () => {
+		const hub = new GuardedHub();
+		hub.useGuards({ roles: ["admin", "owner"], permissions: ["read", "write"] });
+		const { sent } = connect(hub, {
+			isAuthenticated: true,
+			roles: ["owner"],
+			permissions: ["read"],
+		});
+
+		// Roles are any-of, permissions are all-of — the rule every other entry
+		// point in the framework applies.
+		expect(await hub.dispatch("c1", "ping")).toBe(false);
+		expect(sent[0]?.data).toMatchObject({ message: "Insufficient permissions" });
+	});
+})

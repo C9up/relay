@@ -94,6 +94,15 @@ export interface RelayTransport {
 	disconnect?(): void | Promise<void>;
 }
 
+/** A bus, or something that answers one when the relay is built. */
+export type RelayTransportSource = RelayTransport | (() => RelayTransport);
+
+/** Upstream's transport block: the driver, and the channel it publishes on. */
+export interface RelayTransportConfig {
+	driver: RelayTransportSource;
+	channel?: string;
+}
+
 export interface RelayConfig {
 	/**
 	 * Allow subscription to channels that have no authorizer registered.
@@ -119,20 +128,37 @@ export interface RelayConfig {
 	 */
 	maxChannelsPerClient?: number;
 	/**
-	 * Optional message bus for multi-instance broadcast sync. When set,
-	 * every `broadcast(...)` is mirrored onto the bus and re-delivered to
-	 * the SSE clients of every other instance. Absent → single-instance, no
-	 * bus: a broadcast reaches the clients of the instance that made it, and
-	 * no further.
+	 * Message bus for multi-instance broadcast sync. When set, every
+	 * `broadcast(...)` is mirrored onto the bus and re-delivered to the SSE
+	 * clients of every other instance. `null` — or absent — is single-instance:
+	 * a broadcast reaches the clients of the instance that made it, and no
+	 * further.
 	 *
-	 * Takes a transport, or a factory answering one — which is what the
+	 * The shape is upstream's, `{ driver, channel? }`:
+	 *
+	 *   transport: { driver: transports.redis({ connection: 'main' }) }
+	 *   transport: { driver: …, channel: 'relay::broadcast' }
+	 *   transport: null
+	 *
+	 * `driver` takes a transport or a factory answering one, which is what the
 	 * `transports.*` helpers return, so a config file can name a bus it has no
 	 * way of building yet.
+	 *
+	 * A transport passed on its own — `transport: transports.redis(…)` — is the
+	 * form this config had before it matched upstream's, and still works; the
+	 * channel then comes from `transportChannel` beside it.
+	 *
+	 * NAMED DEVIATION: upstream requires the key and accepts `null` for "no
+	 * bus". Here it is optional, because a relay with no bus is the ordinary
+	 * single-instance case and making every config write `transport: null`
+	 * buys nothing.
 	 */
-	transport?: RelayTransport | (() => RelayTransport);
+	transport?: RelayTransportSource | RelayTransportConfig | null;
 	/**
-	 * Bus channel the broadcasts are published on. Default
-	 * `relay::broadcast`. Mirrors Transmit's `transport.channel`.
+	 * Bus channel the broadcasts are published on, when `transport` is given in
+	 * the flat form. Default `relay::broadcast`. Upstream spells this
+	 * `transport.channel`, which is also accepted — and wins when both are set,
+	 * since it is the one attached to the transport it configures.
 	 */
 	transportChannel?: string;
 	/**
@@ -236,9 +262,10 @@ export class Relay {
 			maxClients: config?.maxClients ?? 10_000,
 			maxChannelsPerClient: config?.maxChannelsPerClient ?? 100,
 		};
-		const transport = config?.transport;
-		this.#transport = typeof transport === "function" ? transport() : transport;
-		const channel = config?.transportChannel ?? "relay::broadcast";
+		const resolved = resolveTransport(config?.transport);
+		this.#transport = resolved.transport;
+		const channel =
+			resolved.channel ?? config?.transportChannel ?? "relay::broadcast";
 		this.#transportChannel = channel;
 		// Multi-instance sync: subscribe to the bus and re-deliver every remote
 		// broadcast to THIS instance's local SSE clients. Local-only re-emit —
@@ -880,6 +907,35 @@ export interface SubscribeFailure {
 	code: string;
 }
 export type SubscribeResult = SubscribeSuccess | SubscribeFailure;
+
+/**
+ * Read the `transport` key in either form it accepts.
+ *
+ * `{ driver, channel? }` is upstream's, and the channel it carries belongs to
+ * the transport it sits beside — so it wins over a `transportChannel` written
+ * next to it, which is the older flat spelling of the same thing.
+ */
+function resolveTransport(
+	value: RelayTransportSource | RelayTransportConfig | null | undefined,
+): { transport?: RelayTransport; channel?: string } {
+	if (value === null || value === undefined) return {};
+	if (isTransportConfig(value)) {
+		return { transport: build(value.driver), channel: value.channel };
+	}
+	return { transport: build(value) };
+}
+
+/** The block form, told apart by the one key only it has. */
+function isTransportConfig(
+	value: RelayTransportSource | RelayTransportConfig,
+): value is RelayTransportConfig {
+	return typeof value === "object" && "driver" in value;
+}
+
+/** A transport, or the call that answers one. */
+function build(source: RelayTransportSource): RelayTransport {
+	return typeof source === "function" ? source() : source;
+}
 
 /** A uid or a channel, as it has to arrive to be usable at all. */
 function isNonEmptyString(value: unknown): value is string {

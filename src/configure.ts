@@ -34,7 +34,7 @@ export default defineConfig({
 
   // Without a transport, a broadcast reaches the SSE clients of the instance
   // that made it and no further. Uncomment as soon as there are two.
-  // transport: transports.redis({ connection: 'main' }),
+  // transport: { driver: transports.redis({ connection: 'main' }) },
 })`,
 	);
 }
