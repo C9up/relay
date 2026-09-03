@@ -7,7 +7,7 @@ describe("FakeRelay — broadcast capture", () => {
 		const reached = r.broadcast("notifications", { msg: "hi" });
 		expect(reached).toBe(0);
 		expect(r.getSent()).toHaveLength(1);
-		expect(r.getSent()[0].channel).toBe("notifications");
+		expect(r.getSent()[0]?.channel).toBe("notifications");
 	});
 
 	it("broadcast always returns 0 (no real clients in fake mode)", () => {
@@ -19,9 +19,10 @@ describe("FakeRelay — broadcast capture", () => {
 	it("getSent returns a defensive snapshot", () => {
 		const r = new FakeRelay();
 		r.broadcast("c", { x: 1 });
-		const snap = r.getSent();
-		snap[0].channel = "mutated";
-		expect(r.getSent()[0].channel).toBe("c");
+		const [captured] = r.getSent();
+		if (captured === undefined) throw new Error("expected a captured send");
+		captured.channel = "mutated";
+		expect(r.getSent()[0]?.channel).toBe("c");
 	});
 
 	it("reset clears the captured array", () => {

@@ -971,8 +971,9 @@ function matchesPattern(pattern: string, channel: string): boolean {
 	const patternParts = pattern.split("/");
 	const channelParts = channel.split("/");
 	if (patternParts.length !== channelParts.length) return false;
-	for (let i = 0; i < patternParts.length; i++) {
-		const p = patternParts[i];
+	// Both lists are the same length, checked just above; walking them in step
+	// is what lets each pair be read as two strings rather than two maybes.
+	for (const [i, p] of patternParts.entries()) {
 		const c = channelParts[i];
 		if (p.startsWith(":")) continue;
 		if (p !== c) return false;
@@ -993,10 +994,10 @@ function extractParams(
 	const patternParts = pattern.split("/");
 	const channelParts = channel.split("/");
 	const out: Record<string, string> = {};
-	for (let i = 0; i < patternParts.length; i++) {
-		const p = patternParts[i];
-		if (p.startsWith(":")) {
-			out[p.slice(1)] = channelParts[i];
+	for (const [i, p] of patternParts.entries()) {
+		const value = channelParts[i];
+		if (p.startsWith(":") && value !== undefined) {
+			out[p.slice(1)] = value;
 		}
 	}
 	return out;

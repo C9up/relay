@@ -10,7 +10,7 @@
     "alwaysStrict": true,
     "useUnknownInCatchVariables": true,
     "noImplicitOverride": true,
-    "noUncheckedIndexedAccess": false,
+    "noUncheckedIndexedAccess": true,
     "noFallthroughCasesInSwitch": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,

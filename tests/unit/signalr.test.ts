@@ -150,7 +150,7 @@ describe("relay > SignalRAdapter", () => {
 			data: { message: "hello" },
 		});
 		expect(out).toHaveLength(1);
-		const completion = JSON.parse(out[0]?.replace(RS, ""));
+		const completion = JSON.parse(out[0]?.replace(RS, "") ?? "null");
 		expect(completion).toEqual({ type: 3, invocationId: "i1" });
 	});
 
@@ -172,7 +172,7 @@ describe("relay > SignalRAdapter", () => {
 			}) + RS;
 		const out = await adapter.handleFrame(clientId, inv);
 		expect(out).toHaveLength(1);
-		const completion = JSON.parse(out[0]?.replace(RS, ""));
+		const completion = JSON.parse(out[0]?.replace(RS, "") ?? "null");
 		expect(completion.type).toBe(3);
 		expect(completion.invocationId).toBe("boom-1");
 		expect(completion.error).toBeDefined();
@@ -201,7 +201,7 @@ describe("relay > SignalRAdapter", () => {
 			JSON.stringify({ type: 6 }) + RS,
 		);
 		expect(out).toHaveLength(1);
-		expect(JSON.parse(out[0]?.replace(RS, ""))).toEqual({ type: 6 });
+		expect(JSON.parse(out[0]?.replace(RS, "") ?? "null")).toEqual({ type: 6 });
 	});
 
 	it("handles batched messages in one frame (multiple records)", async () => {
@@ -225,7 +225,7 @@ describe("relay > SignalRAdapter", () => {
 		);
 		const out = await adapter.handleFrame(clientId, `{not-json}${RS}`);
 		expect(out).toHaveLength(1);
-		const parsed = JSON.parse(out[0]?.replace(RS, ""));
+		const parsed = JSON.parse(out[0]?.replace(RS, "") ?? "null");
 		expect(parsed.type).toBe(7);
 		expect(parsed.error).toContain("Malformed");
 	});

@@ -157,7 +157,7 @@ describe("relay > SignalR transport", () => {
 		expect(hub.connected).toBe(1);
 		// onConnect pushed a frame down the stream, record-separated.
 		expect(stream.sse.frames).toHaveLength(1);
-		expect(stream.sse.frames[0].endsWith(RS)).toBe(true);
+		expect(stream.sse.frames[0]?.endsWith(RS)).toBe(true);
 		expect(stream.sse.frames[0]).toContain("welcome");
 	});
 
