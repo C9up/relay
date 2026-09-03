@@ -415,7 +415,10 @@ describe("Hub > the singular guard reaches the check", () => {
 
 	it("needs every permission and only one of the roles", async () => {
 		const hub = new GuardedHub();
-		hub.useGuards({ roles: ["admin", "owner"], permissions: ["read", "write"] });
+		hub.useGuards({
+			roles: ["admin", "owner"],
+			permissions: ["read", "write"],
+		});
 		const { sent } = connect(hub, {
 			isAuthenticated: true,
 			roles: ["owner"],
@@ -425,6 +428,8 @@ describe("Hub > the singular guard reaches the check", () => {
 		// Roles are any-of, permissions are all-of — the rule every other entry
 		// point in the framework applies.
 		expect(await hub.dispatch("c1", "ping")).toBe(false);
-		expect(sent[0]?.data).toMatchObject({ message: "Insufficient permissions" });
+		expect(sent[0]?.data).toMatchObject({
+			message: "Insufficient permissions",
+		});
 	});
-})
+});
