@@ -8,6 +8,8 @@
  * @implements MISS-20
  */
 
+import "./augmentations.js";
+
 import type { RelayConfig } from "./Relay.js";
 
 /**
