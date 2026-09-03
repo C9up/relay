@@ -1,4 +1,4 @@
-import type { Hub } from "./Hub.js";
+import { Hub } from "./Hub.js";
 import { Relay, type RelayConfig, type RelayRouteBuilder } from "./Relay.js";
 import { SignalRAdapter } from "./SignalRAdapter.js";
 import { registerHubRoutes } from "./SignalRTransport.js";
@@ -147,18 +147,49 @@ interface ReamRouter {
  */
 function registerMountedHubs(router: ReamRouter, relay: Relay): void {
 	for (const mounted of relay.mountedHubs()) {
-		const hub = mounted.hub as Hub;
+		// `relay.hub()` takes its hub structurally — the relay records it and
+		// never calls into it — so the concrete types only become knowable here,
+		// where they are used. Checked rather than asserted: a wrong object
+		// would otherwise fail on the first frame, three layers away from the
+		// `relay.hub(...)` line that passed it.
+		const hub = mounted.hub;
+		if (!isHub(hub)) {
+			throw new TypeError(
+				`The object mounted at "${mounted.path}" is not a Hub — it must extend Hub from @c9up/relay.`,
+			);
+		}
+		const adapter = mounted.adapter;
+		if (adapter !== undefined && !isAdapter(adapter)) {
+			throw new TypeError(
+				`The adapter given for the hub at "${mounted.path}" is not a SignalRAdapter.`,
+			);
+		}
 		const routes = registerHubRoutes(router, {
 			path: mounted.path,
 			hub,
-			adapter:
-				(mounted.adapter as SignalRAdapter | undefined) ??
-				new SignalRAdapter(hub),
+			adapter: adapter ?? new SignalRAdapter(hub),
 		});
 		for (const route of [routes.negotiate, routes.stream, routes.send]) {
-			relay.applyRouteCustomization(route as RelayRouteBuilder);
+			relay.applyRouteCustomization(route);
 		}
 	}
+}
+
+function isHub(value: object): value is Hub {
+	return (
+		value instanceof Hub ||
+		(typeof Reflect.get(value, "dispatch") === "function" &&
+			typeof Reflect.get(value, "registerClient") === "function" &&
+			typeof Reflect.get(value, "authFor") === "function")
+	);
+}
+
+function isAdapter(value: object): value is SignalRAdapter {
+	return (
+		value instanceof SignalRAdapter ||
+		(typeof Reflect.get(value, "handleFrame") === "function" &&
+			typeof Reflect.get(value, "resolveToken") === "function")
+	);
 }
 
 function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
@@ -230,12 +261,14 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 	relay.applyRouteCustomization(events);
 
 	const subscribe = router.post("/__relay/subscribe", async (ctx) => {
-		const body = (await ctx.request.body()) as
-			| { uid?: string; channel?: string }
-			| undefined;
-		const result = await relay.subscribe(body?.uid, body?.channel, {
-			auth: ctx.auth,
-		});
+		const body = await ctx.request.body();
+		const result = await relay.subscribe(
+			field(body, "uid"),
+			field(body, "channel"),
+			{
+				auth: ctx.auth,
+			},
+		);
 		if (!result.ok) {
 			ctx.response.status(result.status).json({
 				error: { code: result.code, message: result.code },
@@ -247,10 +280,8 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 	relay.applyRouteCustomization(subscribe);
 
 	const unsubscribe = router.post("/__relay/unsubscribe", async (ctx) => {
-		const body = (await ctx.request.body()) as
-			| { uid?: string; channel?: string }
-			| undefined;
-		const r = relay.unsubscribe(body?.uid, body?.channel, {
+		const body = await ctx.request.body();
+		const r = relay.unsubscribe(field(body, "uid"), field(body, "channel"), {
 			auth: ctx.auth,
 		});
 		if (r === "forbidden") {
@@ -262,6 +293,20 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 		ctx.response.noContent();
 	});
 	relay.applyRouteCustomization(unsubscribe);
+}
+
+/**
+ * One field off a parsed request body, whatever the body turned out to be.
+ *
+ * The body is `unknown` because that is what a POST carries. Describing it as
+ * `{ uid?: string }` did not make it one — the relay took the values on that
+ * word, and a channel that arrived as an object reached the pattern matcher and
+ * threw out of the route. It hands the value over as `unknown` now, and the
+ * relay is the one that decides whether it can use it.
+ */
+function field(body: unknown, name: string): unknown {
+	if (typeof body !== "object" || body === null) return undefined;
+	return Reflect.get(body, name);
 }
 
 function readQueryParam(

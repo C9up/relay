@@ -19,7 +19,7 @@
  * browser delivers it through `onmessage` — the shape the SignalR client reads.
  */
 
-import type { Hub } from "./Hub.js";
+import type { Hub, HubContext } from "./Hub.js";
 import { SignalRAdapter } from "./SignalRAdapter.js";
 
 /** SignalR record separator: every JSON message ends with it. */
@@ -70,9 +70,12 @@ export interface MountedHub {
  * type never matched — handler parameters are contravariant — and the caller
  * had to lie with a double cast.
  */
-export interface HubRouter<Ctx extends HubHttpContext = HubHttpContext> {
-	get(path: string, handler: (ctx: Ctx) => Promise<void> | void): unknown;
-	post(path: string, handler: (ctx: Ctx) => Promise<void> | void): unknown;
+export interface HubRouter<
+	Ctx extends HubHttpContext = HubHttpContext,
+	Route = unknown,
+> {
+	get(path: string, handler: (ctx: Ctx) => Promise<void> | void): Route;
+	post(path: string, handler: (ctx: Ctx) => Promise<void> | void): Route;
 }
 
 /** The `id` query parameter — SignalR's connection token. */
@@ -99,6 +102,37 @@ function hubAuth(ctx: HubHttpContext): {
 	};
 }
 
+/** The user id an auth slice identifies, when it identifies one. */
+function userIdOf(
+	auth:
+		| { isAuthenticated?: boolean; user?: Record<string, unknown> }
+		| undefined,
+): string | undefined {
+	if (auth?.isAuthenticated !== true) return undefined;
+	const id = auth.user?.id;
+	return typeof id === "string" ? id : undefined;
+}
+
+/**
+ * Whether a request may act on the connection registered under this client id.
+ *
+ * The connectionToken travels in a query string — SignalR's own design — so it
+ * reaches access logs, proxies and `Referer` headers. Holding it must not be
+ * enough to speak as the connection: the frames a POST carries are dispatched
+ * with the auth recorded when the stream opened, so a leaked token was an
+ * invocation as somebody else. This is the same rule `Relay` applies to its own
+ * uid — if the connection was authenticated, the request must be the same user;
+ * if it was anonymous, the token is all the identity there is.
+ */
+function mayActAs(
+	registered: HubContext["auth"] | undefined,
+	ctx: HubHttpContext,
+): boolean {
+	const owner = userIdOf(registered);
+	if (owner === undefined) return true;
+	return userIdOf(ctx.auth) === owner;
+}
+
 /**
  * Split a request body into SignalR frames.
  *
@@ -120,10 +154,10 @@ export function splitFrames(body: string): string[] {
  * Returns the route objects so a caller can apply middleware to them the way
  * `relay.registerRoutes()` customizes the relay's own.
  */
-export function registerHubRoutes<Ctx extends HubHttpContext>(
-	router: HubRouter<Ctx>,
+export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
+	router: HubRouter<Ctx, Route>,
 	mounted: MountedHub,
-): { negotiate: unknown; stream: unknown; send: unknown } {
+): { negotiate: Route; stream: Route; send: Route } {
 	const { path, hub, adapter } = mounted;
 	/** Live streams by connectionId, so an upstream POST can answer downstream. */
 	const streams = new Map<string, HubSseStream>();
@@ -149,7 +183,20 @@ export function registerHubRoutes<Ctx extends HubHttpContext>(
 			return;
 		}
 
+		if (!mayActAs(hub.authFor(clientId), ctx)) {
+			ctx.response.status(403).json({
+				error: {
+					code: "E_NOT_OWNER",
+					message: "This connection belongs to another user.",
+				},
+			});
+			return;
+		}
+
 		const sse = await ctx.response.sse();
+		// The token is in use now, so it stops counting against the unclaimed
+		// budget and stops expiring.
+		if (token !== undefined) adapter.claimToken(token);
 		streams.set(clientId, sse);
 		// An SSE event with NO name arrives as `onmessage`, which is where the
 		// SignalR client reads its frames.
@@ -157,15 +204,15 @@ export function registerHubRoutes<Ctx extends HubHttpContext>(
 			// A hub send is fire-and-forget by contract — the caller returns
 			// nothing — so a rejection here had nobody to reject to and took the
 			// process down over one client's socket.
-			void sse.send("", adapter.encodeInvocation(event, [data])).catch(
-				(error: unknown) => {
+			void sse
+				.send("", adapter.encodeInvocation(event, [data]))
+				.catch((error: unknown) => {
 					process.stderr.write(
 						`[relay/signalr] send to ${clientId} failed: ${
 							error instanceof Error ? error.message : String(error)
 						}\n`,
 					);
-				},
-			);
+				});
 		};
 		const context = hub.registerClient({
 			id: clientId,
@@ -174,6 +221,13 @@ export function registerHubRoutes<Ctx extends HubHttpContext>(
 			send,
 		});
 		sse.onClose(() => {
+			// Identity-guarded: a client id can carry a second stream — a
+			// reconnect that opens before the old socket has finished closing —
+			// and the old one's close must not tear down the live connection that
+			// replaced it. Unguarded, the stale close unregistered the new
+			// client from the hub and dropped its tokens, leaving a socket that
+			// was open and could no longer receive anything.
+			if (streams.get(clientId) !== sse) return;
 			streams.delete(clientId);
 			// `removeClient` fires `onDisconnect` itself — calling it here too
 			// would deliver every disconnect twice.
@@ -196,8 +250,23 @@ export function registerHubRoutes<Ctx extends HubHttpContext>(
 			return;
 		}
 
+		if (!mayActAs(hub.authFor(clientId), ctx)) {
+			ctx.response.status(403).json({
+				error: {
+					code: "E_NOT_OWNER",
+					message: "This connection belongs to another user.",
+				},
+			});
+			return;
+		}
+
 		const sse = streams.get(clientId);
 		for (const frame of splitFrames(ctx.request.raw())) {
+			// A Close from the CLIENT is the client saying it is done. The
+			// adapter answers it with nothing — correctly, the protocol asks for
+			// no reply — so watching only the outbound frames meant a graceful
+			// disconnect left the stream open until the socket happened to drop.
+			const clientClosed = SignalRAdapter.containsClose([frame]);
 			const outbound = await adapter.handleFrame(clientId, frame);
 			for (const out of outbound) {
 				// No stream yet means the client posted before opening the GET.
@@ -206,7 +275,7 @@ export function registerHubRoutes<Ctx extends HubHttpContext>(
 				// never arrive is how a hub leaks memory.
 				if (sse?.isOpen()) await sse.send("", out);
 			}
-			if (SignalRAdapter.containsClose(outbound)) {
+			if (clientClosed || SignalRAdapter.containsClose(outbound)) {
 				await sse?.end();
 				break;
 			}

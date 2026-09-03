@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Hub, type HubContext } from "../../src/Hub.js";
 import { SignalRAdapter } from "../../src/SignalRAdapter.js";
 
@@ -113,16 +113,20 @@ describe("relay > SignalRAdapter", () => {
 		const { adapter, clientId } = makeAdapter();
 		const bad = JSON.stringify({ protocol: "messagepack" }) + RS;
 		const out = await adapter.handleFrame(clientId, bad);
-		expect(out).toHaveLength(1);
+		// The error response, then a Close: the protocol ends the connection on a
+		// failed handshake, and the Close is how the transport learns to.
+		expect(out).toHaveLength(2);
 		expect(out[0]).toContain("Invalid handshake");
+		expect(SignalRAdapter.containsClose(out)).toBe(true);
 	});
 
 	it("rejects handshake with unsupported version", async () => {
 		const { adapter, clientId } = makeAdapter();
 		const bad = JSON.stringify({ protocol: "json", version: 2 }) + RS;
 		const out = await adapter.handleFrame(clientId, bad);
-		expect(out).toHaveLength(1);
+		expect(out).toHaveLength(2);
 		expect(out[0]).toContain("Invalid handshake");
+		expect(SignalRAdapter.containsClose(out)).toBe(true);
 	});
 
 	it("dispatches an Invocation (type 1) to the matching hub method", async () => {
@@ -402,5 +406,127 @@ describe("relay > SignalRAdapter unsupported message types", () => {
 		// whose opening invocation was already refused, and the cancel targets a
 		// stream that was never started.
 		expect(out.join("")).toBe("");
+	});
+});
+
+describe("relay > SignalRAdapter negotiate is an unauthenticated write", () => {
+	/**
+	 * A SignalR connection is negotiated first and connected second, so a token
+	 * always exists for a moment before anything uses it. Nothing ever closed
+	 * that window: `negotiate` wrote an entry and only a stream CLOSING removed
+	 * one, so a caller that never opened a stream left the entry for the life
+	 * of the process. A thousand POSTs, a thousand live tokens, forever.
+	 */
+	it("expires a token nothing ever connected with", () => {
+		const adapter = new SignalRAdapter(new TestHub(), { tokenTtlMs: 50 });
+		const stale = adapter.negotiate("c1").connectionToken;
+		expect(adapter.resolveToken(stale)).toBe("c1");
+
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(Date.now() + 51);
+			expect(adapter.resolveToken(stale)).toBeUndefined();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps a token whose stream attached, however long it lives", () => {
+		const adapter = new SignalRAdapter(new TestHub(), { tokenTtlMs: 50 });
+		const token = adapter.negotiate("c1").connectionToken;
+		adapter.claimToken(token);
+
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(Date.now() + 60_000);
+			// Sweeping runs on negotiate; a live connection must survive it.
+			adapter.negotiate("c2");
+			expect(adapter.resolveToken(token)).toBe("c1");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("caps how many unclaimed tokens may wait at once", () => {
+		const adapter = new SignalRAdapter(new TestHub(), { maxPendingTokens: 4 });
+		const tokens = Array.from(
+			{ length: 20 },
+			(_, i) => adapter.negotiate(`c${i}`).connectionToken,
+		);
+
+		const live = tokens.filter((t) => adapter.resolveToken(t) !== undefined);
+
+		// The cap is applied before the new token is written, so the newest and
+		// the four before it stand; the oldest are dropped.
+		expect(live.length).toBeLessThanOrEqual(5);
+		expect(live).toContain(tokens[19]);
+	});
+
+	it("forgets every token a client accumulated, claimed or not", () => {
+		const adapter = new SignalRAdapter(new TestHub());
+		const first = adapter.negotiate("c1").connectionToken;
+		const second = adapter.negotiate("c1").connectionToken;
+		adapter.claimToken(second);
+
+		adapter.forget("c1");
+
+		expect(adapter.resolveToken(first)).toBeUndefined();
+		expect(adapter.resolveToken(second)).toBeUndefined();
+	});
+});
+
+describe("relay > SignalRAdapter answers every invocation that asked", () => {
+	async function handshook(): Promise<SignalRAdapter> {
+		const { adapter, clientId } = makeAdapter();
+		await adapter.handleFrame(clientId, `{"protocol":"json","version":1}${RS}`);
+		return adapter;
+	}
+
+	// The protocol promises a Completion for an invocationId, and the caller
+	// has no timeout to fall back on. Dropped, the client's invoke() waited for
+	// the life of the connection — the same hang the stream branch answers.
+	it("completes an invocation whose target is not a method name", async () => {
+		const adapter = await handshook();
+
+		const out = await adapter.handleFrame(
+			"client-1",
+			`{"type":1,"invocationId":"7","target":42,"arguments":[]}${RS}`,
+		);
+
+		expect(out.map((f) => JSON.parse(f.slice(0, -1)))).toEqual([
+			{ type: 3, invocationId: "7", error: "Invalid invocation" },
+		]);
+	});
+
+	it("says nothing for a bad invocation that asked for nothing", async () => {
+		const adapter = await handshook();
+
+		expect(
+			await adapter.handleFrame("client-1", `{"type":1,"target":42}${RS}`),
+		).toEqual([]);
+	});
+
+	it("closes on a message whose type is not a number", async () => {
+		const adapter = await handshook();
+
+		const out = await adapter.handleFrame("client-1", `{"type":"1"}${RS}`);
+
+		// It used to fall through every case and answer with silence.
+		expect(out.map((f) => JSON.parse(f.slice(0, -1)))).toEqual([
+			{ type: 7, error: "Malformed message" },
+		]);
+	});
+
+	it("completes a stream invocation that is malformed as well as one that is not", async () => {
+		const adapter = await handshook();
+
+		const out = await adapter.handleFrame(
+			"client-1",
+			`{"type":4,"invocationId":"9"}${RS}`,
+		);
+
+		expect(out.map((f) => JSON.parse(f.slice(0, -1)))).toEqual([
+			{ type: 3, invocationId: "9", error: "Invalid stream invocation" },
+		]);
 	});
 });

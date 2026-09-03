@@ -242,3 +242,120 @@ describe("relay > Hub > groups + broadcast", () => {
 		expect(c.sent).toEqual([]);
 	});
 });
+
+describe("Hub > handlers a subclass inherits", () => {
+	class BaseHub extends Hub {
+		ran: string[] = [];
+		async onPing(): Promise<void> {
+			this.ran.push("base:ping");
+		}
+		async onGreet(): Promise<void> {
+			this.ran.push("base:greet");
+		}
+	}
+	class ChildHub extends BaseHub {
+		async onPong(): Promise<void> {
+			this.ran.push("child:pong");
+		}
+		override async onGreet(): Promise<void> {
+			this.ran.push("child:greet");
+		}
+	}
+
+	function connected(hub: Hub): Array<{ event: string; data: unknown }> {
+		const sent: Array<{ event: string; data: unknown }> = [];
+		hub.registerClient({
+			id: "c1",
+			groups: new Set(),
+			auth: { isAuthenticated: true },
+			send: (event, data) => {
+				sent.push({ event, data });
+			},
+		});
+		return sent;
+	}
+
+	// Reading one prototype level answered these with E_RELAY_UNKNOWN_EVENT:
+	// a handler that exists, is spelled right, and never runs.
+	it("dispatches to a handler declared on a base class", async () => {
+		const hub = new ChildHub();
+		const sent = connected(hub);
+
+		expect(await hub.dispatch("c1", "ping")).toBe(true);
+		expect(hub.ran).toEqual(["base:ping"]);
+		expect(sent).toEqual([]);
+	});
+
+	it("lets the subclass win, as method resolution already does", async () => {
+		const hub = new ChildHub();
+		connected(hub);
+
+		await hub.dispatch("c1", "greet");
+
+		expect(hub.ran).toEqual(["child:greet"]);
+	});
+
+	// The point of the allowlist: the walk stops at Hub.prototype, so nothing
+	// on Hub or Object is reachable from the wire.
+	it("still refuses everything the base class Hub itself declares", async () => {
+		const hub = new ChildHub();
+		const sent = connected(hub);
+
+		expect(await hub.dispatch("c1", "connect")).toBe(false);
+		expect(await hub.dispatch("c1", "disconnect")).toBe(false);
+		expect(sent.map((s) => s.event)).toEqual(["error", "error"]);
+	});
+});
+
+describe("Hub > a client id that connects twice", () => {
+	class QuietHub extends Hub {}
+
+	it("does not leave the first connection's groups on the second", () => {
+		const hub = new QuietHub();
+		const first = hub.registerClient({
+			id: "c1",
+			groups: new Set(),
+			auth: { isAuthenticated: true, user: { id: "alice" } },
+			send: () => {},
+		});
+		first.joinGroup("secret");
+
+		const received: unknown[] = [];
+		hub.registerClient({
+			id: "c1",
+			groups: new Set(),
+			auth: { isAuthenticated: true, user: { id: "alice" } },
+			send: (_event, data) => {
+				received.push(data);
+			},
+		});
+		first.group("secret").send("leak", { from: "the old membership" });
+
+		// The new connection never joined that group and was never checked for it.
+		expect(received).toEqual([]);
+	});
+
+	it("leaves no group behind once the client is removed", () => {
+		const hub = new QuietHub();
+		hub
+			.registerClient({
+				id: "c1",
+				groups: new Set(),
+				auth: { isAuthenticated: true },
+				send: () => {},
+			})
+			.joinGroup("room");
+		hub.registerClient({
+			id: "c1",
+			groups: new Set(),
+			auth: { isAuthenticated: true },
+			send: () => {},
+		});
+
+		hub.removeClient("c1");
+
+		// `removeClient` walks the client's own group set, so a membership left
+		// on a client it no longer holds could never be cleaned up again.
+		expect(hub.stats()).toEqual({ clients: 0, groups: 0 });
+	});
+});

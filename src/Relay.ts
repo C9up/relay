@@ -30,6 +30,13 @@
 
 import { randomUUID } from "node:crypto";
 
+/**
+ * Event name the keep-alive goes out under. Prefixed so it cannot collide with
+ * an application channel, and named for this package rather than borrowed from
+ * Transmit's `$$transmit/ping`.
+ */
+export const PING_CHANNEL = "$$relay/ping";
+
 /** Slim shape of the per-client SSE transport. Matches `SseStream`. */
 export interface RelaySseStream {
 	id: string;
@@ -90,8 +97,14 @@ export interface RelayTransport {
 export interface RelayConfig {
 	/**
 	 * Allow subscription to channels that have no authorizer registered.
-	 * Default `false` (secure-by-default) — Adonis Transmit ships the
-	 * same default.
+	 * Default `false`.
+	 *
+	 * NAMED DEVIATION from Adonis Transmit, which allows them: its
+	 * `verifyAccess` answers `true` the moment no secured definition matches
+	 * the channel, so a channel nobody thought to authorize is world-readable.
+	 * Default-deny is the opposite bet — a channel you forgot to cover refuses
+	 * subscribers instead of serving them — and the flag is here for anyone who
+	 * wants upstream's behavior back.
 	 */
 	allowUnauthorizedChannels?: boolean;
 	/**
@@ -122,6 +135,19 @@ export interface RelayConfig {
 	 * `relay::broadcast`. Mirrors Transmit's `transport.channel`.
 	 */
 	transportChannel?: string;
+	/**
+	 * Milliseconds between keep-alive frames sent to every connected client,
+	 * or `false` for none. Default `false` — Transmit's `pingInterval`, same
+	 * shape and same default.
+	 *
+	 * An SSE connection that carries no traffic is indistinguishable from a
+	 * hung one to everything between the client and the process: nginx closes
+	 * an idle upstream at 60 s by default, and most load balancers and mobile
+	 * networks are less patient still. The client reconnects, so the symptom
+	 * is not silence but a connection that drops and reopens forever, losing
+	 * whatever was published in between. A periodic frame is what stops that.
+	 */
+	pingInterval?: number | false;
 }
 
 /** Cross-instance broadcast envelope carried over `RelayTransport`. */
@@ -202,6 +228,7 @@ export class Relay {
 	>;
 	readonly #transport?: RelayTransport;
 	readonly #transportChannel: string;
+	readonly #pingTimer?: ReturnType<typeof setInterval>;
 
 	constructor(config?: RelayConfig) {
 		this.#config = {
@@ -243,6 +270,34 @@ export class Relay {
 					}\n`,
 				);
 			});
+		const ping = config?.pingInterval;
+		if (typeof ping === "number" && ping > 0) {
+			this.#pingTimer = setInterval(() => {
+				this.#ping();
+			}, ping);
+			// Unreffed: a keep-alive is for the connections that exist, not a
+			// reason for the process to stay up once nothing else is running.
+			this.#pingTimer.unref();
+		}
+	}
+
+	/**
+	 * One frame to every connected client, whatever they subscribed to. The
+	 * point is bytes on the wire, so it goes to the client and not through the
+	 * channel index — a client that has subscribed to nothing yet is exactly
+	 * the one an idle-timeout would cut.
+	 */
+	#ping(): void {
+		for (const [uid, client] of this.#clients) {
+			if (!client.sse.isOpen()) {
+				this.#dropClient(uid);
+				continue;
+			}
+			void client.sse.send(PING_CHANNEL, {}).catch((error: unknown) => {
+				this.#warn(`keep-alive to ${uid} failed`, error);
+				this.#dropClient(uid);
+			});
+		}
 	}
 
 	// ─── Channel authorization ────────────────────────────────
@@ -339,9 +394,15 @@ export class Relay {
 	 * bus so the SSE clients of every OTHER instance receive it too.
 	 */
 	broadcast(channel: string, payload: unknown): number {
-		const reached = this.#deliver(channel, payload);
-		this.#publishToBus(channel, payload);
-		this.#emit("broadcast", { channel, payload });
+		// `undefined` is not a value JSON can carry: it survives in-process,
+		// disappears through `JSON.stringify` on the way to the SSE frame, and
+		// comes back from the bus as a missing key on the other instances. Which
+		// of those a listener sees would depend on where it happened to run.
+		// Transmit substitutes null here for the same reason.
+		const carried = payload === undefined ? null : payload;
+		const reached = this.#deliver(channel, carried);
+		this.#publishToBus(channel, carried);
+		this.#emit("broadcast", { channel, payload: carried });
 		return reached;
 	}
 
@@ -389,7 +450,15 @@ export class Relay {
 				continue;
 			}
 			const client = this.#clients.get(uid);
-			if (!client?.sse.isOpen()) {
+			if (!client) {
+				// Subscribed but no longer a client: the index outlived the
+				// client it points at. `#dropClient` cannot clear this one — it
+				// reads the channels off the client, and there is none — so the
+				// entry is removed here or never.
+				this.#indexRemove(channel, uid);
+				continue;
+			}
+			if (!client.sse.isOpen()) {
 				dead.push(uid);
 				continue;
 			}
@@ -557,11 +626,15 @@ export class Relay {
 	 * routes translate into HTTP status codes (204 OK / 400 / 403 / 429).
 	 */
 	async subscribe(
-		uid: string | undefined,
-		channel: string | undefined,
+		uid: unknown,
+		channel: unknown,
 		ctx: RelayContext,
 	): Promise<SubscribeResult> {
-		if (!uid || !channel) {
+		// Both arrive straight off a JSON request body, so neither is a string
+		// because the signature says so. A channel that was an object reached
+		// the pattern matcher and threw `channel.split is not a function` out of
+		// the route — a 500, and a stack trace, for a body anyone can post.
+		if (!isNonEmptyString(uid) || !isNonEmptyString(channel)) {
 			return { ok: false, status: 400, code: "E_RELAY_BAD_REQUEST" };
 		}
 		if (channel.length > 256) {
@@ -589,11 +662,11 @@ export class Relay {
 		if (client.channels.size >= this.#config.maxChannelsPerClient) {
 			return { ok: false, status: 429, code: "E_MAX_CHANNELS" };
 		}
-		const authorizer = this.#findAuthorizer(channel);
-		if (authorizer) {
+		const match = this.#findAuthorizer(channel);
+		if (match) {
 			let allowed: boolean;
 			try {
-				allowed = await authorizer(ctx, this.#extractParams(channel));
+				allowed = await match.authorize(ctx, match.params);
 			} catch {
 				return { ok: false, status: 403, code: "E_CHANNEL_FORBIDDEN" };
 			}
@@ -602,6 +675,19 @@ export class Relay {
 			}
 		} else if (!this.#config.allowUnauthorizedChannels) {
 			return { ok: false, status: 403, code: "E_CHANNEL_NO_AUTHORIZER" };
+		}
+		// An authorizer may await — a database lookup is the usual one — and the
+		// socket can close in that window. Writing the subscription then put the
+		// uid back into the channel index for a client that no longer exists,
+		// and nothing could take it out again: `#dropClient` walks the client's
+		// own channel set, and that client is gone. The entry stayed for the
+		// life of the process, counted by `channelSubscribers`, returned by
+		// `getSubscribersFor`, and walked on every broadcast. Worse on a
+		// reconnect: the uid is stable for an authenticated client, so the
+		// ghost attached the old subscription to the NEW connection, which had
+		// never asked for that channel and was never checked for it.
+		if (this.#clients.get(uid) !== client) {
+			return { ok: false, status: 400, code: "E_NOT_CONNECTED" };
 		}
 		client.channels.add(channel);
 		this.#indexAdd(channel, uid);
@@ -617,11 +703,14 @@ export class Relay {
 	 * requester doesn't own the uid.
 	 */
 	unsubscribe(
-		uid: string | undefined,
-		channel: string | undefined,
+		uid: unknown,
+		channel: unknown,
 		ctx: RelayContext,
 	): "ok" | "forbidden" {
-		if (!uid || !channel) return "ok";
+		// Same untrusted body as `subscribe`. Nothing here would throw on a
+		// non-string, but a `Set.delete` that silently misses is how a client
+		// believes it has stopped listening while the frames keep arriving.
+		if (!isNonEmptyString(uid) || !isNonEmptyString(channel)) return "ok";
 		const client = this.#clients.get(uid);
 		if (!client) return "ok";
 		// Same ownership check as subscribe — without it, any party who
@@ -663,6 +752,10 @@ export class Relay {
 	 * — both bus methods are optional on the duck-typed transport.
 	 */
 	async shutdown(): Promise<void> {
+		// Cleared first, and unconditionally: Transmit clears its ping interval
+		// before touching the bus, and a relay with no transport still has a
+		// timer to stop.
+		if (this.#pingTimer) clearInterval(this.#pingTimer);
 		if (!this.#transport) return;
 		await this.#transport.unsubscribe?.(this.#transportChannel);
 		await this.#transport.disconnect?.();
@@ -735,23 +828,31 @@ export class Relay {
 		if (set.size === 0) this.#channelIndex.delete(channel);
 	}
 
-	#findAuthorizer(
-		channel: string,
-	): ChannelAuthorizer<Record<string, string>> | undefined {
+	/**
+	 * The authorizer covering `channel`, together with the params ITS pattern
+	 * yields — resolved in one walk, the way Transmit's
+	 * `getSecuredChannelDefinition` hands back the matched definition and its
+	 * params together.
+	 *
+	 * Two walks were two answers. Finding the callback preferred an exact
+	 * registration over a pattern, while the params were taken from the first
+	 * pattern that happened to match: with `users/:id` and `users/me` both
+	 * registered, `users/me` ran the exact callback and handed it `{id: 'me'}`
+	 * — params from a pattern it was not written for.
+	 */
+	#findAuthorizer(channel: string):
+		| {
+				authorize: ChannelAuthorizer<Record<string, string>>;
+				params: Record<string, string>;
+		  }
+		| undefined {
 		const exact = this.#authorizers.get(channel);
-		if (exact) return exact;
-		for (const [pattern, authorizer] of this.#authorizers) {
-			if (matchesPattern(pattern, channel)) return authorizer;
+		if (exact) return { authorize: exact, params: {} };
+		for (const [pattern, authorize] of this.#authorizers) {
+			const params = extractParams(pattern, channel);
+			if (params) return { authorize, params };
 		}
 		return undefined;
-	}
-
-	#extractParams(channel: string): Record<string, string> {
-		for (const pattern of this.#authorizers.keys()) {
-			const params = extractParams(pattern, channel);
-			if (params) return params;
-		}
-		return {};
 	}
 
 	#emit<E extends LifecycleEventName>(
@@ -779,6 +880,11 @@ export interface SubscribeFailure {
 	code: string;
 }
 export type SubscribeResult = SubscribeSuccess | SubscribeFailure;
+
+/** A uid or a channel, as it has to arrive to be usable at all. */
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
 
 /**
  * Type guard for a cross-instance broadcast envelope arriving over the

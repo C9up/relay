@@ -1,22 +1,25 @@
 # @c9up/relay
 
-> Realtime client transport for the Ream framework — SSE + WebSocket Hub + SignalR.
->
-> **Transport status:** only SSE has a working server transport today. `Hub` and
-> `SignalRAdapter` implement their protocols in full, but Ream's Rust HTTP server
-> exposes no WebSocket upgrade point, so the caller must supply the socket itself.
+> Realtime client transport for the Ream framework — SSE event streams and
+> SignalR hubs.
 
-### What "no server transport" means
+### Which transports run
 
-`Hub` and `SignalRAdapter` are **protocol** implementations: they parse an
-inbound text frame and hand back the frames to send. They do not open, own or
-close a socket, and this package cannot give you one — Ream's Rust HTTP server
-exposes no WebSocket upgrade point yet.
+Both of them run over Server-Sent Events, which is what Ream's HTTP server
+serves and a first-class SignalR transport besides:
 
-So a SignalR or Hub deployment needs a WebSocket server you supply and drive
-(`ws`, `uWebSockets.js`, a reverse proxy). Installing this package does not
-give you a working SignalR endpoint. `Transmit` (SSE) is the transport that
-runs end to end here today.
+- the **event stream** — `authorize` / `broadcast` / `on`, on the three routes
+  the provider registers;
+- **hubs** — `relay.hub('/hubs/chat', new ChatHub())` registers SignalR's
+  negotiate, downstream and upstream routes, and a stock `@microsoft/signalr`
+  client configured with `HttpTransportType.ServerSentEvents` speaks to it
+  unchanged.
+
+**WebSockets are the transport that is missing.** Ream's Rust HTTP server
+exposes no upgrade point, so a hub reached over `HttpTransportType.WebSockets`
+needs a socket you supply and drive yourself — `SignalRAdapter` is written for
+that, parsing an inbound frame and handing back the frames to send without
+owning a socket of its own.
 
 Part of **[Ream](https://github.com/C9up/ream)** — a Rust-powered, AdonisJS-compatible Node.js framework. Independent, publishable package.
 
@@ -49,6 +52,30 @@ export default defineConfig({
   transport: transports.redis({ connection: 'main' }),
 })
 ```
+
+### Keeping a stream alive
+
+An SSE connection carrying no traffic is indistinguishable from a hung one to
+everything between the client and the process: nginx closes an idle upstream at
+sixty seconds by default, and most load balancers and mobile networks are less
+patient still. The client reconnects, so the symptom is not silence but a
+connection that drops and reopens forever, losing whatever was published in
+between. `pingInterval` is what stops that — off by default, in milliseconds:
+
+```ts
+export default defineConfig({
+  pingInterval: 30_000,
+})
+```
+
+The frames go out on the `$$relay/ping` event, which no application channel can
+collide with. Browser clients using `EventSource` never see them unless they
+add a listener for that name.
+
+### Channels nobody authorized
+
+`allowUnauthorizedChannels` is `false`, so a channel with no `authorize(...)`
+covering it refuses subscribers. Set it to `true` to serve them instead.
 
 ## Entry points
 

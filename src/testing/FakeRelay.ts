@@ -42,23 +42,31 @@ export class FakeRelay {
 	 *  the original object after broadcasting cannot retroactively
 	 *  alter the captured snapshot. */
 	broadcast(channel: string, data: unknown): number {
+		// `undefined` becomes null on the real relay, because that is what JSON
+		// can carry. A fake that captured it verbatim would let an assertion
+		// pass on a payload the real broadcast never sends.
+		return this.#capture(channel, data === undefined ? null : data);
+	}
+
+	/** Mirrors the real `Relay.broadcastExcept` — captures the call
+	 *  (the excluded uid(s) are irrelevant to assertions, since the fake
+	 *  holds no real clients) and returns 0. Like the real one, it does NOT
+	 *  substitute for an absent payload: only `broadcast` does. */
+	broadcastExcept(
+		channel: string,
+		data: unknown,
+		_senderUid: string | string[],
+	): number {
+		return this.#capture(channel, data);
+	}
+
+	#capture(channel: string, data: unknown): number {
 		this.#captured.push({
 			channel,
 			data: data === undefined ? undefined : deepClone(data),
 			clients: 0,
 		});
 		return 0;
-	}
-
-	/** Mirrors the real `Relay.broadcastExcept` — captures the call
-	 *  (the excluded uid(s) are irrelevant to assertions, since the fake
-	 *  holds no real clients) and returns 0. */
-	broadcastExcept(
-		channel: string,
-		data: unknown,
-		_senderUid: string | string[],
-	): number {
-		return this.broadcast(channel, data);
 	}
 
 	/** Defensive snapshot of every captured broadcast. */

@@ -32,10 +32,15 @@ export const transports = {
 	redis(options: {
 		connection: RelayPubSubResolver | string;
 	}): RelayTransportFactory {
+		// Read into a local before the closure: narrowing a mutable property
+		// does not survive into a deferred body, and the only way to keep the
+		// property was to assert the type back — a claim about an object the
+		// caller still holds and can change.
+		const connection = options.connection;
 		const client: RelayPubSubResolver =
-			typeof options.connection === "string"
-				? () => quasarConnection(options.connection as string)
-				: options.connection;
+			typeof connection === "string"
+				? () => quasarConnection(connection)
+				: connection;
 		return () => new RedisRelayTransport(client);
 	},
 };

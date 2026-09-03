@@ -26,6 +26,28 @@ import type { Hub } from "./Hub.js";
 /** SignalR record separator — every JSON message ends with this byte. */
 const RS = "\x1e";
 const DEFAULT_MAX_FRAME_SIZE = 65_536;
+/**
+ * How long a negotiated token stays valid before its stream attaches, and how
+ * many may be waiting at once.
+ *
+ * A SignalR connection is negotiated first and connected second, so there is
+ * always a window in which a token exists and nothing has used it. SignalR's
+ * own server closes that window itself — a negotiated connection whose
+ * transport never attaches is disposed after a timeout. Here it stayed open
+ * forever: `negotiate` is an unauthenticated POST that writes an entry, and the
+ * only thing that ever removed one was a stream closing. A thousand requests
+ * left a thousand live tokens, and they were still live an hour later.
+ */
+const DEFAULT_TOKEN_TTL_MS = 30_000;
+const DEFAULT_MAX_PENDING_TOKENS = 1_024;
+
+/** A token handed out by `negotiate`, before or after its stream attaches. */
+interface IssuedToken {
+	clientId: string;
+	issuedAt: number;
+	/** True once a stream has been opened with it — no longer on the clock. */
+	claimed: boolean;
+}
 
 export type SignalRMessageType = 1 | 2 | 3 | 4 | 5 | 6 | 7;
 
@@ -70,10 +92,37 @@ interface HandshakeRequest {
 	version: number;
 }
 
+function isStreamInvocation(
+	msg: Record<string, unknown>,
+): msg is StreamInvocationMessage {
+	return (
+		msg.type === 4 &&
+		typeof msg.invocationId === "string" &&
+		typeof msg.target === "string"
+	);
+}
+
 function isInvocationMessage(
 	msg: Record<string, unknown>,
 ): msg is InvocationMessage {
 	return msg.type === 1 && typeof msg.target === "string";
+}
+
+/** The first frame a client must send, and the only shape accepted for it. */
+function isHandshakeRequest(value: unknown): value is HandshakeRequest {
+	if (typeof value !== "object" || value === null) return false;
+	return (
+		Reflect.get(value, "protocol") === "json" &&
+		Reflect.get(value, "version") === 1
+	);
+}
+
+/** Any SignalR message, identified only by carrying a numeric `type`. */
+function isTypedMessage(
+	value: unknown,
+): value is Record<string, unknown> & { type: number } {
+	if (typeof value !== "object" || value === null) return false;
+	return typeof Reflect.get(value, "type") === "number";
 }
 
 export interface NegotiateResponse {
@@ -86,12 +135,26 @@ export interface NegotiateResponse {
 export class SignalRAdapter {
 	#hub: Hub;
 	#handshakes = new Set<string>(); // clientIds that have completed handshake
-	#tokenToId: Map<string, string> = new Map();
+	#tokenToId: Map<string, IssuedToken> = new Map();
 	#maxFrameSize: number;
+	#tokenTtlMs: number;
+	#maxPendingTokens: number;
 
-	constructor(hub: Hub, options?: { maxFrameSize?: number }) {
+	constructor(
+		hub: Hub,
+		options?: {
+			maxFrameSize?: number;
+			/** Milliseconds a negotiated token stays valid unclaimed. */
+			tokenTtlMs?: number;
+			/** How many unclaimed tokens may wait at once. */
+			maxPendingTokens?: number;
+		},
+	) {
 		this.#hub = hub;
 		this.#maxFrameSize = options?.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE;
+		this.#tokenTtlMs = options?.tokenTtlMs ?? DEFAULT_TOKEN_TTL_MS;
+		this.#maxPendingTokens =
+			options?.maxPendingTokens ?? DEFAULT_MAX_PENDING_TOKENS;
 	}
 
 	/**
@@ -106,8 +169,13 @@ export class SignalRAdapter {
 		connectionId: string,
 		transports: readonly string[] = ["ServerSentEvents"],
 	): NegotiateResponse {
+		this.#expireTokens();
 		const connectionToken = randomUUID();
-		this.#tokenToId.set(connectionToken, connectionId);
+		this.#tokenToId.set(connectionToken, {
+			clientId: connectionId,
+			issuedAt: Date.now(),
+			claimed: false,
+		});
 		return {
 			connectionId,
 			connectionToken,
@@ -121,7 +189,52 @@ export class SignalRAdapter {
 
 	/** Resolve a connectionId from a connectionToken. Returns undefined if invalid. */
 	resolveToken(connectionToken: string): string | undefined {
-		return this.#tokenToId.get(connectionToken);
+		const issued = this.#tokenToId.get(connectionToken);
+		if (!issued) return undefined;
+		if (!issued.claimed && this.#isExpired(issued)) {
+			this.#tokenToId.delete(connectionToken);
+			return undefined;
+		}
+		return issued.clientId;
+	}
+
+	/**
+	 * Mark a token as in use — its stream has attached.
+	 *
+	 * From here the token lives as long as the connection does, and `forget`
+	 * is what ends it. Only the unclaimed ones are on a clock, because only
+	 * they can be created by someone who never intends to connect.
+	 */
+	claimToken(connectionToken: string): void {
+		const issued = this.#tokenToId.get(connectionToken);
+		if (issued) issued.claimed = true;
+	}
+
+	/**
+	 * Drop unclaimed tokens that have run out of time, and, if too many are
+	 * still waiting, the oldest of those. The sweep runs on `negotiate`, which
+	 * is the only thing that grows the table.
+	 */
+	#expireTokens(): void {
+		const pending: string[] = [];
+		for (const [token, issued] of this.#tokenToId) {
+			if (issued.claimed) continue;
+			if (this.#isExpired(issued)) {
+				this.#tokenToId.delete(token);
+				continue;
+			}
+			pending.push(token);
+		}
+		// Insertion order is issue order, so the front of the list is the oldest.
+		const excess = pending.length - this.#maxPendingTokens;
+		for (let i = 0; i < excess; i++) {
+			const token = pending[i];
+			if (token !== undefined) this.#tokenToId.delete(token);
+		}
+	}
+
+	#isExpired(issued: IssuedToken): boolean {
+		return Date.now() - issued.issuedAt >= this.#tokenTtlMs;
 	}
 
 	/**
@@ -148,25 +261,37 @@ export class SignalRAdapter {
 		for (const raw of messages) {
 			if (!this.#handshakes.has(clientId)) {
 				// Expecting handshake
-				const parsed = this.#tryParse<HandshakeRequest>(raw);
-				if (!parsed || parsed.protocol !== "json" || parsed.version !== 1) {
+				if (!isHandshakeRequest(this.#tryParse(raw))) {
 					out.push(
 						this.#encode({
 							error:
 								'Invalid handshake — expected {"protocol":"json","version":1}',
 						}),
 					);
-					continue;
+					// The protocol ends the connection on a failed handshake. The
+					// error response is the last thing a real client reads — it stops
+					// there and closes — so the Close that follows is for the
+					// transport, which had no other way to know the socket should go.
+					// Without it the connection stayed open, with every later frame
+					// re-read as another handshake attempt.
+					out.push(
+						this.#encode({
+							type: 7,
+							error: "Handshake failed",
+						} satisfies CloseMessage),
+					);
+					return out;
 				}
 				this.#handshakes.add(clientId);
 				out.push(this.#encode({})); // empty object = handshake OK
 				continue;
 			}
 
-			const msg = this.#tryParse<
-				{ type: SignalRMessageType } & Record<string, unknown>
-			>(raw);
-			if (!msg) {
+			// A message whose `type` is not a number is malformed by the same
+			// rule as one that is not JSON: nothing below can act on it, and it
+			// used to fall through every case without a word.
+			const msg = this.#tryParse(raw);
+			if (!isTypedMessage(msg)) {
 				out.push(
 					this.#encode({
 						type: 7,
@@ -179,7 +304,19 @@ export class SignalRAdapter {
 			switch (msg.type) {
 				case 1: {
 					// Invocation
-					if (!isInvocationMessage(msg)) break;
+					if (!isInvocationMessage(msg)) {
+						// Type 1 without a usable target. Dropping it left an
+						// invoke() waiting on a Completion the protocol promises and
+						// nothing was going to send — the same hang the type-4
+						// branch below was written to stop.
+						const id = msg.invocationId;
+						if (typeof id === "string") {
+							out.push(
+								this.#encodeCompletion(id, undefined, "Invalid invocation"),
+							);
+						}
+						break;
+					}
 					const inv = msg;
 					let ok = false;
 					try {
@@ -216,16 +353,19 @@ export class SignalRAdapter {
 					// this left the client's observable pending for the lifetime of
 					// the connection — the caller has no timeout to fall back on
 					// because the protocol promises a Completion. Say so instead.
-					const stream = msg as Partial<StreamInvocationMessage>;
-					if (typeof stream.invocationId === "string") {
-						out.push(
-							this.#encodeCompletion(
-								stream.invocationId,
-								undefined,
-								"Streaming is not supported by this hub",
-							),
-						);
-					}
+					const invocationId = msg.invocationId;
+					// Nothing to answer to without one — and a stream invocation
+					// that arrives without an invocationId is malformed anyway.
+					if (typeof invocationId !== "string") break;
+					out.push(
+						this.#encodeCompletion(
+							invocationId,
+							undefined,
+							isStreamInvocation(msg)
+								? "Streaming is not supported by this hub"
+								: "Invalid stream invocation",
+						),
+					);
 					break;
 				}
 				// StreamItem (2) and CancelInvocation (5) carry no reply of their
@@ -298,8 +438,8 @@ export class SignalRAdapter {
 		// `break`, every disconnect cleared exactly one entry and the older
 		// tokens stayed resolvable indefinitely — a stale-token surface that
 		// a hijacker could replay after the client believes it's gone.
-		for (const [token, id] of this.#tokenToId) {
-			if (id === clientId) {
+		for (const [token, issued] of this.#tokenToId) {
+			if (issued.clientId === clientId) {
 				this.#tokenToId.delete(token);
 			}
 		}
@@ -310,11 +450,12 @@ export class SignalRAdapter {
 		return frame.split(RS).filter((s) => s.length > 0);
 	}
 
-	#tryParse<T>(raw: string): T | null {
+	/** Parse a frame, or answer `undefined` when it is not JSON at all. */
+	#tryParse(raw: string): unknown {
 		try {
-			return JSON.parse(raw) as T;
+			return JSON.parse(raw);
 		} catch {
-			return null;
+			return undefined;
 		}
 	}
 

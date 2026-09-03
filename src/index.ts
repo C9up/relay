@@ -27,6 +27,7 @@ export {
 } from "./RedisRelayTransport.js";
 export {
 	type ChannelAuthorizer,
+	PING_CHANNEL,
 	Relay,
 	type RelayAuth,
 	type RelayConfig,

@@ -78,21 +78,39 @@ export abstract class Hub {
 		(ctx: HubContext, ...args: unknown[]) => Promise<void> | void
 	> = new Map();
 
+	/**
+	 * Build the allowlist of dispatchable handlers.
+	 *
+	 * The whole prototype chain BELOW `Hub` is walked, not just the class's own
+	 * prototype. A hub that extends another hub is an ordinary way to share
+	 * handlers, and reading one level meant the inherited ones were answered
+	 * with `E_RELAY_UNKNOWN_EVENT` — a handler that exists, is spelled right,
+	 * and never runs.
+	 *
+	 * The walk STOPS at `Hub.prototype`, which is the point of the allowlist:
+	 * nothing on this class or on `Object.prototype` is ever reachable from the
+	 * wire, so `dispatch` cannot be talked into calling `useGuards`,
+	 * `removeClient` or `constructor`. Subclasses win over their bases, as
+	 * method resolution already says they do.
+	 */
 	constructor() {
-		// Build allowlist from own prototype methods starting with "on" (excluding lifecycle hooks)
 		const reserved = new Set(["onConnect", "onDisconnect"]);
-		const proto = Object.getPrototypeOf(this);
-		for (const name of Object.getOwnPropertyNames(proto)) {
-			if (
-				name.startsWith("on") &&
-				name.length > 2 &&
-				!reserved.has(name) &&
-				typeof proto[name] === "function"
-			) {
-				// Convert onTaskUpdate → taskUpdate (event name)
+		let proto: object | null = Object.getPrototypeOf(this);
+		while (proto !== null && proto !== Hub.prototype) {
+			for (const name of Object.getOwnPropertyNames(proto)) {
+				if (!name.startsWith("on") || name.length <= 2 || reserved.has(name)) {
+					continue;
+				}
 				const eventName = name.charAt(2).toLowerCase() + name.slice(3);
-				this.#handlerMethods.set(eventName, proto[name]);
+				// A base class does not override the subclass that extends it.
+				if (this.#handlerMethods.has(eventName)) continue;
+				// Read the descriptor rather than the property: a getter would
+				// otherwise be invoked here, during construction, just to find out
+				// whether it answers a function.
+				const handler = Object.getOwnPropertyDescriptor(proto, name)?.value;
+				if (isHandler(handler)) this.#handlerMethods.set(eventName, handler);
 			}
+			proto = Object.getPrototypeOf(proto);
 		}
 	}
 
@@ -149,25 +167,51 @@ export abstract class Hub {
 		return ctx;
 	}
 
-	/** Register a client connection. */
+	/**
+	 * Register a client connection.
+	 *
+	 * A registration under an id that already has one REPLACES it, and takes
+	 * the previous client's group memberships out of the index on the way. It
+	 * used to overwrite the map entry and leave the index alone, which had two
+	 * consequences, both silent: the new connection received everything sent to
+	 * the groups the old one had joined — groups it never asked for and was
+	 * never authorized for — and `removeClient` could not clean them up
+	 * afterwards, because it walks the client's own group set and the client
+	 * holding that set had been dropped.
+	 */
 	registerClient(client: ConnectedHubClient): HubContext {
+		this.#forgetGroups(this.#clients.get(client.id));
 		this.#clients.set(client.id, client);
 		return this.#buildContext(client);
+	}
+
+	/**
+	 * The auth recorded when `clientId` connected, or `undefined` when there is
+	 * no such client. A transport uses it to check that a later request on the
+	 * same connection comes from the identity the connection was opened with.
+	 */
+	authFor(clientId: string): HubContext["auth"] | undefined {
+		return this.#clients.get(clientId)?.auth;
 	}
 
 	/** Remove a client. */
 	removeClient(clientId: string): void {
 		const client = this.#clients.get(clientId);
 		if (client) {
-			for (const group of client.groups) {
-				const members = this.#groupIndex.get(group);
-				if (members) {
-					members.delete(clientId);
-					if (members.size === 0) this.#groupIndex.delete(group);
-				}
-			}
+			this.#forgetGroups(client);
 			this.#clients.delete(clientId);
 			this.onDisconnect(clientId).catch(() => {});
+		}
+	}
+
+	/** Take a client out of every group index it is a member of. */
+	#forgetGroups(client: ConnectedHubClient | undefined): void {
+		if (!client) return;
+		for (const group of client.groups) {
+			const members = this.#groupIndex.get(group);
+			if (!members) continue;
+			members.delete(client.id);
+			if (members.size === 0) this.#groupIndex.delete(group);
 		}
 	}
 
@@ -205,7 +249,6 @@ export abstract class Hub {
 			return false;
 		}
 
-		// Reuse existing ctx if available, otherwise create
 		const ctx = this.#buildContext(client);
 		try {
 			// EVERY argument, not just the first. A SignalR client calling
@@ -282,7 +325,7 @@ export abstract class Hub {
 		for (const id of members) {
 			const client = this.#clients.get(id);
 			if (client) {
-				client.send(event, data);
+				deliver(client, event, data);
 			} else {
 				dead.push(id);
 			}
@@ -293,7 +336,7 @@ export abstract class Hub {
 	/** Broadcast to all connected clients. */
 	#broadcastAll(event: string, data: unknown): void {
 		for (const client of this.#clients.values()) {
-			client.send(event, data);
+			deliver(client, event, data);
 		}
 	}
 
@@ -301,4 +344,30 @@ export abstract class Hub {
 	stats(): { clients: number; groups: number } {
 		return { clients: this.#clients.size, groups: this.#groupIndex.size };
 	}
+}
+
+/**
+ * Send to one client without letting it end the fan-out.
+ *
+ * `send` is supplied by whatever transport registered the client, so a throw
+ * from one socket used to abort the loop: every member of the group listed
+ * after it silently received nothing, and which ones depended on Set order.
+ */
+function deliver(
+	client: ConnectedHubClient,
+	event: string,
+	data: unknown,
+): void {
+	try {
+		client.send(event, data);
+	} catch {
+		// One client's transport is not the group's problem.
+	}
+}
+
+/** What the allowlist accepts: a method taking a context and whatever follows. */
+function isHandler(
+	value: unknown,
+): value is (ctx: HubContext, ...args: unknown[]) => Promise<void> | void {
+	return typeof value === "function";
 }

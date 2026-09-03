@@ -9,6 +9,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import {
+	PING_CHANNEL,
 	Relay,
 	type RelaySseStream,
 	type RelayTransport,
@@ -258,9 +259,7 @@ describe("relay > a delivery that rejects", () => {
 			// The healthy client still got it, and the failing write did not
 			// surface as an unhandled rejection — which on a default Node ends
 			// the process, so one dead socket ended everybody's stream.
-			expect(good.sse.sent).toEqual([
-				{ event: "room/1", data: { n: 1 } },
-			]);
+			expect(good.sse.sent).toEqual([{ event: "room/1", data: { n: 1 } }]);
 			expect(rejections).toEqual([]);
 			expect(written.join("")).toContain("delivery to");
 			// …and the client that cannot receive is no longer subscribed.
@@ -270,7 +269,7 @@ describe("relay > a delivery that rejects", () => {
 			process.off("unhandledRejection", onUnhandled);
 		}
 	});
-})
+});
 
 describe("relay > rejections that used to escape", () => {
 	/** Capture unhandled rejections and stderr for the duration of `fn`. */
@@ -334,4 +333,107 @@ describe("relay > rejections that used to escape", () => {
 		expect(rejections).toEqual([]);
 		expect(written).toContain("will not receive messages");
 	});
-})
+});
+
+describe("relay > keep-alive", () => {
+	it("sends nothing when no interval is configured, which is the default", async () => {
+		vi.useFakeTimers();
+		try {
+			const r = new Relay({ allowUnauthorizedChannels: true });
+			const { sse } = await connectAndSubscribe(r, "u1", "feed");
+			await vi.advanceTimersByTimeAsync(120_000);
+
+			expect(sse.sent).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	/**
+	 * The reason the option exists: an SSE connection carrying no traffic is
+	 * indistinguishable from a hung one to everything in between, and nginx
+	 * closes an idle upstream at sixty seconds by default.
+	 */
+	it("reaches every client on the interval, subscribed or not", async () => {
+		vi.useFakeTimers();
+		try {
+			const r = new Relay({
+				allowUnauthorizedChannels: true,
+				pingInterval: 1_000,
+			});
+			const { sse } = await connectAndSubscribe(r, "u1", "feed");
+			const idle = fakeSse("idle");
+			r.connect(undefined, idle, {});
+			idle.sent.length = 0;
+
+			await vi.advanceTimersByTimeAsync(3_000);
+
+			expect(sse.sent.map((s) => s.event)).toEqual([
+				PING_CHANNEL,
+				PING_CHANNEL,
+				PING_CHANNEL,
+			]);
+			expect(idle.sent.map((s) => s.event)).toEqual([
+				PING_CHANNEL,
+				PING_CHANNEL,
+				PING_CHANNEL,
+			]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("stops on shutdown, and drops a client whose socket has gone", async () => {
+		vi.useFakeTimers();
+		try {
+			const r = new Relay({
+				allowUnauthorizedChannels: true,
+				pingInterval: 1_000,
+			});
+			const { sse } = await connectAndSubscribe(r, "u1", "feed");
+			await sse.end();
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(r.clientCount()).toBe(0);
+
+			const live = await connectAndSubscribe(r, "u2", "feed");
+			await r.shutdown();
+			await vi.advanceTimersByTimeAsync(10_000);
+
+			expect(live.sse.sent).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
+describe("relay > broadcast payloads", () => {
+	/**
+	 * `undefined` is not a value JSON carries. Left alone it survived
+	 * in-process, vanished through `JSON.stringify` into the SSE frame, and
+	 * came back off the bus as a missing key — three answers depending on
+	 * where the listener ran. Transmit substitutes null for the same reason.
+	 */
+	it("carries an absent payload as null, everywhere it is carried", async () => {
+		const published: unknown[] = [];
+		const bus: RelayTransport = {
+			publish: (_channel, message) => {
+				published.push(message);
+			},
+			subscribe: () => {},
+		};
+		const r = new Relay({ allowUnauthorizedChannels: true, transport: bus });
+		const { sse } = await connectAndSubscribe(r, "u1", "feed");
+		const seen: unknown[] = [];
+		r.on("broadcast", (evt) => {
+			seen.push(evt.payload);
+		});
+
+		r.broadcast("feed", undefined);
+
+		expect(sse.sent).toEqual([{ event: "feed", data: null }]);
+		expect(seen).toEqual([null]);
+		expect(published).toEqual([
+			{ type: "broadcast", channel: "feed", payload: null },
+		]);
+	});
+});

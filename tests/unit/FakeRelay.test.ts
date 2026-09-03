@@ -101,3 +101,15 @@ describe("FakeRelay — assertNotSent", () => {
 		);
 	});
 });
+
+describe("FakeRelay > payload parity with the real relay", () => {
+	it("captures an absent payload as null, the way a real broadcast sends it", () => {
+		const relay = new FakeRelay();
+
+		relay.broadcast("feed", undefined);
+
+		expect(relay.getSent()).toEqual([
+			{ channel: "feed", data: null, clients: 0 },
+		]);
+	});
+});

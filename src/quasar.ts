@@ -39,6 +39,11 @@ function missingCommands(value: unknown): string[] {
 	);
 }
 
+/** A client is one when it answers every command the transport issues. */
+function isPubSubClient(value: unknown): value is RelayPubSubClient {
+	return missingCommands(value).length === 0;
+}
+
 /** Resolve the named quasar connection, or say precisely what is missing. */
 export async function quasarConnection(
 	name?: string,
@@ -67,11 +72,10 @@ export async function quasarConnection(
 	}
 
 	const connection = manager.connection(name);
-	const missing = missingCommands(connection);
-	if (missing.length > 0) {
+	if (!isPubSubClient(connection)) {
 		throw new Error(
-			`The quasar connection${name ? ` '${name}'` : ""} is missing ${missing.join(", ")}, which the relay bus issues.`,
+			`The quasar connection${name ? ` '${name}'` : ""} is missing ${missingCommands(connection).join(", ")}, which the relay bus issues.`,
 		);
 	}
-	return connection as RelayPubSubClient;
+	return connection;
 }

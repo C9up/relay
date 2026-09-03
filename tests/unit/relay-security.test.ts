@@ -268,3 +268,92 @@ describe("relay-security > unsubscribe() ownership", () => {
 		expect(result).toBe("ok");
 	});
 });
+
+describe("relay-security > a body is not a shape just because the type says so", () => {
+	it("refuses a channel that is not a string, instead of throwing out of the route", async () => {
+		const r = new Relay();
+		r.authorize("room/:id", () => true);
+		const c = r.connect(undefined, fakeSse(), {
+			auth: { isAuthenticated: false },
+		});
+		if (c.outcome !== "ok") throw new Error("unreachable");
+
+		// `{}.split` is not a function: this reached the pattern matcher and
+		// answered a posted body with a 500 and a stack trace.
+		const result = await r.subscribe(c.uid, { evil: 1 }, {});
+
+		expect(result).toEqual({
+			ok: false,
+			status: 400,
+			code: "E_RELAY_BAD_REQUEST",
+		});
+	});
+
+	it("refuses a uid that is not a string", async () => {
+		const r = new Relay();
+		expect(await r.subscribe(["a"], "room/1", {})).toEqual({
+			ok: false,
+			status: 400,
+			code: "E_RELAY_BAD_REQUEST",
+		});
+	});
+
+	it("treats a non-string unsubscribe as the no-op it is", () => {
+		const r = new Relay();
+		expect(r.unsubscribe(7, "feed", {})).toBe("ok");
+	});
+});
+
+describe("relay-security > a subscription outliving its client", () => {
+	it("does not index a client that disconnected while the authorizer ran", async () => {
+		const r = new Relay();
+		let release: (() => void) | undefined;
+		r.authorize("room/:id", async () => {
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return true;
+		});
+		const sse = fakeSse();
+		const c = r.connect(undefined, sse, { auth: { isAuthenticated: false } });
+		if (c.outcome !== "ok") throw new Error("unreachable");
+
+		const pending = r.subscribe(c.uid, "room/7", {});
+		await new Promise((resolve) => setImmediate(resolve));
+		// The socket dies mid-authorization.
+		await sse.end();
+		release?.();
+
+		expect(await pending).toEqual({
+			ok: false,
+			status: 400,
+			code: "E_NOT_CONNECTED",
+		});
+		// The entry that used to stay for the life of the process: counted by
+		// channelSubscribers, returned by getSubscribersFor, walked on every
+		// broadcast, and removable by nothing.
+		expect(r.channelSubscribers("room/7")).toBe(0);
+		expect(r.getSubscribersFor("room/7")).toEqual([]);
+	});
+
+	it("hands an authorizer the params of the pattern that selected it", async () => {
+		const r = new Relay();
+		const seen: Array<Record<string, string>> = [];
+		// Registered first, so the old two-walk lookup found ITS params for a
+		// channel the exact registration below was the one to answer.
+		r.authorize("users/:id", (_ctx, params) => {
+			seen.push({ pattern: "users/:id", ...params });
+			return true;
+		});
+		r.authorize("users/me", (_ctx, params) => {
+			seen.push({ pattern: "users/me", ...params });
+			return true;
+		});
+		const c = r.connect(undefined, fakeSse(), {});
+		if (c.outcome !== "ok") throw new Error("unreachable");
+
+		await r.subscribe(c.uid, "users/me", {});
+
+		expect(seen).toEqual([{ pattern: "users/me" }]);
+	});
+});
