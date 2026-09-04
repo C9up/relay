@@ -114,7 +114,12 @@ export abstract class Hub {
 		}
 	}
 
-	/** Set guard options for the entire hub. Normalizes singular guard/guards. */
+	/**
+	 * Set guard options for the entire hub. Normalizes singular guard/guards.
+	 *
+	 * `roles` is satisfied by ANY of the names, `permissions` by ALL of them —
+	 * the same split every other entry point in the framework uses.
+	 */
 	useGuards(options: HubGuardOptions): void {
 		this.#guards = {
 			guards: [
@@ -307,6 +312,11 @@ export abstract class Hub {
 			}
 		}
 
+		// Roles are ANY, permissions are ALL — deliberately asymmetric, and the
+		// same split the HTTP pipeline, the RPC router and the GraphQL engine
+		// use, so one contract holds across every entry point. A role names who
+		// someone is (an admin OR an owner may act), a permission names what an
+		// action needs (all of them, or it is not allowed).
 		if (this.#guards.roles && this.#guards.roles.length > 0) {
 			const userRoles = client.auth.roles ?? [];
 			if (!this.#guards.roles.some((r) => userRoles.includes(r))) {
