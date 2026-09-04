@@ -1,0 +1,50 @@
+{
+	"root": true,
+	"$schema": "https://biomejs.dev/schemas/2.4.10/schema.json",
+	"assist": {
+		"actions": {
+			"source": {
+				"organizeImports": "on"
+			}
+		}
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"style": {
+				"noNonNullAssertion": "error"
+			},
+			"recommended": true,
+			"nursery": {},
+			"correctness": {
+				"noUnusedImports": "error"
+			}
+		}
+	},
+	"formatter": {
+		"indentStyle": "tab",
+		"indentWidth": 2
+	},
+	"javascript": {
+		"parser": {
+			"unsafeParameterDecoratorsEnabled": true
+		}
+	},
+	"files": {
+		"includes": [
+			"**",
+			"!**/dist/**",
+			"!**/coverage/**",
+			"!**/target/**",
+			"!**/examples/emails/**",
+			"!**/*.html",
+			"!**/index.js",
+			"!**/index.d.ts",
+			"!**/*_wasm.d.ts",
+			"!**/tsconfig*.json",
+			"!**/package.json",
+			"!**/vitest.config.ts",
+			"!**/scripts/**"
+		]
+	}
+}
