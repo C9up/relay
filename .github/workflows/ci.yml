@@ -34,9 +34,15 @@ jobs:
           node-version: '22'
       - run: pnpm install
       - run: pnpm exec tsc -p tsconfig.build.json --noEmit
+      # And the tests: `tsconfig.build.json` leaves them out, so every type a
+      # test relies on went ungated until this step ran the project's own
+      # `tsconfig.json`, which includes them.
+      - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm build
-      - run: pnpm test
+      # With coverage: the thresholds in vitest.config.ts are only a gate
+      # if something runs them.
+      - run: pnpm test:coverage
 
   # Publish job — gated on workflow_dispatch (manual maintainer trigger).
   # Requires NPM_TOKEN secret + a v<MAJOR>.<MINOR>.<PATCH> tag at HEAD matching
