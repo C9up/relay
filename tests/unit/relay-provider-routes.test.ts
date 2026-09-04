@@ -152,6 +152,7 @@ describe("relay > provider > the routes", () => {
 		provider.register();
 		await provider.boot();
 		await provider.start();
+		await provider.ready();
 
 		expect([...router.routes.keys()].sort()).toEqual([
 			"GET /__relay/events",
@@ -169,6 +170,7 @@ describe("relay > provider > the routes", () => {
 		provider.register();
 		await provider.boot();
 		await provider.start();
+		await provider.ready();
 
 		expect(router.routes.size).toBe(0);
 	});
@@ -182,6 +184,7 @@ describe("relay > provider > the routes", () => {
 		provider.register();
 		await provider.boot();
 		await provider.start();
+		await provider.ready();
 
 		const events = router.routes.get("GET /__relay/events");
 		const first = fakeResponse();
@@ -215,6 +218,7 @@ describe("relay > provider > the routes", () => {
 		provider.register();
 		await provider.boot();
 		await provider.start();
+		await provider.ready();
 
 		const response = fakeResponse();
 		await router.routes.get("GET /__relay/events")?.({
@@ -235,6 +239,7 @@ describe("relay > provider > the routes", () => {
 		provider.register();
 		await provider.boot();
 		await provider.start();
+		await provider.ready();
 
 		const response = fakeResponse();
 		await router.routes.get("GET /__relay/events")?.({

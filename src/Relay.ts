@@ -330,6 +330,48 @@ export class Relay {
 	// ─── Channel authorization ────────────────────────────────
 
 	/**
+	 * Take over what was registered on an earlier instance.
+	 *
+	 * `services/main` hands out a Proxy that builds a default `Relay` on first
+	 * access, so an application with no provider still has a usable surface.
+	 * When the provider then binds its own — configured one — the default is
+	 * left holding whatever had already been registered on it: an `authorize()`
+	 * from a preload went to an object nothing served from, and the channel
+	 * answered `E_CHANNEL_NO_AUTHORIZER` at request time. Silently, because
+	 * both calls read as `relay.authorize(...)` at the call site.
+	 *
+	 * Registrations move; connections do not. Nothing has connected before the
+	 * provider boots, and a live client belongs to the socket it opened on.
+	 *
+	 * @internal Called by `setRelay` when the instance is replaced.
+	 */
+	adoptRegistrationsFrom(previous: Relay): void {
+		for (const [pattern, callback] of previous.#authorizers) {
+			// An authorizer this instance already declared wins: it was
+			// registered against the served instance on purpose.
+			if (!this.#authorizers.has(pattern)) {
+				this.#authorizers.set(pattern, callback);
+			}
+		}
+		if (this.#routeCustomizer === undefined) {
+			this.#routeCustomizer = previous.#routeCustomizer;
+		}
+		for (const [path, mounted] of previous.#hubs) {
+			if (!this.#hubs.has(path)) this.#hubs.set(path, mounted);
+		}
+		for (const [event, listeners] of Object.entries(previous.#listeners)) {
+			if (listeners === undefined) continue;
+			const name = event as LifecycleEventName;
+			// Same mapped-type dance as `on()`: TS cannot propagate the event
+			// name from the index expression to the assignment target, so the
+			// entry is added through a spread.
+			const existing = this.#listeners[name] ?? new Set();
+			for (const listener of listeners) existing.add(listener);
+			this.#listeners = { ...this.#listeners, [name]: existing };
+		}
+	}
+
+	/**
 	 * Register an authorization callback. Patterns support a single
 	 * `:param` slot or a trailing `:*` wildcard:
 	 *

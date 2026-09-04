@@ -65,11 +65,18 @@ export default class RelayProvider {
 		setRelay(relay);
 	}
 
-	async start(): Promise<void> {
-		// Routes are registered in `start()` — AFTER preloads have run.
-		// Apps' `relay.registerRoutes(customizer)` calls (which typically
-		// live in start/services.ts) are guaranteed to have been
-		// recorded by the time the customizer is applied to each route.
+	async start(): Promise<void> {}
+
+	async ready(): Promise<void> {
+		// Routes are registered in `ready()`, not `start()`: the host starts its
+		// providers BEFORE importing preloads, and a preload is where an
+		// application writes `relay.registerRoutes(customizer)` and
+		// `relay.hub(...)`. Registering here is what makes those calls arrive in
+		// time — the customizer is applied to each route as it is built, so a
+		// route built before the preload ran could never carry it.
+		//
+		// Safe to add routes this late: the router builds its lookup index
+		// lazily and rebuilds it when the table changes.
 		//
 		// Resolve the host router from the container, where Ream registers it as
 		// `'router'` (Ignitor) — instead of importing `@c9up/ream/services/router`
@@ -84,8 +91,6 @@ export default class RelayProvider {
 		registerRelayRoutes(router, relay);
 		registerMountedHubs(router, relay);
 	}
-
-	async ready(): Promise<void> {}
 
 	async shutdown(): Promise<void> {
 		// Graceful shutdown: release the Relay's bus subscription/connection so
