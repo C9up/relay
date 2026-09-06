@@ -23,18 +23,28 @@ interface ConnectionSource {
 	connection(name?: string): unknown;
 }
 
+/**
+ * Read a member without assuming how the object answers.
+ *
+ * Two shapes have to work, and they disagree about `in`. Quasar's accessor is
+ * a Proxy over an empty null-prototype object with only a `get` trap, so
+ * `"connection" in manager` is FALSE while reading it returns the function —
+ * gating on `in` rejected the real manager. And a module namespace under a
+ * test double RAISES for an export it does not have, rather than answering
+ * undefined, so a bare read fails on the mock. Reading through a catch is what
+ * satisfies both.
+ */
+function readMember(value: unknown, name: string): unknown {
+	if (typeof value !== "object" || value === null) return undefined;
+	try {
+		return Reflect.get(value, name);
+	} catch {
+		return undefined;
+	}
+}
+
 function isConnectionSource(value: unknown): value is ConnectionSource {
-	// `in` BEFORE reading. What comes back from the specifier is a module
-	// namespace, and reading an export it does not have is not always harmless:
-	// under a test double it raises rather than answering undefined, so a
-	// probe written as a plain read fails on the mock instead of falling
-	// through to the default export.
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		"connection" in value &&
-		typeof Reflect.get(value, "connection") === "function"
-	);
+	return typeof readMember(value, "connection") === "function";
 }
 
 export interface QuasarConnectionRequest {
@@ -104,10 +114,7 @@ export async function quasarConnection<T>(
 
 	const connection = manager.connection(name);
 	const missing = required.filter(
-		(command) =>
-			typeof connection !== "object" ||
-			connection === null ||
-			typeof Reflect.get(connection, command) !== "function",
+		(command) => typeof readMember(connection, command) !== "function",
 	);
 	if (missing.length > 0) {
 		throw raise(
