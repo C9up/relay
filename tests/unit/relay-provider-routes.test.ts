@@ -151,14 +151,25 @@ describe("relay > provider > the routes", () => {
 
 		provider.register();
 		await provider.boot();
-		await provider.start();
-		await provider.ready();
 
+		// Nothing yet: the application has not asked.
+		expect(router.routes.size).toBe(0);
+
+		// And the moment it asks — from a preload, which runs BEFORE the socket
+		// opens — the routes exist. They used to be built in `ready()`, which
+		// runs after the server is already listening, so a request arriving in
+		// that window got a 404 from a route the application had asked for.
+		getRelay()?.registerRoutes();
 		expect([...router.routes.keys()].sort()).toEqual([
 			"GET /__relay/events",
 			"POST /__relay/subscribe",
 			"POST /__relay/unsubscribe",
 		]);
+
+		// `ready()` adds nothing — that is the point.
+		await provider.start();
+		await provider.ready();
+		expect(router.routes.size).toBe(3);
 	});
 
 	it("mounts nothing when the host registers no router", async () => {
@@ -169,6 +180,9 @@ describe("relay > provider > the routes", () => {
 
 		provider.register();
 		await provider.boot();
+		// What a preload writes. Upstream's Transmit is the same: the routes
+		// exist because the application asked for them.
+		getRelay()?.registerRoutes();
 		await provider.start();
 		await provider.ready();
 
@@ -183,6 +197,9 @@ describe("relay > provider > the routes", () => {
 		const provider = new RelayProvider(app as never);
 		provider.register();
 		await provider.boot();
+		// What a preload writes. Upstream's Transmit is the same: the routes
+		// exist because the application asked for them.
+		getRelay()?.registerRoutes();
 		await provider.start();
 		await provider.ready();
 
@@ -217,6 +234,9 @@ describe("relay > provider > the routes", () => {
 		const provider = new RelayProvider(app as never);
 		provider.register();
 		await provider.boot();
+		// What a preload writes. Upstream's Transmit is the same: the routes
+		// exist because the application asked for them.
+		getRelay()?.registerRoutes();
 		await provider.start();
 		await provider.ready();
 
@@ -238,6 +258,9 @@ describe("relay > provider > the routes", () => {
 		const provider = new RelayProvider(app as never);
 		provider.register();
 		await provider.boot();
+		// What a preload writes. Upstream's Transmit is the same: the routes
+		// exist because the application asked for them.
+		getRelay()?.registerRoutes();
 		await provider.start();
 		await provider.ready();
 

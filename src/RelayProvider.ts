@@ -57,39 +57,49 @@ export default class RelayProvider {
 	}
 
 	async boot(): Promise<void> {
-		// Force-resolve the Relay singleton so `setRelay` runs even
-		// when the app never imports it explicitly. Apps can then call
-		// `relay.registerRoutes(...)` from a preload BEFORE the routes
-		// are actually registered (that happens in `start()` below).
+		// Force-resolve the Relay singleton so `setRelay` runs even when the app
+		// never imports it explicitly.
 		const relay = await this.app.container.resolve<Relay>(Relay);
 		setRelay(relay);
+
+		// Hand the relay the router, so a declaration made in a preload —
+		// `relay.registerRoutes(...)`, `relay.hub(...)` — becomes a mounted route
+		// AT THAT MOMENT.
+		//
+		// The routes used to be built here in `ready()`, which runs after the
+		// socket is already listening: a request arriving in that window got a
+		// 404 from a route the application had asked for. Mounting on
+		// declaration closes the window, and it is what upstream's Transmit
+		// does — `transmit.registerRoutes()` builds the routes itself.
+		//
+		// Resolve the host router from the container, where Ream registers it as
+		// `'router'` (Ignitor), instead of importing
+		// `@c9up/ream/services/router` — which keeps relay runtime-agnostic. A
+		// non-Ream host never registers `'router'`: broadcast / authorize still
+		// work through the singleton and the user wires their own SSE routes.
+		if (!this.app.container.has("router")) return;
+		const router = await this.app.container.resolve<ReamRouter>("router");
+		relay.useMounter({
+			mountEndpoints: (target) => registerRelayRoutes(router, target),
+			mountHub: (target, mounted) =>
+				registerMountedHub(router, target, mounted),
+		});
 	}
 
 	async start(): Promise<void> {}
 
 	async ready(): Promise<void> {
-		// Routes are registered in `ready()`, not `start()`: the host starts its
-		// providers BEFORE importing preloads, and a preload is where an
-		// application writes `relay.registerRoutes(customizer)` and
-		// `relay.hub(...)`. Registering here is what makes those calls arrive in
-		// time — the customizer is applied to each route as it is built, so a
-		// route built before the preload ran could never carry it.
-		//
-		// Safe to add routes this late: the router builds its lookup index
-		// lazily and rebuilds it when the table changes.
-		//
-		// Resolve the host router from the container, where Ream registers it as
-		// `'router'` (Ignitor) — instead of importing `@c9up/ream/services/router`
-		// — which keeps relay runtime-agnostic. A non-Ream host never registers
-		// `'router'`: broadcast / authorize still work via the singleton and the
-		// user wires their own SSE routes. Past the guard Ream IS present, so
-		// route-registration failures (duplicate route, router throwing, a bad
-		// customizer) surface instead of being hidden as "host is not Ream".
+		// Nothing is mounted here any more. What IS worth saying is that an
+		// application which mounted a hub but never asked for the SSE endpoints
+		// has a hub no browser can reach: the client opens `/__relay/events`
+		// first, and that route only exists once `registerRoutes()` is called.
 		if (!this.app.container.has("router")) return;
-		const router = await this.app.container.resolve<ReamRouter>("router");
 		const relay = await this.app.container.resolve<Relay>(Relay);
-		registerRelayRoutes(router, relay);
-		registerMountedHubs(router, relay);
+		if (relay.mountedHubs().length > 0 && !relay.hasRegisteredRoutes()) {
+			console.warn(
+				"[relay] A hub is mounted but relay.registerRoutes() was never called, so /__relay/events does not exist and no client can connect. Call it from the preload where the hub is declared.",
+			);
+		}
 	}
 
 	async shutdown(): Promise<void> {
@@ -151,21 +161,28 @@ interface ReamRouter {
  * customizer the relay's own routes get — a hub is as much in need of `auth`
  * middleware as the event stream is.
  */
-function registerMountedHubs(router: ReamRouter, relay: Relay): void {
-	for (const mounted of relay.mountedHubs()) {
+function registerMountedHub(
+	router: ReamRouter,
+	relay: Relay,
+	mounted: { path: string; hub: unknown; adapter?: unknown },
+): void {
+	{
 		// `relay.hub()` takes its hub structurally — the relay records it and
 		// never calls into it — so the concrete types only become knowable here,
 		// where they are used. Checked rather than asserted: a wrong object
 		// would otherwise fail on the first frame, three layers away from the
 		// `relay.hub(...)` line that passed it.
 		const hub = mounted.hub;
-		if (!isHub(hub)) {
+		if (typeof hub !== "object" || hub === null || !isHub(hub)) {
 			throw new TypeError(
 				`The object mounted at "${mounted.path}" is not a Hub — it must extend Hub from @c9up/relay.`,
 			);
 		}
 		const adapter = mounted.adapter;
-		if (adapter !== undefined && !isAdapter(adapter)) {
+		if (
+			adapter !== undefined &&
+			(typeof adapter !== "object" || adapter === null || !isAdapter(adapter))
+		) {
 			throw new TypeError(
 				`The adapter given for the hub at "${mounted.path}" is not a SignalRAdapter.`,
 			);

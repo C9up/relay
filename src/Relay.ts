@@ -222,6 +222,21 @@ export interface RelayRouteBuilder {
 
 export type RelayRouteCustomizer = (route: RelayRouteBuilder) => void;
 
+/**
+ * How the relay reaches the host router.
+ *
+ * Installed by `RelayProvider` once the router exists, so a declaration made in
+ * a preload — `registerRoutes()`, `hub()` — becomes a mounted route at the
+ * moment it is written rather than in a later phase.
+ */
+export interface RelayRouteMounter {
+	mountEndpoints(relay: Relay): void;
+	mountHub(
+		relay: Relay,
+		mounted: { path: string; hub: unknown; adapter?: unknown },
+	): void;
+}
+
 interface RegisteredClient {
 	uid: string;
 	sse: RelaySseStream;
@@ -241,6 +256,21 @@ export class Relay {
 	#authorizers = new Map<string, ChannelAuthorizer<Record<string, string>>>();
 	#listeners: { [E in LifecycleEventName]?: Set<LifecycleListener<E>> } = {};
 	#routeCustomizer?: RelayRouteCustomizer;
+	/**
+	 * How a declaration reaches the router, installed by `RelayProvider` in
+	 * `boot()`.
+	 *
+	 * Declaring and mounting used to be two moments: the app recorded a
+	 * customizer and its hubs in a preload, and the provider built the routes
+	 * afterwards, in `ready()` — which runs AFTER the socket is listening. A
+	 * request arriving in that window got a 404 from a route the application had
+	 * already asked for. Mounting where the app declares closes the window,
+	 * and it is what upstream's Transmit does: `registerRoutes()` builds the
+	 * routes itself.
+	 */
+	#mounter?: RelayRouteMounter;
+	/** Whether the application asked for the SSE endpoints at all. */
+	#routesRequested = false;
 	/** Hubs mounted with {@link hub}, keyed by path. */
 	readonly #hubs = new Map<
 		string,
@@ -353,6 +383,7 @@ export class Relay {
 				this.#authorizers.set(pattern, callback);
 			}
 		}
+		if (previous.#routesRequested) this.#routesRequested = true;
 		if (this.#routeCustomizer === undefined) {
 			this.#routeCustomizer = previous.#routeCustomizer;
 		}
@@ -408,8 +439,12 @@ export class Relay {
 	 * Equivalent of AdonisJS Transmit's
 	 * `transmit.registerRoutes((route) => route.middleware(['auth']))`.
 	 */
-	registerRoutes(customizer: RelayRouteCustomizer): void {
-		this.#routeCustomizer = customizer;
+	registerRoutes(customizer?: RelayRouteCustomizer): void {
+		if (customizer !== undefined) this.#routeCustomizer = customizer;
+		this.#routesRequested = true;
+		// Mount now. A host with no router (relay used outside Ream) records the
+		// customizer and nothing else, exactly as before.
+		this.#mounter?.mountEndpoints(this);
 	}
 
 	/**
@@ -433,9 +468,29 @@ export class Relay {
 			);
 		}
 		this.#hubs.set(path, { path, hub, adapter });
+		this.#mounter?.mountHub(this, { path, hub, adapter });
 	}
 
-	/** @internal The hubs recorded so far, read by the provider at `start()`. */
+	/**
+	 * @internal Give the relay a way to mount what it is told about, installed
+	 * by the provider once the host router exists.
+	 *
+	 * Mounts whatever was declared BEFORE it arrived: an app is free to call
+	 * `relay.hub(...)` at module scope, which runs while the provider is still
+	 * booting.
+	 */
+	useMounter(mounter: RelayRouteMounter): void {
+		this.#mounter = mounter;
+		if (this.#routesRequested) mounter.mountEndpoints(this);
+		for (const mounted of this.#hubs.values()) mounter.mountHub(this, mounted);
+	}
+
+	/** @internal Whether the application ever asked for the SSE endpoints. */
+	hasRegisteredRoutes(): boolean {
+		return this.#routesRequested;
+	}
+
+	/** @internal The hubs recorded so far. */
 	mountedHubs(): Array<{
 		path: string;
 		hub: HubLike;
