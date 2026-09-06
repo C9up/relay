@@ -60,3 +60,39 @@ describe("relay > RelayProvider", () => {
 		expect(await app.container.resolve(Relay)).toBeInstanceOf(Relay);
 	});
 });
+
+describe("relay > RelayProvider > shutdown", () => {
+	it("releases the services/main singleton it bound", async () => {
+		const { getRelay } = await import("../../src/services/main.js");
+		const { app } = makeApp();
+		const provider = new RelayProvider(app);
+		provider.register();
+		await provider.boot();
+		const bound = getRelay();
+		expect(bound).toBeInstanceOf(Relay);
+
+		await provider.shutdown();
+
+		// `relay.shutdown()` releases the bus subscription, so a Relay still
+		// reachable through `services/main` accepts a broadcast and delivers it
+		// to a transport it has already let go of.
+		expect(getRelay()).toBeUndefined();
+	});
+
+	it("leaves a relay another application has since bound alone", async () => {
+		const { getRelay } = await import("../../src/services/main.js");
+		const provider = new RelayProvider(makeApp().app);
+		provider.register();
+		await provider.boot();
+
+		const other = new RelayProvider(makeApp().app);
+		other.register();
+		await other.boot();
+		const replacement = getRelay();
+		if (!replacement) throw new Error("expected the second boot to bind one");
+
+		await provider.shutdown();
+
+		expect(getRelay()).toBe(replacement);
+	});
+});

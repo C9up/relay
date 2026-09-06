@@ -3,7 +3,7 @@ import { Hub } from "./Hub.js";
 import { Relay, type RelayConfig, type RelayRouteBuilder } from "./Relay.js";
 import { SignalRAdapter } from "./SignalRAdapter.js";
 import { registerHubRoutes } from "./SignalRTransport.js";
-import { setRelay } from "./services/main.js";
+import { clearRelay, getRelay, setRelay } from "./services/main.js";
 
 interface RelayContainer {
 	singleton(token: unknown, factory: () => unknown): void;
@@ -108,6 +108,11 @@ export default class RelayProvider {
 		// No-op for single-instance relays (no transport configured).
 		const relay = await this.app.container.resolve<Relay>(Relay);
 		await relay.shutdown();
+		// And release the module-level singleton, while it is still ours: a
+		// stopped application left a shut-down Relay reachable through
+		// `services/main`, so a broadcast written anywhere in the process went
+		// to a transport that had already let go of its subscription.
+		if (getRelay() === relay) clearRelay();
 	}
 }
 

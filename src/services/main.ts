@@ -44,6 +44,19 @@ export function getRelay(): Relay | undefined {
 	return instance;
 }
 
+/**
+ * @internal Release the singleton, so a shut-down application does not leave a
+ * dead relay reachable through `services/main`.
+ *
+ * The caller checks ownership first (`getRelay() === mine`): two applications
+ * share this module in one process, and the one shutting down must not clear
+ * what the other has since bound.
+ */
+export function clearRelay(): void {
+	instance = undefined;
+	instanceIsLazyDefault = false;
+}
+
 const relay: Relay = new Proxy({} as Relay, {
 	get(_target, prop) {
 		if (!instance) {
