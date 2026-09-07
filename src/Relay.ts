@@ -490,6 +490,18 @@ export class Relay {
 		return this.#routesRequested;
 	}
 
+	/**
+	 * @internal The channel patterns an authorizer was declared for.
+	 *
+	 * Sibling of {@link mountedHubs}: both answer "what has the application
+	 * declared that presumes the endpoints exist". A channel authorizer is the
+	 * shape simple use takes — `authorize()` then `broadcast()`, no hub — and
+	 * looking only at hubs missed it entirely.
+	 */
+	authorizedChannels(): string[] {
+		return [...this.#authorizers.keys()];
+	}
+
 	/** @internal The hubs recorded so far. */
 	mountedHubs(): Array<{
 		path: string;

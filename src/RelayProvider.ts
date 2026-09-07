@@ -21,14 +21,25 @@ export interface RelayAppContext {
 }
 
 /**
- * RelayProvider — registers the Relay singleton in the host container
- * and auto-binds the three SSE routes (`/__relay/events`,
- * `/__relay/subscribe`, `/__relay/unsubscribe`) when the host is Ream
- * (detected by importing `@c9up/ream/services/router`).
+ * RelayProvider — registers the Relay singleton in the host container and
+ * installs a MOUNTER on it: the thing that knows how to put a route on the
+ * host router. It does NOT create any route.
+ *
+ * The three SSE endpoints (`/__relay/events`, `/__relay/subscribe`,
+ * `/__relay/unsubscribe`) exist only once the application calls
+ * `relay.registerRoutes()` — from a preload, so they are on the router before
+ * the socket listens. They used to be mounted in `ready()`, which runs after
+ * the server is already accepting connections: a request arriving in that
+ * window got a 404 from a route the application had declared. This mirrors
+ * `transmit.registerRoutes()` upstream.
+ *
+ * An application that declares a hub or a channel authorizer and never calls
+ * it gets a warning in `ready()` — that warning is the only thing between the
+ * upgrade and a silent `E_ROUTE_NOT_FOUND`.
  *
  * The duck-typed `RelayAppContext` keeps this provider usable in any
  * framework that exposes a Container — non-Ream hosts get the
- * singleton bindings and skip the route registration silently.
+ * singleton bindings and no mounter at all.
  *
  * @example
  *   // reamrc.ts
@@ -95,11 +106,28 @@ export default class RelayProvider {
 		// first, and that route only exists once `registerRoutes()` is called.
 		if (!this.app.container.has("router")) return;
 		const relay = await this.app.container.resolve<Relay>(Relay);
-		if (relay.mountedHubs().length > 0 && !relay.hasRegisteredRoutes()) {
-			console.warn(
-				"[relay] A hub is mounted but relay.registerRoutes() was never called, so /__relay/events does not exist and no client can connect. Call it from the preload where the hub is declared.",
-			);
-		}
+		if (relay.hasRegisteredRoutes()) return;
+		// Anything that presumes the endpoints counts, not just a hub. The shape
+		// simple use takes — `authorize()` then `broadcast()`, which is what the
+		// documentation shows — mounts no hub, so a guard that looked only at
+		// hubs stayed silent for exactly the applications it existed to protect.
+		const hubs = relay.mountedHubs().length;
+		const channels = relay.authorizedChannels().length;
+		if (hubs === 0 && channels === 0) return;
+		// Name what the application actually wrote: telling someone who never
+		// declared a hub that "a hub is mounted" sends them hunting for code
+		// they do not have.
+		const declared = [
+			hubs > 0 ? `${hubs} hub${hubs > 1 ? "s" : ""} mounted` : undefined,
+			channels > 0
+				? `${channels} channel authorizer${channels > 1 ? "s" : ""} declared`
+				: undefined,
+		]
+			.filter((part) => part !== undefined)
+			.join(" and ");
+		console.warn(
+			`[relay] ${declared}, but relay.registerRoutes() was never called, so /__relay/events does not exist and no client can connect. Call it from the preload where you declare them.`,
+		);
 	}
 
 	async shutdown(): Promise<void> {

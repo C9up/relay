@@ -6,6 +6,7 @@
  * decides whether a browser can connect at all.
  */
 import { describe, expect, it, vi } from "vitest";
+import { Hub } from "../../src/Hub.js";
 import {
 	Relay,
 	type RelayConfig,
@@ -288,5 +289,80 @@ describe("relay > provider > shutdown", () => {
 		await provider.shutdown();
 
 		expect(release).toHaveBeenCalled();
+	});
+});
+
+/**
+ * The warning that stands in for the routes that are no longer automatic.
+ *
+ * Since 0.1.20 the endpoints exist only once `registerRoutes()` is called, so
+ * this warning is the ONLY thing between an upgrade and a silent 404. It
+ * covered a mounted hub and nothing else, while the shape the documentation
+ * shows for simple use — `authorize()` then `broadcast()` — mounts no hub at
+ * all. An application built that way went from working realtime to
+ * `E_ROUTE_NOT_FOUND` on a patch bump, with nothing said anywhere.
+ */
+describe("relay > the missing-registerRoutes warning", () => {
+	class ChatHub extends Hub {}
+
+	/** Boot a provider, run ready(), and hand back what was warned. */
+	async function readyWith(declare: (relay: Relay) => void) {
+		const { app } = fakeApp({ withRouter: true });
+		const provider = new RelayProvider(app as never);
+		provider.register();
+		await provider.boot();
+
+		const relay = await app.container.resolve<Relay>(Relay);
+		declare(relay);
+
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			await provider.ready();
+			return warn.mock.calls.map((c) => String(c[0]));
+		} finally {
+			warn.mockRestore();
+		}
+	}
+
+	it("warns when only a channel authorizer was declared", async () => {
+		// The steamprice shape: an authorizer and a broadcast, no hub. This is
+		// the case the guard missed, and the one the docs teach.
+		const warnings = await readyWith((relay) => {
+			relay.authorize("prices/:appid", () => true);
+		});
+
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toMatch(/registerRoutes\(\)/);
+		expect(warnings[0]).toMatch(/__relay\/events/);
+		// The message must name what the application actually declared —
+		// telling someone who never wrote a hub that "a hub is mounted" sends
+		// them looking for code they did not write.
+		expect(warnings[0]).toMatch(/channel/i);
+		expect(warnings[0]).not.toMatch(/^\[relay\] A hub is mounted\b/);
+	});
+
+	it("still warns for a mounted hub, and names it as one", async () => {
+		const warnings = await readyWith((relay) => {
+			relay.hub("/hubs/chat", new ChatHub());
+		});
+
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toMatch(/hub/i);
+		expect(warnings[0]).toMatch(/registerRoutes\(\)/);
+	});
+
+	it("says nothing once the application asked for the routes", async () => {
+		const warnings = await readyWith((relay) => {
+			relay.authorize("prices/:appid", () => true);
+			relay.registerRoutes();
+		});
+
+		expect(warnings).toEqual([]);
+	});
+
+	it("says nothing when the application declared nothing at all", async () => {
+		// A provider registered but unused is not a mistake, and a warning here
+		// would be noise every application learns to ignore.
+		expect(await readyWith(() => {})).toEqual([]);
 	});
 });
