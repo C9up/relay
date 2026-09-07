@@ -101,9 +101,10 @@ export default class RelayProvider {
 
 	async ready(): Promise<void> {
 		// Nothing is mounted here any more. What IS worth saying is that an
-		// application which mounted a hub but never asked for the SSE endpoints
-		// has a hub no browser can reach: the client opens `/__relay/events`
-		// first, and that route only exists once `registerRoutes()` is called.
+		// application which declared something reachable over SSE — a hub, or a
+		// channel it authorizes — but never asked for the endpoints has declared
+		// something no browser can reach: the client opens `/__relay/events`
+		// first, and that route exists only once `registerRoutes()` is called.
 		if (!this.app.container.has("router")) return;
 		const relay = await this.app.container.resolve<Relay>(Relay);
 		if (relay.hasRegisteredRoutes()) return;
