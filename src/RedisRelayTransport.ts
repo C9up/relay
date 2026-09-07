@@ -148,12 +148,16 @@ export class RedisRelayTransport implements RelayTransport {
 	}
 
 	async unsubscribe(channel: string): Promise<void> {
-		const client = await this.#client();
-		// Named, so a shared client drops OUR listener and keeps the others.
-		// Passing nothing means "drop every listener on this channel", which
-		// silenced the application's own subscriptions when relay shut down.
+		// NOTHING to remove means nothing to call. `unsubscribe(channel)` with no
+		// handler means "drop every listener on this channel" on a shared client,
+		// so calling it when relay never subscribed — a failed `ready()`, or a
+		// second shutdown — would cut the cache's and the sessions' listeners
+		// instead of relay's. Reaching the client at all would also connect one
+		// just to disconnect it.
 		const wrapper = this.#handlers.get(channel);
+		if (wrapper === undefined) return;
 		this.#handlers.delete(channel);
+		const client = await this.#client();
 		await client.unsubscribe(channel, wrapper);
 	}
 

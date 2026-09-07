@@ -91,6 +91,7 @@ describe("relay-broadcast > broadcastExcept", () => {
 		const publish = vi.fn();
 		const transport: RelayTransport = { publish, subscribe: vi.fn() };
 		const r = new Relay({ allowUnauthorizedChannels: true, transport });
+		await r.startTransport();
 		const a = await connectAndSubscribe(r, "u-a", "room/1");
 
 		r.broadcastExcept("room/1", { x: 1 }, a.uid);
@@ -104,6 +105,7 @@ describe("relay-broadcast > multi-instance transport sync", () => {
 		const publish = vi.fn();
 		const transport: RelayTransport = { publish, subscribe: vi.fn() };
 		const r = new Relay({ transport, transportChannel: "custom::bus" });
+		await r.startTransport();
 
 		r.broadcast("news", { headline: "hi" });
 
@@ -125,6 +127,7 @@ describe("relay-broadcast > multi-instance transport sync", () => {
 			},
 		};
 		const r = new Relay({ allowUnauthorizedChannels: true, transport });
+		await r.startTransport();
 		const a = await connectAndSubscribe(r, "u-a", "room/1");
 
 		// A broadcast originating on ANOTHER instance arrives over the bus.
@@ -148,6 +151,7 @@ describe("relay-broadcast > multi-instance transport sync", () => {
 			},
 		};
 		const r = new Relay({ allowUnauthorizedChannels: true, transport });
+		await r.startTransport();
 		const a = await connectAndSubscribe(r, "u-a", "room/1");
 
 		busHandler?.(null);
@@ -167,6 +171,7 @@ describe("relay-broadcast > multi-instance transport sync", () => {
 			disconnect,
 		};
 		const r = new Relay({ transport, transportChannel: "custom::bus" });
+		await r.startTransport();
 
 		await r.shutdown();
 
@@ -212,6 +217,9 @@ describe("relay > a transport that cannot subscribe says so", () => {
 			},
 		};
 		const relay = new Relay({ transport });
+		// Starting it IS where the failure surfaces now — the provider awaits
+		// this in `ready()`, the last phase that can still refuse to boot.
+		await expect(relay.startTransport()).rejects.toThrow("no route to the bus");
 
 		// A failed subscribe is how an instance stops hearing the others: it
 		// keeps serving its own clients and misses everything published
@@ -227,6 +235,7 @@ describe("relay > a transport that cannot subscribe says so", () => {
 		const relay = new Relay({
 			transport: { publish: async () => {}, subscribe: async () => {} },
 		});
+		await relay.startTransport();
 
 		await expect(relay.whenTransportReady()).resolves.toBeUndefined();
 	});
@@ -323,8 +332,8 @@ describe("relay > rejections that used to escape", () => {
 	});
 
 	it("reports a transport whose subscribe throws SYNCHRONOUSLY", async () => {
-		// `Promise.resolve(x())` calls `x()` first, so a synchronous throw never
-		// reached the `.catch` — it came straight out of `new Relay(...)`.
+		// `Promise.resolve(x())` calls `x()` first, so a synchronous throw used
+		// to come straight out of the call that started the subscription.
 		const transport: RelayTransport = {
 			publish: async () => {},
 			subscribe: () => {
@@ -334,13 +343,17 @@ describe("relay > rejections that used to escape", () => {
 
 		let relay: Relay | undefined;
 		const { rejections } = await watch(async () => {
+			// Constructing opens nothing, so it cannot throw here whatever the
+			// transport does.
 			expect(() => {
 				relay = new Relay({ transport });
 			}).not.toThrow();
+			await expect(relay?.startTransport()).rejects.toThrow(
+				"no connection on this client",
+			);
 		});
 
-		// Not an unhandled rejection — the constructor attaches a handler — and
-		// still reachable by whoever asks whether the instance is ready.
+		// A rejection, not an UNHANDLED one: a handler is attached as it starts.
 		expect(rejections).toEqual([]);
 		await expect(relay?.whenTransportReady()).rejects.toThrow(
 			"no connection on this client",
@@ -374,6 +387,9 @@ describe("relay > keep-alive", () => {
 				allowUnauthorizedChannels: true,
 				pingInterval: 1_000,
 			});
+			// The keep-alive starts with the transport, not with the constructor:
+			// a timer opened during an inspection is one nothing would clear.
+			await r.startTransport();
 			const { sse } = await connectAndSubscribe(r, "u1", "feed");
 			const idle = fakeSse("idle");
 			r.connect(undefined, idle, {});
@@ -435,6 +451,7 @@ describe("relay > broadcast payloads", () => {
 			subscribe: () => {},
 		};
 		const r = new Relay({ allowUnauthorizedChannels: true, transport: bus });
+		await r.startTransport();
 		const { sse } = await connectAndSubscribe(r, "u1", "feed");
 		const seen: unknown[] = [];
 		r.on("broadcast", (evt) => {
@@ -464,6 +481,7 @@ describe("relay > the transport key, in both shapes", () => {
 			allowUnauthorizedChannels: true,
 			transport: { driver: bus, channel: "app::bus" },
 		});
+		await relay.startTransport();
 
 		relay.broadcast("feed", { hello: true });
 
@@ -483,6 +501,7 @@ describe("relay > the transport key, in both shapes", () => {
 			allowUnauthorizedChannels: true,
 			transport: { driver: bus },
 		});
+		await relay.startTransport();
 
 		relay.broadcast("feed", {});
 
@@ -502,6 +521,7 @@ describe("relay > the transport key, in both shapes", () => {
 			transport: { driver: bus, channel: "block::wins" },
 			transportChannel: "flat::loses",
 		});
+		await relay.startTransport();
 
 		relay.broadcast("feed", {});
 
@@ -521,6 +541,7 @@ describe("relay > the transport key, in both shapes", () => {
 			transport: bus,
 			transportChannel: "flat::bus",
 		});
+		await relay.startTransport();
 
 		relay.broadcast("feed", {});
 
@@ -532,6 +553,7 @@ describe("relay > the transport key, in both shapes", () => {
 			allowUnauthorizedChannels: true,
 			transport: null,
 		});
+		await relay.startTransport();
 
 		// Nothing to publish to, and nothing thrown for saying so explicitly.
 		expect(relay.broadcast("feed", {})).toBe(0);
@@ -550,5 +572,73 @@ describe("relay > the transport key, in both shapes", () => {
 		});
 
 		expect(built).toBe(1);
+	});
+});
+
+/**
+ * Constructing a Relay must open nothing.
+ *
+ * `register`, `boot` and `start` all run when the application is assembled to
+ * be INSPECTED — a route listing, a codegen pass — and `shutdown` does not run
+ * on that path. A socket or a timer opened while constructing was therefore
+ * left behind by a command that only meant to look.
+ */
+describe("relay > nothing opens before ready()", () => {
+	it("does not subscribe until the transport is started", async () => {
+		const subscribed: string[] = [];
+		const transport: RelayTransport = {
+			publish: async () => {},
+			subscribe: async (channel: string) => {
+				subscribed.push(channel);
+			},
+		};
+
+		const relay = new Relay({ transport });
+		await Promise.resolve();
+		expect(subscribed).toEqual([]);
+
+		await relay.startTransport();
+
+		expect(subscribed).toEqual(["relay::broadcast"]);
+	});
+
+	it("does not start the keep-alive until then either", async () => {
+		vi.useFakeTimers();
+		try {
+			const relay = new Relay({
+				allowUnauthorizedChannels: true,
+				pingInterval: 1_000,
+			});
+			const { sse } = await connectAndSubscribe(relay, "u1", "feed");
+
+			await vi.advanceTimersByTimeAsync(3_000);
+			expect(sse.sent.map((s) => s.event)).toEqual([]);
+
+			await relay.startTransport();
+			await vi.advanceTimersByTimeAsync(1_000);
+
+			expect(sse.sent.length).toBeGreaterThan(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("starts once, however many times it is asked", async () => {
+		// A host that readies twice must not stack a second subscription or a
+		// second timer.
+		const subscribed: string[] = [];
+		const relay = new Relay({
+			transport: {
+				publish: async () => {},
+				subscribe: async (channel: string) => {
+					subscribed.push(channel);
+				},
+			},
+		});
+
+		await relay.startTransport();
+		await relay.startTransport();
+
+		expect(subscribed).toHaveLength(1);
 	});
 });

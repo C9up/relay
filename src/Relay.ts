@@ -284,11 +284,15 @@ export class Relay {
 	>;
 	readonly #transport?: RelayTransport;
 	readonly #transportChannel: string;
-	/** The bus subscription, so a caller can await what the constructor began. */
-	readonly #transportReady: Promise<void>;
+	/** The bus subscription, once `startTransport()` has begun it. */
+	#transportReady: Promise<void> = Promise.resolve();
+	/** Guards `startTransport` against being run twice. */
+	#transportStarted = false;
+	/** Keep-alive period, held until the transport actually starts. */
+	readonly #pingInterval: number | false | undefined;
 	/** Whether the endpoints are on the router — mounting twice duplicates them. */
 	#routesMounted = false;
-	readonly #pingTimer?: ReturnType<typeof setInterval>;
+	#pingTimer?: ReturnType<typeof setInterval>;
 
 	constructor(config?: RelayConfig) {
 		this.#config = {
@@ -314,24 +318,34 @@ export class Relay {
 		//
 		// The channel is read from the local rather than the field, because a
 		// deferred body cannot promise the compiler the field is assigned yet.
-		// Started here, but AWAITABLE: a subscribe that fails is how an instance
-		// stops hearing the others — it keeps serving its own clients and
-		// quietly misses every message published elsewhere. Fire-and-forget, the
-		// only trace was a line on stderr, and the application went on reporting
-		// itself healthy in a permanent split-brain.
+		// NOT started here. Constructing a Relay opens no socket and starts no
+		// timer: `register`, `boot` and `start` all run during an inspection
+		// (`ream inspect`, a codegen pass, a route listing), and `shutdown` does
+		// not — so anything opened in the constructor was a Redis connection and
+		// a ping interval left behind by a command that only meant to look.
 		//
-		// `RelayProvider.ready()` awaits {@link whenTransportReady}, so the
-		// failure reaches the boot that can still refuse to come up.
-		this.#transportReady = (async () =>
-			this.#transport?.subscribe(channel, (message) => {
-				if (isRelayTransportMessage(message)) {
-					this.#deliver(message.channel, message.payload);
-				}
-			}))();
-		// Attached now so an early failure is never an unhandled rejection —
-		// `whenTransportReady` hands back the original promise regardless.
-		this.#transportReady.catch(() => {});
-		const ping = config?.pingInterval;
+		// `RelayProvider.ready()` calls {@link startTransport}, which is the
+		// phase upstream reserves for sockets and background work, and the one
+		// an inspection never reaches.
+		this.#pingInterval = config?.pingInterval;
+	}
+
+	/**
+	 * Open the bus subscription and start the keep-alive.
+	 *
+	 * Everything with an effect outside this process lives here rather than in
+	 * the constructor, because the constructor runs during an inspection and
+	 * `shutdown()` does not. Idempotent: a second call is a no-op, so a host
+	 * that readies twice does not stack a second subscription or a second timer.
+	 *
+	 * @returns once this instance is listening — or rejects if it never managed
+	 *   to, which is a split-brain the caller can still refuse to boot on.
+	 */
+	async startTransport(): Promise<void> {
+		if (this.#transportStarted) return this.#transportReady;
+		this.#transportStarted = true;
+
+		const ping = this.#pingInterval;
 		if (typeof ping === "number" && ping > 0) {
 			this.#pingTimer = setInterval(() => {
 				this.#ping();
@@ -340,6 +354,19 @@ export class Relay {
 			// reason for the process to stay up once nothing else is running.
 			this.#pingTimer.unref();
 		}
+
+		const channel = this.#transportChannel;
+		// A subscribe that fails is how an instance stops hearing the others: it
+		// keeps serving its own clients and quietly misses every message
+		// published elsewhere. Awaited by the provider, so that reaches the boot.
+		this.#transportReady = (async () =>
+			this.#transport?.subscribe(channel, (message) => {
+				if (isRelayTransportMessage(message)) {
+					this.#deliver(message.channel, message.payload);
+				}
+			}))();
+		this.#transportReady.catch(() => {});
+		return this.#transportReady;
 	}
 
 	/**
@@ -918,6 +945,11 @@ export class Relay {
 	 */
 	async whenTransportReady(): Promise<void> {
 		await this.#transportReady;
+	}
+
+	/** @internal Whether the bus has been started — for the provider's guard. */
+	hasStartedTransport(): boolean {
+		return this.#transportStarted;
 	}
 
 	// ─── Shutdown ─────────────────────────────────────────────

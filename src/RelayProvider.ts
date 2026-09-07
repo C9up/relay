@@ -106,13 +106,16 @@ export default class RelayProvider {
 		// something no browser can reach: the client opens `/__relay/events`
 		// first, and that route exists only once `registerRoutes()` is called.
 		const relay = await this.app.container.resolve<Relay>(Relay);
-		// The bus subscription was begun in the constructor and nothing ever
-		// waited on it. A transient Redis failure at start-up left the instance
-		// serving its own clients while silently missing every broadcast
-		// published elsewhere — a split-brain the application reported as
-		// healthy. `ready()` is the last phase that can still refuse to boot,
-		// and upstream puts long-lived resources here for the same reason.
-		await relay.whenTransportReady();
+		// The socket and the keep-alive open HERE, not in the constructor.
+		// `register`, `boot` and `start` all run during an inspection — a route
+		// listing, a codegen pass — while `shutdown` does not, so anything
+		// opened earlier was a Redis connection nothing would ever close.
+		//
+		// Awaiting it also makes a bus that cannot be reached a failed boot: an
+		// instance that never subscribes keeps serving its own clients while
+		// missing every broadcast published elsewhere, and `ready()` is the last
+		// phase that can still refuse to come up.
+		await relay.startTransport();
 
 		if (!this.app.container.has("router")) return;
 		if (relay.hasRegisteredRoutes()) return;

@@ -83,6 +83,9 @@ describe("relay > redis transport", () => {
 		};
 		const publisher = new Relay(config);
 		const subscriber = new Relay(config);
+		// Constructing opens nothing now; the bus starts in `ready()`.
+		await publisher.startTransport();
+		await subscriber.startTransport();
 
 		// Let both subscriptions settle — they are established asynchronously.
 		await Promise.resolve();
@@ -246,5 +249,53 @@ describe("relay > a failed resolution is not kept forever", () => {
 		await transport.publish("b", {});
 
 		expect(attempts).toBe(1);
+	});
+});
+
+describe("relay > unsubscribing what was never subscribed", () => {
+	it("does not touch the client when relay has no listener on the channel", async () => {
+		// `unsubscribe(channel)` with no handler means "drop everything here" on
+		// a shared connection. Called when relay never subscribed — a failed
+		// ready(), or a second shutdown — it would cut the cache's and the
+		// sessions' listeners instead of relay's.
+		const { client } = fakeRedis();
+		const transport = new RedisRelayTransport(() => client);
+
+		await transport.unsubscribe("relay::broadcast");
+
+		expect(client.unsubscribed).toHaveLength(0);
+	});
+
+	it("is idempotent: the second call removes nothing", async () => {
+		const { client } = fakeRedis();
+		const transport = new RedisRelayTransport(() => client);
+		await transport.subscribe("relay::broadcast", () => {});
+
+		await transport.unsubscribe("relay::broadcast");
+		await transport.unsubscribe("relay::broadcast");
+
+		expect(client.unsubscribed).toHaveLength(1);
+	});
+
+	it("removes nothing after a subscribe that failed", async () => {
+		const { client } = fakeRedis();
+		const failing = {
+			...client,
+			subscribe(
+				_c: string,
+				_h: unknown,
+				options?: { onError?: (e: unknown) => void },
+			) {
+				options?.onError?.(new Error("no route to the bus"));
+			},
+		};
+		const transport = new RedisRelayTransport(() => failing);
+		await expect(
+			transport.subscribe("relay::broadcast", () => {}),
+		).rejects.toThrow();
+
+		await transport.unsubscribe("relay::broadcast");
+
+		expect(client.unsubscribed).toHaveLength(0);
 	});
 });
