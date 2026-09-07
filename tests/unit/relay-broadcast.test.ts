@@ -204,30 +204,36 @@ describe("relay-broadcast > on() detacher + getSubscribersFor", () => {
 });
 
 describe("relay > a transport that cannot subscribe says so", () => {
-	it("reports instead of failing silently", async () => {
-		const written: string[] = [];
-		const original = process.stderr.write.bind(process.stderr);
-		process.stderr.write = (chunk: string | Uint8Array): boolean => {
-			written.push(String(chunk));
-			return true;
+	it("surfaces the failure to whoever awaits readiness", async () => {
+		const transport: RelayTransport = {
+			publish: async () => {},
+			subscribe: async () => {
+				throw new Error("no route to the bus");
+			},
 		};
-		try {
-			const transport: RelayTransport = {
-				publish: async () => {},
-				subscribe: async () => {
-					throw new Error("no route to the bus");
-				},
-			};
-			new Relay({ transport });
-			await new Promise((resolve) => setTimeout(resolve, 10));
+		const relay = new Relay({ transport });
 
-			// A failed subscribe is how an instance stops hearing the others: it
-			// keeps serving its own clients and misses everything published
-			// elsewhere. Unawaited, that split-brain was invisible.
-			expect(written.join("")).toContain("will not receive messages");
-		} finally {
-			process.stderr.write = original;
-		}
+		// A failed subscribe is how an instance stops hearing the others: it
+		// keeps serving its own clients and misses everything published
+		// elsewhere. A line on stderr left the application reporting itself
+		// healthy in a permanent split-brain; the provider awaits this in
+		// `ready()`, the last phase that can still refuse to boot.
+		await expect(relay.whenTransportReady()).rejects.toThrow(
+			"no route to the bus",
+		);
+	});
+
+	it("resolves readiness when the subscription succeeds", async () => {
+		const relay = new Relay({
+			transport: { publish: async () => {}, subscribe: async () => {} },
+		});
+
+		await expect(relay.whenTransportReady()).resolves.toBeUndefined();
+	});
+
+	it("is ready immediately with no transport at all", async () => {
+		// Single-instance is the default and must not wait on anything.
+		await expect(new Relay().whenTransportReady()).resolves.toBeUndefined();
 	});
 });
 
@@ -326,12 +332,19 @@ describe("relay > rejections that used to escape", () => {
 			},
 		};
 
-		const { rejections, written } = await watch(async () => {
-			expect(() => new Relay({ transport })).not.toThrow();
+		let relay: Relay | undefined;
+		const { rejections } = await watch(async () => {
+			expect(() => {
+				relay = new Relay({ transport });
+			}).not.toThrow();
 		});
 
+		// Not an unhandled rejection — the constructor attaches a handler — and
+		// still reachable by whoever asks whether the instance is ready.
 		expect(rejections).toEqual([]);
-		expect(written).toContain("will not receive messages");
+		await expect(relay?.whenTransportReady()).rejects.toThrow(
+			"no connection on this client",
+		);
 	});
 });
 

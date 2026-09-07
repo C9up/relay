@@ -105,8 +105,16 @@ export default class RelayProvider {
 		// channel it authorizes — but never asked for the endpoints has declared
 		// something no browser can reach: the client opens `/__relay/events`
 		// first, and that route exists only once `registerRoutes()` is called.
-		if (!this.app.container.has("router")) return;
 		const relay = await this.app.container.resolve<Relay>(Relay);
+		// The bus subscription was begun in the constructor and nothing ever
+		// waited on it. A transient Redis failure at start-up left the instance
+		// serving its own clients while silently missing every broadcast
+		// published elsewhere — a split-brain the application reported as
+		// healthy. `ready()` is the last phase that can still refuse to boot,
+		// and upstream puts long-lived resources here for the same reason.
+		await relay.whenTransportReady();
+
+		if (!this.app.container.has("router")) return;
 		if (relay.hasRegisteredRoutes()) return;
 		// Anything that presumes the endpoints counts, not just a hub. The shape
 		// simple use takes — `authorize()` then `broadcast()`, which is what the

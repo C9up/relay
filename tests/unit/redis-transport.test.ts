@@ -35,8 +35,17 @@ function fakeRedis() {
 		string,
 		Set<(message: string, channel: string) => void>
 	>();
-	const client: RelayPubSubClient & { quit: () => void; quits: number } = {
+	/** Every `unsubscribe` call, so a test can see WHAT was removed. */
+	const unsubscribed: Array<
+		[string, ((message: string, channel: string) => void) | undefined]
+	> = [];
+	const client: RelayPubSubClient & {
+		quit: () => void;
+		quits: number;
+		unsubscribed: typeof unsubscribed;
+	} = {
 		quits: 0,
+		unsubscribed,
 		publish(channel, message) {
 			for (const handler of handlers.get(channel) ?? []) {
 				handler(message, channel);
@@ -48,7 +57,14 @@ function fakeRedis() {
 			set.add(handler);
 			handlers.set(channel, set);
 		},
-		unsubscribe(channel) {
+		unsubscribe(channel, handler) {
+			unsubscribed.push([channel, handler]);
+			// Like a real shared client: named, only that listener goes.
+			if (handler) {
+				const set = handlers.get(channel);
+				set?.delete(handler);
+				if (set && set.size > 0) return;
+			}
 			handlers.delete(channel);
 		},
 		quit() {
@@ -112,16 +128,45 @@ describe("relay > redis transport", () => {
 		expect(relay).toBeInstanceOf(Relay);
 	});
 
-	it("closes the connection on shutdown, and only if it opened one", async () => {
+	it("closes a connection it OWNS on shutdown, and only if it opened one", async () => {
 		const { client } = fakeRedis();
-		const unused = new RedisRelayTransport(() => client);
+		const unused = new RedisRelayTransport(() => client, true);
 		await unused.disconnect();
 		expect(client.quits).toBe(0);
 
-		const used = new RedisRelayTransport(() => client);
+		const used = new RedisRelayTransport(() => client, true);
 		await used.publish("relay::broadcast", { type: "broadcast" });
 		await used.disconnect();
 		expect(client.quits).toBe(1);
+	});
+
+	it("never closes a connection it only borrowed", async () => {
+		// `quit()` on a shared @c9up/quasar connection closes BOTH its sockets,
+		// so relay shutting down took the cache, the sessions and the queues
+		// down with it. Ownership is opt-in for exactly this reason.
+		const { client } = fakeRedis();
+		const borrowed = new RedisRelayTransport(() => client);
+
+		await borrowed.publish("relay::broadcast", { type: "broadcast" });
+		await borrowed.disconnect();
+
+		expect(client.quits).toBe(0);
+	});
+
+	it("removes its own listener, not every listener on the channel", async () => {
+		// Unsubscribing without naming a handler means "drop everything on this
+		// channel" — on a shared client that silences the application's own
+		// subscriptions the moment relay stops.
+		const { client } = fakeRedis();
+		const transport = new RedisRelayTransport(() => client);
+
+		await transport.subscribe("relay::broadcast", () => {});
+		await transport.unsubscribe("relay::broadcast");
+
+		expect(client.unsubscribed).toHaveLength(1);
+		const [channel, handler] = client.unsubscribed[0] ?? [];
+		expect(channel).toBe("relay::broadcast");
+		expect(typeof handler).toBe("function");
 	});
 
 	it("resolves the client once, however many broadcasts follow", async () => {

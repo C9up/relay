@@ -284,6 +284,10 @@ export class Relay {
 	>;
 	readonly #transport?: RelayTransport;
 	readonly #transportChannel: string;
+	/** The bus subscription, so a caller can await what the constructor began. */
+	readonly #transportReady: Promise<void>;
+	/** Whether the endpoints are on the router — mounting twice duplicates them. */
+	#routesMounted = false;
 	readonly #pingTimer?: ReturnType<typeof setInterval>;
 
 	constructor(config?: RelayConfig) {
@@ -310,23 +314,23 @@ export class Relay {
 		//
 		// The channel is read from the local rather than the field, because a
 		// deferred body cannot promise the compiler the field is assigned yet.
-		void (async () =>
+		// Started here, but AWAITABLE: a subscribe that fails is how an instance
+		// stops hearing the others — it keeps serving its own clients and
+		// quietly misses every message published elsewhere. Fire-and-forget, the
+		// only trace was a line on stderr, and the application went on reporting
+		// itself healthy in a permanent split-brain.
+		//
+		// `RelayProvider.ready()` awaits {@link whenTransportReady}, so the
+		// failure reaches the boot that can still refuse to come up.
+		this.#transportReady = (async () =>
 			this.#transport?.subscribe(channel, (message) => {
 				if (isRelayTransportMessage(message)) {
 					this.#deliver(message.channel, message.payload);
 				}
-			}))()
-			// A subscribe that fails is how an instance stops hearing the others:
-			// it keeps serving its own clients and quietly misses every message
-			// published elsewhere. Unawaited, the rejection had nowhere to go, so
-			// the split-brain was invisible.
-			.catch((error: unknown) => {
-				process.stderr.write(
-					`[relay] transport subscribe failed — this instance will not receive messages published elsewhere: ${
-						error instanceof Error ? error.message : String(error)
-					}\n`,
-				);
-			});
+			}))();
+		// Attached now so an early failure is never an unhandled rejection —
+		// `whenTransportReady` hands back the original promise regardless.
+		this.#transportReady.catch(() => {});
 		const ping = config?.pingInterval;
 		if (typeof ping === "number" && ping > 0) {
 			this.#pingTimer = setInterval(() => {
@@ -442,9 +446,29 @@ export class Relay {
 	registerRoutes(customizer?: RelayRouteCustomizer): void {
 		if (customizer !== undefined) this.#routeCustomizer = customizer;
 		this.#routesRequested = true;
-		// Mount now. A host with no router (relay used outside Ream) records the
-		// customizer and nothing else, exactly as before.
-		this.#mounter?.mountEndpoints(this);
+		// Mount ONCE. Mounting is not idempotent on the router — a second call
+		// adds the three endpoints again, which is a duplicate route or a
+		// collision depending on the host, and it cannot change the ones
+		// already built anyway.
+		//
+		// A repeated call is therefore a no-op on the routes. It still records a
+		// customizer, because the shape upstream documents is "call it from a
+		// preload"; two preloads reaching it is a wiring accident, not a reason
+		// to break the boot. What it CANNOT do is retro-apply that customizer,
+		// so say so rather than let the caller assume it worked.
+		if (this.#routesMounted) {
+			if (customizer !== undefined) {
+				console.warn(
+					"[relay] registerRoutes() was called again with a customizer, but the routes are already mounted and cannot be rebuilt. Call it once, from the preload where you declare your channels.",
+				);
+			}
+			return;
+		}
+		// A host with no router (relay used outside Ream) records the request
+		// and nothing else; `useMounter` replays it when one arrives.
+		if (this.#mounter === undefined) return;
+		this.#routesMounted = true;
+		this.#mounter.mountEndpoints(this);
 	}
 
 	/**
@@ -481,7 +505,12 @@ export class Relay {
 	 */
 	useMounter(mounter: RelayRouteMounter): void {
 		this.#mounter = mounter;
-		if (this.#routesRequested) mounter.mountEndpoints(this);
+		// Replay a request made before the mounter existed — but only once, for
+		// the same reason  guards itself.
+		if (this.#routesRequested && !this.#routesMounted) {
+			this.#routesMounted = true;
+			mounter.mountEndpoints(this);
+		}
 		for (const mounted of this.#hubs.values()) mounter.mountHub(this, mounted);
 	}
 
@@ -877,6 +906,18 @@ export class Relay {
 	getSubscribersFor(channel: string): string[] {
 		const set = this.#channelIndex.get(channel);
 		return set ? Array.from(set) : [];
+	}
+
+	/**
+	 * Resolves once this instance is listening to the bus, rejects if it never
+	 * managed to.
+	 *
+	 * Await it where a failure can still change the outcome — the provider's
+	 * `ready()`. An instance that cannot subscribe is not a degraded instance,
+	 * it is one that will never see another's broadcasts.
+	 */
+	async whenTransportReady(): Promise<void> {
+		await this.#transportReady;
 	}
 
 	// ─── Shutdown ─────────────────────────────────────────────

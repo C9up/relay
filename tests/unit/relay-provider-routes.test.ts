@@ -366,3 +366,68 @@ describe("relay > the missing-registerRoutes warning", () => {
 		expect(await readyWith(() => {})).toEqual([]);
 	});
 });
+
+/**
+ * `registerRoutes()` mounts once.
+ *
+ * Mounting is not idempotent on the router: a second call adds the three
+ * endpoints again — a duplicate route or a collision depending on the host —
+ * and it cannot change the ones already built. Two preloads reaching it is a
+ * wiring accident, not a reason to break the boot, but it must not silently
+ * double the routing table either.
+ */
+describe("relay > registerRoutes is mount-once", () => {
+	it("mounts the three endpoints once, however many times it is called", async () => {
+		const { app, router } = fakeApp({ withRouter: true });
+		const provider = new RelayProvider(app as never);
+		provider.register();
+		await provider.boot();
+
+		const relay = await app.container.resolve<Relay>(Relay);
+		relay.registerRoutes();
+		relay.registerRoutes();
+		relay.registerRoutes();
+
+		expect([...router.routes.keys()].sort()).toEqual([
+			"GET /__relay/events",
+			"POST /__relay/subscribe",
+			"POST /__relay/unsubscribe",
+		]);
+	});
+
+	it("says a late customizer cannot be applied, instead of pretending", async () => {
+		const { app } = fakeApp({ withRouter: true });
+		const provider = new RelayProvider(app as never);
+		provider.register();
+		await provider.boot();
+		const relay = await app.container.resolve<Relay>(Relay);
+		relay.registerRoutes();
+
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			relay.registerRoutes((route) => route);
+			expect(warn.mock.calls.map((c) => String(c[0])).join("")).toMatch(
+				/already mounted/,
+			);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("stays quiet when called again with nothing new", async () => {
+		const { app } = fakeApp({ withRouter: true });
+		const provider = new RelayProvider(app as never);
+		provider.register();
+		await provider.boot();
+		const relay = await app.container.resolve<Relay>(Relay);
+		relay.registerRoutes();
+
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			relay.registerRoutes();
+			expect(warn).not.toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+});
