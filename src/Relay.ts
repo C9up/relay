@@ -290,6 +290,19 @@ export class Relay {
 	#transportStarted = false;
 	/** Whether a start was ever attempted — a failed one still has an answer. */
 	#transportAttempted = false;
+	/**
+	 * Which start attempt owns the transport, incremented by every start and
+	 * every stop.
+	 *
+	 * A subscribe is asynchronous, and a shutdown or a restart can land while
+	 * one is still in flight. Without a generation, the attempt that came back
+	 * late mutated whatever state it found: a stale failure cleared a NEWER
+	 * attempt's ping timer and marked the relay stopped while its subscription
+	 * was live, and a stale success left a handler on the bus that the shutdown
+	 * had already looked for and not found. An attempt only touches shared
+	 * state while it is still the generation that owns it.
+	 */
+	#transportGeneration = 0;
 	/** Keep-alive period, held until the transport actually starts. */
 	readonly #pingInterval: number | false | undefined;
 	/** Whether the endpoints are on the router — mounting twice duplicates them. */
@@ -347,6 +360,9 @@ export class Relay {
 		if (this.#transportStarted) return this.#transportReady;
 		this.#transportStarted = true;
 		this.#transportAttempted = true;
+		// This attempt's claim on the transport. Anything below that outlives a
+		// shutdown or a restart checks it before touching shared state.
+		const generation = ++this.#transportGeneration;
 
 		const ping = this.#pingInterval;
 		if (typeof ping === "number" && ping > 0) {
@@ -379,8 +395,35 @@ export class Relay {
 				// `#transportReady` is deliberately left rejected — a caller
 				// asking whether this instance is ready must be told what went
 				// wrong, not that nothing was attempted.
-				this.#stopTransport({ keepOutcome: true });
+				//
+				// Only while this attempt still owns the transport. A failure
+				// reported after a shutdown and a restart used to clear the NEW
+				// attempt's ping timer and mark the relay stopped while its
+				// subscription was live — so the next start subscribed a second
+				// time and every broadcast arrived twice.
+				if (this.#transportGeneration === generation) {
+					this.#stopTransport({ keepOutcome: true });
+				}
 				throw error;
+			}
+			if (this.#transportGeneration !== generation) {
+				// Superseded while the subscribe was in flight. The subscription
+				// is real — it just belongs to a generation nobody is tracking
+				// any more, and the shutdown that superseded it looked for a
+				// handler before this one existed. Taking it back down is this
+				// attempt's job; nobody else can name it.
+				//
+				// Unless a newer start is running: the transport holds one
+				// handler per channel, so unsubscribing here would take down the
+				// live one instead. That only happens when a start is issued
+				// without awaiting the shutdown it overlaps, which `shutdown()`
+				// is written to make unnecessary.
+				if (!this.#transportStarted) {
+					await this.#transport?.unsubscribe?.(channel);
+				}
+				throw new Error(
+					"Relay.startTransport() was superseded by a shutdown before the subscription completed. The subscription it opened has been taken back down.",
+				);
 			}
 		})();
 		this.#transportReady.catch(() => {});
@@ -402,6 +445,8 @@ export class Relay {
 		this.#transportStarted = false;
 		this.#transportAttempted = options.keepOutcome === true;
 		if (options.keepOutcome !== true) this.#transportReady = Promise.resolve();
+		// Anything still in flight is now stale, and says so by comparing.
+		this.#transportGeneration += 1;
 	}
 
 	/**
@@ -1016,6 +1061,11 @@ export class Relay {
 		// so an application that stops and starts again in one process — a hot
 		// reload, a test — actually re-subscribes instead of silently sitting
 		// off the bus.
+		// A start still in flight is NOT awaited here: `#stopTransport` moves the
+		// generation on, which is how that attempt learns to take its own
+		// subscription back down when it lands. Waiting for it instead would
+		// make a graceful shutdown hang on exactly the unreachable bus that
+		// makes shutting down urgent.
 		this.#stopTransport();
 		if (!this.#transport) return;
 		try {
