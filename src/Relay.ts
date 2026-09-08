@@ -504,9 +504,10 @@ export class Relay {
 	 *
 	 *   relay.hub("/hubs/chat", new ChatHub())
 	 *
-	 * Call it from a preload (`start/services.ts`), like
-	 * {@link registerRoutes}: the provider registers the routes in `start()`,
-	 * after preloads have run, so a hub recorded there is always picked up.
+	 * Call it from a preload (`start/services.ts`), like {@link registerRoutes}.
+	 * A declaration made there mounts its route AT THAT MOMENT — the provider
+	 * installed the mounter in `boot()`, well before — so it does not matter
+	 * that preloads run after the providers have started.
 	 *
 	 * Mounting the same path twice throws rather than replacing the first hub —
 	 * a route silently shadowed is how half an application stops answering with
