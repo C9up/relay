@@ -288,6 +288,8 @@ export class Relay {
 	#transportReady: Promise<void> = Promise.resolve();
 	/** Guards `startTransport` against being run twice. */
 	#transportStarted = false;
+	/** Whether a start was ever attempted — a failed one still has an answer. */
+	#transportAttempted = false;
 	/** Keep-alive period, held until the transport actually starts. */
 	readonly #pingInterval: number | false | undefined;
 	/** Whether the endpoints are on the router — mounting twice duplicates them. */
@@ -344,6 +346,7 @@ export class Relay {
 	async startTransport(): Promise<void> {
 		if (this.#transportStarted) return this.#transportReady;
 		this.#transportStarted = true;
+		this.#transportAttempted = true;
 
 		const ping = this.#pingInterval;
 		if (typeof ping === "number" && ping > 0) {
@@ -359,14 +362,46 @@ export class Relay {
 		// A subscribe that fails is how an instance stops hearing the others: it
 		// keeps serving its own clients and quietly misses every message
 		// published elsewhere. Awaited by the provider, so that reaches the boot.
-		this.#transportReady = (async () =>
-			this.#transport?.subscribe(channel, (message) => {
-				if (isRelayTransportMessage(message)) {
-					this.#deliver(message.channel, message.payload);
-				}
-			}))();
+		this.#transportReady = (async () => {
+			try {
+				await this.#transport?.subscribe(channel, (message) => {
+					if (isRelayTransportMessage(message)) {
+						this.#deliver(message.channel, message.payload);
+					}
+				});
+			} catch (error) {
+				// UNDO the start, but KEEP the rejection. Marking it started
+				// before the subscribe made a failure permanent: every later
+				// call handed back the same rejected promise without ever trying
+				// again, and the ping timer stayed running for a bus this
+				// instance was not on.
+				//
+				// `#transportReady` is deliberately left rejected — a caller
+				// asking whether this instance is ready must be told what went
+				// wrong, not that nothing was attempted.
+				this.#stopTransport({ keepOutcome: true });
+				throw error;
+			}
+		})();
 		this.#transportReady.catch(() => {});
 		return this.#transportReady;
+	}
+
+	/**
+	 * Stop the keep-alive and let the transport be started again.
+	 *
+	 * @param keepOutcome Leave `#transportReady` as it is. Used after a failed
+	 *   subscribe, where the rejection is the answer a caller needs; a shutdown
+	 *   clears it, because the next start is a fresh question.
+	 */
+	#stopTransport(options: { keepOutcome?: boolean } = {}): void {
+		if (this.#pingTimer) {
+			clearInterval(this.#pingTimer);
+			this.#pingTimer = undefined;
+		}
+		this.#transportStarted = false;
+		this.#transportAttempted = options.keepOutcome === true;
+		if (options.keepOutcome !== true) this.#transportReady = Promise.resolve();
 	}
 
 	/**
@@ -945,6 +980,19 @@ export class Relay {
 	 * it is one that will never see another's broadcasts.
 	 */
 	async whenTransportReady(): Promise<void> {
+		// Answering "ready" before anything started is the one answer that must
+		// not be given: it is what a provider awaits to decide whether the
+		// instance may serve, and a relay with a bus it never joined is exactly
+		// the split-brain this exists to catch.
+		if (
+			this.#transport !== undefined &&
+			!this.#transportStarted &&
+			!this.#transportAttempted
+		) {
+			throw new Error(
+				"Relay.whenTransportReady() was called before startTransport(). The bus opens in the provider's ready() phase — nothing has subscribed yet.",
+			);
+		}
 		await this.#transportReady;
 	}
 
@@ -962,13 +1010,22 @@ export class Relay {
 	 * — both bus methods are optional on the duck-typed transport.
 	 */
 	async shutdown(): Promise<void> {
-		// Cleared first, and unconditionally: Transmit clears its ping interval
+		// Cleared first, and unconditionally: upstream clears its ping interval
 		// before touching the bus, and a relay with no transport still has a
-		// timer to stop.
-		if (this.#pingTimer) clearInterval(this.#pingTimer);
+		// timer to stop. This also puts the transport back in a startable state,
+		// so an application that stops and starts again in one process — a hot
+		// reload, a test — actually re-subscribes instead of silently sitting
+		// off the bus.
+		this.#stopTransport();
 		if (!this.#transport) return;
-		await this.#transport.unsubscribe?.(this.#transportChannel);
-		await this.#transport.disconnect?.();
+		try {
+			await this.#transport.unsubscribe?.(this.#transportChannel);
+		} finally {
+			// Disconnected WHATEVER unsubscribe did. Left in the happy path, a
+			// rejecting unsubscribe skipped it and leaked the connection this
+			// relay owns.
+			await this.#transport.disconnect?.();
+		}
 	}
 
 	// ─── Internals ────────────────────────────────────────────

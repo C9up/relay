@@ -642,3 +642,100 @@ describe("relay > nothing opens before ready()", () => {
 		expect(subscribed).toHaveLength(1);
 	});
 });
+
+/**
+ * A failed start, and a shutdown, both have to leave relay startable.
+ *
+ * `#transportStarted` was set BEFORE the subscribe, so a failure was permanent:
+ * every later call handed back the same rejected promise without trying again,
+ * and the ping timer kept running for a bus this instance was not on. Nothing
+ * was reset on shutdown either, so an application that stopped and started
+ * again in one process sat silently off the bus.
+ */
+describe("relay > recovering from a failed or stopped transport", () => {
+	function flaky(failures: number) {
+		let calls = 0;
+		const transport: RelayTransport = {
+			publish: async () => {},
+			subscribe: async () => {
+				calls += 1;
+				if (calls <= failures) throw new Error("no route to the bus");
+			},
+		};
+		return { transport, calls: () => calls };
+	}
+
+	it("tries again after a failure instead of replaying the rejection", async () => {
+		const { transport, calls } = flaky(1);
+		const relay = new Relay({ transport });
+
+		await expect(relay.startTransport()).rejects.toThrow("no route to the bus");
+		// Redis is back.
+		await expect(relay.startTransport()).resolves.toBeUndefined();
+
+		expect(calls()).toBe(2);
+	});
+
+	it("still reports the failure to whoever asks about readiness", async () => {
+		// Startable again does not mean "nothing happened": the rejection is
+		// what a provider deciding whether to boot needs.
+		const { transport } = flaky(1);
+		const relay = new Relay({ transport });
+		await expect(relay.startTransport()).rejects.toThrow();
+
+		await expect(relay.whenTransportReady()).rejects.toThrow(
+			"no route to the bus",
+		);
+	});
+
+	it("re-subscribes after a shutdown", async () => {
+		const { transport, calls } = flaky(0);
+		const relay = new Relay({ transport });
+		await relay.startTransport();
+		await relay.shutdown();
+
+		await relay.startTransport();
+
+		expect(calls()).toBe(2);
+	});
+
+	it("refuses to answer 'ready' before anything was started", async () => {
+		// Resolving here is the one answer that must not be given: it is what a
+		// provider awaits to decide the instance may serve.
+		const relay = new Relay({
+			transport: { publish: async () => {}, subscribe: async () => {} },
+		});
+
+		await expect(relay.whenTransportReady()).rejects.toThrow(
+			/before startTransport/,
+		);
+	});
+
+	it("is ready immediately with no transport at all", async () => {
+		// Single-instance is the default and must not be asked to start a bus.
+		await expect(new Relay().whenTransportReady()).resolves.toBeUndefined();
+	});
+
+	it("disconnects even when unsubscribing fails", async () => {
+		// Left in the happy path, a rejecting unsubscribe skipped disconnect and
+		// leaked the connection this relay owns.
+		let disconnected = false;
+		const relay = new Relay({
+			transport: {
+				publish: async () => {},
+				subscribe: async () => {},
+				unsubscribe: async () => {
+					throw new Error("connection already gone");
+				},
+				disconnect: async () => {
+					disconnected = true;
+				},
+			},
+		});
+		await relay.startTransport();
+
+		await expect(relay.shutdown()).rejects.toThrow("already gone");
+
+		expect(disconnected).toBe(true);
+	});
+});
