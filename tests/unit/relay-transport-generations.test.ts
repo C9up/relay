@@ -57,12 +57,22 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 /**
- * A bus that models what matters here: a handler is only live once `subscribe`
- * has resolved, and `unsubscribe` takes it back off.
+ * A bus that models the one relay actually runs on.
+ *
+ * Handlers STACK, exactly as `@c9up/quasar` stacks them in a `Set` — the
+ * earlier fake kept one handler per channel in a `Map`, so a second subscribe
+ * silently replaced the first and hid the duplicate-delivery this exists to
+ * catch. `unsubscribe` drops one named handler, or all of them when it is not
+ * told which.
  */
-function fakeBus(options: { hold?: Promise<void>; failFirst?: Promise<void> }) {
-	const handlers = new Map<string, (message: unknown) => void>();
+function fakeBus(options: {
+	hold?: Promise<void>;
+	holdCall?: number;
+	failFirst?: Promise<void>;
+}) {
+	const handlers = new Map<string, Set<(message: unknown) => void>>();
 	let calls = 0;
+	let disconnected = 0;
 	const transport: RelayTransport = {
 		publish: async () => {},
 		subscribe: async (channel, handler) => {
@@ -71,23 +81,34 @@ function fakeBus(options: { hold?: Promise<void>; failFirst?: Promise<void> }) {
 				await options.failFirst;
 				throw new Error("the bus refused the subscription");
 			}
-			if (calls === 1 && options.hold) await options.hold;
-			handlers.set(channel, handler);
+			if (calls === (options.holdCall ?? 1) && options.hold) {
+				await options.hold;
+			}
+			const set = handlers.get(channel) ?? new Set();
+			set.add(handler);
+			handlers.set(channel, set);
 		},
-		unsubscribe: async (channel) => {
-			handlers.delete(channel);
+		unsubscribe: async (channel, handler) => {
+			const set = handlers.get(channel);
+			if (!set) return;
+			if (handler === undefined) set.clear();
+			else set.delete(handler);
+			if (set.size === 0) handlers.delete(channel);
+		},
+		disconnect: async () => {
+			disconnected += 1;
 		},
 	};
 	return {
 		transport,
 		calls: () => calls,
-		isLive: () => handlers.has("relay::broadcast"),
+		disconnects: () => disconnected,
+		live: () => handlers.get("relay::broadcast")?.size ?? 0,
+		isLive: () => (handlers.get("relay::broadcast")?.size ?? 0) > 0,
 		emit: (channel: string, payload: unknown) => {
-			handlers.get("relay::broadcast")?.({
-				type: "broadcast",
-				channel,
-				payload,
-			});
+			for (const handler of handlers.get("relay::broadcast") ?? []) {
+				handler({ type: "broadcast", channel, payload });
+			}
 		},
 	};
 }
@@ -169,5 +190,99 @@ describe("relay > a failure reported after a restart", () => {
 		await relay.startTransport();
 
 		expect(bus.calls()).toBe(2);
+	});
+});
+
+describe("relay > one live subscription, whatever the restart looked like", () => {
+	it("does not let a superseded success double every broadcast", async () => {
+		const held = deferred();
+		const bus = fakeBus({ hold: held.promise });
+		const relay = new Relay({
+			allowUnauthorizedChannels: true,
+			transport: bus.transport,
+		});
+		const sse = await subscribedClient(relay, "news");
+
+		const first = relay.startTransport();
+		const stopping = relay.shutdown();
+		const second = relay.startTransport();
+		held.resolve();
+		await first.catch(() => {});
+		await second.catch(() => {});
+		await stopping;
+		await relay.startTransport();
+
+		bus.emit("news", { n: 1 });
+		expect(sse.sent).toHaveLength(1);
+	});
+
+	it("does not disconnect the bus a restart has just re-subscribed to", async () => {
+		// `shutdown()` marks the relay restartable before its own unsubscribe
+		// and disconnect have run, so a start issued in that window came up on
+		// a transport the shutdown then closed underneath it.
+		const bus = fakeBus({});
+		const relay = new Relay({ transport: bus.transport });
+
+		await relay.startTransport();
+		const stopping = relay.shutdown();
+		const restarting = relay.startTransport();
+		await stopping;
+		await restarting;
+
+		expect(bus.isLive()).toBe(true);
+		expect(bus.disconnects()).toBe(0);
+	});
+
+	it("does not unsubscribe the other instance sharing the bus", async () => {
+		// Two Relay instances on one transport is the shape a test harness and
+		// a multi-tenant host both take. "Drop everything on this channel" is
+		// not this attempt's to say: it silenced an instance that had nothing
+		// to do with the shutdown.
+		const held = deferred();
+		const bus = fakeBus({ hold: held.promise, holdCall: 2 });
+		const config = {
+			allowUnauthorizedChannels: true,
+			transport: bus.transport,
+		};
+		const staying = new Relay(config);
+		const leaving = new Relay(config);
+		const sse = await subscribedClient(staying, "news");
+		await staying.startTransport();
+
+		const starting = leaving.startTransport();
+		const stopping = leaving.shutdown();
+		held.resolve();
+		await starting.catch(() => {});
+		await stopping;
+
+		expect(bus.live()).toBe(1);
+		bus.emit("news", { n: 1 });
+		expect(sse.sent).toHaveLength(1);
+	});
+
+	it("does not wipe a restart with the shutdown it overlapped", async () => {
+		// With nothing live to name, a shutdown removes every handler relay put
+		// on the channel — which is right, unless a restart has already put a
+		// new one there. The restart waits for the teardown instead of racing
+		// it.
+		const held = deferred();
+		const bus = fakeBus({ hold: held.promise });
+		const relay = new Relay({
+			allowUnauthorizedChannels: true,
+			transport: bus.transport,
+		});
+		const sse = await subscribedClient(relay, "news");
+
+		const starting = relay.startTransport();
+		const stopping = relay.shutdown();
+		const restarting = relay.startTransport();
+		held.resolve();
+		await starting.catch(() => {});
+		await stopping;
+		await restarting;
+
+		expect(bus.live()).toBe(1);
+		bus.emit("news", { n: 1 });
+		expect(sse.sent).toHaveLength(1);
 	});
 });

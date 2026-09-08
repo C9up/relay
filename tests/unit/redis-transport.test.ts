@@ -298,4 +298,66 @@ describe("relay > unsubscribing what was never subscribed", () => {
 
 		expect(client.unsubscribed).toHaveLength(0);
 	});
+
+	it("removes only the handler it is given", async () => {
+		// The client STACKS subscriptions. Removing by channel alone takes down
+		// a listener this transport does not own; keeping one wrapper per
+		// channel loses track of the other and leaves it delivering.
+		const { client } = fakeRedis();
+		const transport = new RedisRelayTransport(() => client);
+		const first: Array<unknown> = [];
+		const second: Array<unknown> = [];
+		const a = (m: unknown): void => {
+			first.push(m);
+		};
+		const b = (m: unknown): void => {
+			second.push(m);
+		};
+		await transport.subscribe("relay::broadcast", a);
+		await transport.subscribe("relay::broadcast", b);
+
+		await transport.unsubscribe("relay::broadcast", a);
+		await transport.publish("relay::broadcast", { type: "broadcast" });
+
+		expect(first).toHaveLength(0);
+		expect(second).toHaveLength(1);
+	});
+
+	it("forgets a connection it has closed", async () => {
+		// `quit()` leaves the client unusable, and the resolved promise was
+		// kept: an application that stopped and started again in one process —
+		// a hot reload, a test — came back up on the socket it had just shut
+		// and never reached the bus again.
+		const { client } = fakeRedis();
+		let resolutions = 0;
+		const source = (): RelayPubSubClient => {
+			resolutions += 1;
+			// Closed state is PER CONNECTION, as a real client's is: reusing a
+			// quit one is exactly what this test is about.
+			let closed = false;
+			const live = {
+				...client,
+				quit: () => {
+					closed = true;
+				},
+			};
+			return {
+				publish: (c, m) => live.publish(c, m),
+				subscribe: (c, h, o) => {
+					if (closed) throw new Error("the connection is closed");
+					return live.subscribe(c, h, o);
+				},
+				unsubscribe: (c, h) => live.unsubscribe(c, h),
+				quit: () => live.quit(),
+			};
+		};
+		const transport = new RedisRelayTransport(source, true);
+		await transport.subscribe("relay::broadcast", () => {});
+		await transport.disconnect();
+
+		await expect(
+			transport.subscribe("relay::broadcast", () => {}),
+		).resolves.toBeUndefined();
+		expect(resolutions).toBe(2);
+	});
 });

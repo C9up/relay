@@ -164,9 +164,10 @@ describe("relay-broadcast > multi-instance transport sync", () => {
 	it("shutdown() unsubscribes from and disconnects the bus", async () => {
 		const unsubscribe = vi.fn();
 		const disconnect = vi.fn();
+		const subscribe = vi.fn();
 		const transport: RelayTransport = {
 			publish: vi.fn(),
-			subscribe: vi.fn(),
+			subscribe,
 			unsubscribe,
 			disconnect,
 		};
@@ -175,7 +176,13 @@ describe("relay-broadcast > multi-instance transport sync", () => {
 
 		await r.shutdown();
 
-		expect(unsubscribe).toHaveBeenCalledWith("custom::bus");
+		// The handler is NAMED, not just the channel: the bus stacks
+		// subscriptions, and "drop everything on this channel" would take down
+		// whatever else the application put on the client relay shares.
+		expect(unsubscribe).toHaveBeenCalledWith(
+			"custom::bus",
+			subscribe.mock.calls[0]?.[1],
+		);
 		expect(disconnect).toHaveBeenCalled();
 	});
 

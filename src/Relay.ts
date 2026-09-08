@@ -90,7 +90,22 @@ export interface RelayTransport {
 		channel: string,
 		handler: (message: unknown) => void,
 	): void | Promise<void>;
-	unsubscribe?(channel: string): void | Promise<void>;
+	/**
+	 * Stop listening. The HANDLER is what identifies a subscription: a bus
+	 * shared with the rest of the application stacks them — `@c9up/quasar`
+	 * keeps a `Set` per channel, matching upstream — so "drop everything on
+	 * this channel" is both too much and not enough. Too much, because it can
+	 * take down a subscription this relay does not own; not enough, because a
+	 * superseded start attempt cannot otherwise remove its own handler and
+	 * leaves it delivering alongside the live one.
+	 *
+	 * Omitting it means "every handler this relay registered on the channel",
+	 * which is what a shutdown with nothing in flight wants.
+	 */
+	unsubscribe?(
+		channel: string,
+		handler?: (message: unknown) => void,
+	): void | Promise<void>;
 	disconnect?(): void | Promise<void>;
 }
 
@@ -303,6 +318,8 @@ export class Relay {
 	 * state while it is still the generation that owns it.
 	 */
 	#transportGeneration = 0;
+	/** The handler the live generation registered, so it can be named again. */
+	#transportHandler: ((message: unknown) => void) | undefined;
 	/** Keep-alive period, held until the transport actually starts. */
 	readonly #pingInterval: number | false | undefined;
 	/** Whether the endpoints are on the router — mounting twice duplicates them. */
@@ -375,16 +392,21 @@ export class Relay {
 		}
 
 		const channel = this.#transportChannel;
+		// This generation's own handler, kept so it can be named again — to
+		// undo it when this attempt turns out to have been superseded, and to
+		// remove exactly it at shutdown. The bus stacks handlers, so anything
+		// coarser either leaves one behind or takes down someone else's.
+		const handler = (message: unknown): void => {
+			if (isRelayTransportMessage(message)) {
+				this.#deliver(message.channel, message.payload);
+			}
+		};
 		// A subscribe that fails is how an instance stops hearing the others: it
 		// keeps serving its own clients and quietly misses every message
 		// published elsewhere. Awaited by the provider, so that reaches the boot.
 		this.#transportReady = (async () => {
 			try {
-				await this.#transport?.subscribe(channel, (message) => {
-					if (isRelayTransportMessage(message)) {
-						this.#deliver(message.channel, message.payload);
-					}
-				});
+				await this.#transport?.subscribe(channel, handler);
 			} catch (error) {
 				// UNDO the start, but KEEP the rejection. Marking it started
 				// before the subscribe made a failure permanent: every later
@@ -411,20 +433,14 @@ export class Relay {
 				// is real — it just belongs to a generation nobody is tracking
 				// any more, and the shutdown that superseded it looked for a
 				// handler before this one existed. Taking it back down is this
-				// attempt's job; nobody else can name it.
-				//
-				// Unless a newer start is running: the transport holds one
-				// handler per channel, so unsubscribing here would take down the
-				// live one instead. That only happens when a start is issued
-				// without awaiting the shutdown it overlaps, which `shutdown()`
-				// is written to make unnecessary.
-				if (!this.#transportStarted) {
-					await this.#transport?.unsubscribe?.(channel);
-				}
+				// attempt's job, and it can, because it removes ITS OWN handler
+				// by name: a newer generation's subscription is untouched.
+				await this.#transport?.unsubscribe?.(channel, handler);
 				throw new Error(
 					"Relay.startTransport() was superseded by a shutdown before the subscription completed. The subscription it opened has been taken back down.",
 				);
 			}
+			this.#transportHandler = handler;
 		})();
 		this.#transportReady.catch(() => {});
 		return this.#transportReady;
@@ -443,6 +459,7 @@ export class Relay {
 			this.#pingTimer = undefined;
 		}
 		this.#transportStarted = false;
+		this.#transportHandler = undefined;
 		this.#transportAttempted = options.keepOutcome === true;
 		if (options.keepOutcome !== true) this.#transportReady = Promise.resolve();
 		// Anything still in flight is now stale, and says so by comparing.
@@ -1066,15 +1083,37 @@ export class Relay {
 		// subscription back down when it lands. Waiting for it instead would
 		// make a graceful shutdown hang on exactly the unreachable bus that
 		// makes shutting down urgent.
+		//
+		// The live handler is read BEFORE that, because `#stopTransport` is
+		// what makes the relay restartable and a restart replaces it.
+		const handler = this.#transportHandler;
+		this.#transportHandler = undefined;
 		this.#stopTransport();
-		if (!this.#transport) return;
+		const transport = this.#transport;
+		if (!transport) return;
+		const generation = this.#transportGeneration;
+
 		try {
-			await this.#transport.unsubscribe?.(this.#transportChannel);
+			// ONLY the handler this relay has live, and only when it has one. A
+			// start still in flight owns its handler and takes it back down
+			// itself, by name — so there is nothing here to remove, and asking
+			// for "every handler on this channel" would silence another Relay
+			// sharing the same bus, which is the shape a test harness and a
+			// multi-tenant host both take.
+			if (handler !== undefined) {
+				await transport.unsubscribe?.(this.#transportChannel, handler);
+			}
 		} finally {
 			// Disconnected WHATEVER unsubscribe did. Left in the happy path, a
 			// rejecting unsubscribe skipped it and leaked the connection this
 			// relay owns.
-			await this.#transport.disconnect?.();
+			//
+			// Unless something started again in the meantime: closing the
+			// connection under a newer generation is the same mistake in the
+			// other direction.
+			if (this.#transportGeneration === generation) {
+				await transport.disconnect?.();
+			}
 		}
 	}
 

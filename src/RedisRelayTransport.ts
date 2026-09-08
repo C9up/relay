@@ -59,15 +59,19 @@ export type RelayPubSubResolver =
 export class RedisRelayTransport implements RelayTransport {
 	readonly #source: RelayPubSubResolver;
 	/**
-	 * The wrapper actually registered with the client, per channel.
+	 * Per channel, the wrapper registered with the client for each of relay's
+	 * handlers.
 	 *
-	 * Kept so `unsubscribe` can name it. Without it the only available call was
-	 * "drop everything on this channel", which is not relay's to do on a client
-	 * it shares.
+	 * Kept so `unsubscribe` can name one. Without it the only available call
+	 * was "drop everything on this channel", which is not relay's to do on a
+	 * client it shares — and a single wrapper per channel was not enough
+	 * either: the client STACKS subscriptions (`@c9up/quasar` keeps a `Set`),
+	 * so a second subscribe replaced the map entry while both wrappers stayed
+	 * registered. The first became untrackable and every message arrived twice.
 	 */
 	readonly #handlers = new Map<
 		string,
-		(message: string, channel: string) => void
+		Map<(message: unknown) => void, (message: string, channel: string) => void>
 	>();
 	/**
 	 * Whether closing the sockets is relay's business.
@@ -132,7 +136,9 @@ export class RedisRelayTransport implements RelayTransport {
 			const parsed = parseMessage(raw);
 			if (parsed !== undefined) handler(parsed);
 		};
-		this.#handlers.set(channel, wrapper);
+		const wrappers = this.#handlers.get(channel) ?? new Map();
+		wrappers.set(handler, wrapper);
+		this.#handlers.set(channel, wrappers);
 		// Turn a reported failure back into a rejection. A client that resolves
 		// after failing leaves the caller with no way to tell the two apart.
 		let reported: unknown;
@@ -142,23 +148,53 @@ export class RedisRelayTransport implements RelayTransport {
 			},
 		});
 		if (reported !== undefined) {
-			this.#handlers.delete(channel);
+			this.#forget(channel, handler);
 			throw reported instanceof Error ? reported : new Error(String(reported));
 		}
 	}
 
-	async unsubscribe(channel: string): Promise<void> {
-		// NOTHING to remove means nothing to call. `unsubscribe(channel)` with no
-		// handler means "drop every listener on this channel" on a shared client,
-		// so calling it when relay never subscribed — a failed `ready()`, or a
-		// second shutdown — would cut the cache's and the sessions' listeners
-		// instead of relay's. Reaching the client at all would also connect one
-		// just to disconnect it.
-		const wrapper = this.#handlers.get(channel);
-		if (wrapper === undefined) return;
-		this.#handlers.delete(channel);
+	/**
+	 * Stop listening — one named handler, or every one relay put on `channel`.
+	 *
+	 * NOTHING to remove means nothing to call. `unsubscribe(channel)` with no
+	 * wrapper means "drop every listener on this channel" on a shared client,
+	 * so calling it when relay never subscribed — a failed `ready()`, or a
+	 * second shutdown — would cut the cache's and the sessions' listeners
+	 * instead of relay's. Reaching the client at all would also connect one
+	 * just to disconnect it.
+	 */
+	async unsubscribe(
+		channel: string,
+		handler?: (message: unknown) => void,
+	): Promise<void> {
+		const wrappers = this.#handlers.get(channel);
+		if (wrappers === undefined) return;
+
+		const doomed: Array<(message: string, channel: string) => void> = [];
+		if (handler === undefined) {
+			doomed.push(...wrappers.values());
+			wrappers.clear();
+		} else {
+			const wrapper = wrappers.get(handler);
+			if (wrapper === undefined) return;
+			doomed.push(wrapper);
+			wrappers.delete(handler);
+		}
+		if (wrappers.size === 0) this.#handlers.delete(channel);
+		if (doomed.length === 0) return;
+
 		const client = await this.#client();
-		await client.unsubscribe(channel, wrapper);
+		for (const wrapper of doomed) {
+			await client.unsubscribe(channel, wrapper);
+		}
+	}
+
+	/** Drop one registration without touching the client. */
+	#forget(channel: string, handler: (message: unknown) => void): void {
+		const wrappers = this.#handlers.get(channel);
+		if (wrappers === undefined) return;
+		wrappers.delete(handler);
+		if (wrappers.size === 0) this.#handlers.delete(channel);
 	}
 
 	/**
@@ -172,7 +208,13 @@ export class RedisRelayTransport implements RelayTransport {
 	 */
 	async disconnect(): Promise<void> {
 		if (!this.#ownsConnection || !this.#resolved) return;
-		const client = await this.#resolved;
+		// FORGOTTEN before it is closed. Left cached, the quit client was handed
+		// straight back to the next `subscribe` — so an application that stops
+		// and starts again in one process, a hot reload or a test, came up on a
+		// socket that was already shut and never reached the bus again.
+		const pending = this.#resolved;
+		this.#resolved = undefined;
+		const client = await pending;
 		await client.quit?.();
 	}
 }
