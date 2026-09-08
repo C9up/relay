@@ -136,17 +136,28 @@ export class RedisRelayTransport implements RelayTransport {
 			const parsed = parseMessage(raw);
 			if (parsed !== undefined) handler(parsed);
 		};
+		// Recorded BEFORE the call, because a client that registers the wrapper
+		// and then fails still has it — and forgotten again on ANY failure, not
+		// just the reported kind. A direct rejection used to leave the wrapper
+		// recorded: `unsubscribe` would then ask the client to remove something
+		// it may never have registered, and a retry was refused by bookkeeping
+		// for a subscription that never happened.
 		const wrappers = this.#handlers.get(channel) ?? new Map();
 		wrappers.set(handler, wrapper);
 		this.#handlers.set(channel, wrappers);
 		// Turn a reported failure back into a rejection. A client that resolves
 		// after failing leaves the caller with no way to tell the two apart.
 		let reported: unknown;
-		await client.subscribe(channel, wrapper, {
-			onError: (error) => {
-				reported = error;
-			},
-		});
+		try {
+			await client.subscribe(channel, wrapper, {
+				onError: (error) => {
+					reported = error;
+				},
+			});
+		} catch (error) {
+			this.#forget(channel, handler);
+			throw error;
+		}
 		if (reported !== undefined) {
 			this.#forget(channel, handler);
 			throw reported instanceof Error ? reported : new Error(String(reported));
@@ -170,22 +181,27 @@ export class RedisRelayTransport implements RelayTransport {
 		const wrappers = this.#handlers.get(channel);
 		if (wrappers === undefined) return;
 
-		const doomed: Array<(message: string, channel: string) => void> = [];
+		// Chosen first, DROPPED last. Clearing the bookkeeping before asking the
+		// client left a live subscription nothing could name again when the
+		// call failed — neither to retry it nor to remove it at shutdown.
+		const doomed: Array<
+			[(message: unknown) => void, (message: string, channel: string) => void]
+		> = [];
 		if (handler === undefined) {
-			doomed.push(...wrappers.values());
-			wrappers.clear();
+			doomed.push(...wrappers.entries());
 		} else {
 			const wrapper = wrappers.get(handler);
 			if (wrapper === undefined) return;
-			doomed.push(wrapper);
-			wrappers.delete(handler);
+			doomed.push([handler, wrapper]);
 		}
-		if (wrappers.size === 0) this.#handlers.delete(channel);
 		if (doomed.length === 0) return;
 
 		const client = await this.#client();
-		for (const wrapper of doomed) {
+		for (const [owner, wrapper] of doomed) {
 			await client.unsubscribe(channel, wrapper);
+			// One at a time, so a failure halfway through leaves the rest
+			// nameable rather than losing them all with the one that refused.
+			this.#forget(channel, owner);
 		}
 	}
 

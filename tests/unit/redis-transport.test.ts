@@ -360,4 +360,55 @@ describe("relay > unsubscribing what was never subscribed", () => {
 		).resolves.toBeUndefined();
 		expect(resolutions).toBe(2);
 	});
+
+	it("forgets a subscription the client rejected outright", async () => {
+		// The wrapper is recorded BEFORE the client is called, so relay can
+		// name it if the call resolves. A direct rejection left it recorded and
+		// possibly live: the next `unsubscribe` would ask the client to remove
+		// something it never registered, and a retry would be refused by
+		// bookkeeping for a subscription that never happened.
+		const { client } = fakeRedis();
+		const refusing: RelayPubSubClient = {
+			...client,
+			subscribe() {
+				throw new Error("no route to the bus");
+			},
+		};
+		const transport = new RedisRelayTransport(() => refusing);
+		const handler = (): void => {};
+
+		await expect(
+			transport.subscribe("relay::broadcast", handler),
+		).rejects.toThrow("no route to the bus");
+
+		await transport.unsubscribe("relay::broadcast", handler);
+		expect(client.unsubscribed).toHaveLength(0);
+	});
+
+	it("keeps a subscription the client refused to remove", async () => {
+		// Bookkeeping was cleared BEFORE the client was asked. A rejecting
+		// unsubscribe then left a live subscription nothing could name again —
+		// not to retry it, not to remove it at shutdown.
+		const { client } = fakeRedis();
+		let refuse = true;
+		const flaky: RelayPubSubClient = {
+			...client,
+			unsubscribe(channel, handler) {
+				if (refuse) throw new Error("the connection is busy");
+				return client.unsubscribe(channel, handler);
+			},
+		};
+		const transport = new RedisRelayTransport(() => flaky);
+		const handler = (): void => {};
+		await transport.subscribe("relay::broadcast", handler);
+
+		await expect(
+			transport.unsubscribe("relay::broadcast", handler),
+		).rejects.toThrow("busy");
+
+		// The retry still knows what to remove.
+		refuse = false;
+		await transport.unsubscribe("relay::broadcast", handler);
+		expect(client.unsubscribed).toHaveLength(1);
+	});
 });

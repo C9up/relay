@@ -320,6 +320,16 @@ export class Relay {
 	#transportGeneration = 0;
 	/** The handler the live generation registered, so it can be named again. */
 	#transportHandler: ((message: unknown) => void) | undefined;
+	/**
+	 * A shutdown still releasing the bus.
+	 *
+	 * A start waits for it. `shutdown()` checks the generation before it awaits
+	 * `disconnect()`, so a restart that lands during that await passes a check
+	 * that has already happened — and the old shutdown goes on to close the
+	 * connection the new generation has just subscribed on. Relay then reports
+	 * itself started, with a live handler, on a transport nobody can reach.
+	 */
+	#teardown: Promise<void> | undefined;
 	/** Keep-alive period, held until the transport actually starts. */
 	readonly #pingInterval: number | false | undefined;
 	/** Whether the endpoints are on the router — mounting twice duplicates them. */
@@ -401,10 +411,20 @@ export class Relay {
 				this.#deliver(message.channel, message.payload);
 			}
 		};
+		const teardown = this.#teardown;
 		// A subscribe that fails is how an instance stops hearing the others: it
 		// keeps serving its own clients and quietly misses every message
 		// published elsewhere. Awaited by the provider, so that reaches the boot.
 		this.#transportReady = (async () => {
+			// A shutdown still releasing the bus finishes FIRST. Subscribing
+			// underneath one is how a restart ended up on a connection the
+			// shutdown was about to close.
+			if (teardown !== undefined) await teardown.catch(() => {});
+			if (this.#transportGeneration !== generation) {
+				throw new Error(
+					"Relay.startTransport() was superseded before it could subscribe.",
+				);
+			}
 			try {
 				await this.#transport?.subscribe(channel, handler);
 			} catch (error) {
@@ -1093,27 +1113,36 @@ export class Relay {
 		if (!transport) return;
 		const generation = this.#transportGeneration;
 
+		const teardown = (async (): Promise<void> => {
+			try {
+				// ONLY the handler this relay has live, and only when it has one. A
+				// start still in flight owns its handler and takes it back down
+				// itself, by name — so there is nothing here to remove, and
+				// asking for "every handler on this channel" would silence
+				// another Relay sharing the same bus, which is the shape a test
+				// harness and a multi-tenant host both take.
+				if (handler !== undefined) {
+					await transport.unsubscribe?.(this.#transportChannel, handler);
+				}
+			} finally {
+				// Disconnected WHATEVER unsubscribe did. Left in the happy path,
+				// a rejecting unsubscribe skipped it and leaked the connection
+				// this relay owns.
+				//
+				// Unless something started again in the meantime: closing the
+				// connection under a newer generation is the same mistake in the
+				// other direction.
+				if (this.#transportGeneration === generation) {
+					await transport.disconnect?.();
+				}
+			}
+		})();
+		this.#teardown = teardown;
 		try {
-			// ONLY the handler this relay has live, and only when it has one. A
-			// start still in flight owns its handler and takes it back down
-			// itself, by name — so there is nothing here to remove, and asking
-			// for "every handler on this channel" would silence another Relay
-			// sharing the same bus, which is the shape a test harness and a
-			// multi-tenant host both take.
-			if (handler !== undefined) {
-				await transport.unsubscribe?.(this.#transportChannel, handler);
-			}
+			await teardown;
 		} finally {
-			// Disconnected WHATEVER unsubscribe did. Left in the happy path, a
-			// rejecting unsubscribe skipped it and leaked the connection this
-			// relay owns.
-			//
-			// Unless something started again in the meantime: closing the
-			// connection under a newer generation is the same mistake in the
-			// other direction.
-			if (this.#transportGeneration === generation) {
-				await transport.disconnect?.();
-			}
+			// Only while it is still ours: a second shutdown installs its own.
+			if (this.#teardown === teardown) this.#teardown = undefined;
 		}
 	}
 

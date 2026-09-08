@@ -69,6 +69,9 @@ function fakeBus(options: {
 	hold?: Promise<void>;
 	holdCall?: number;
 	failFirst?: Promise<void>;
+	holdDisconnect?: Promise<void>;
+	/** Model a transport whose `disconnect` really does close the bus. */
+	closesOnDisconnect?: boolean;
 }) {
 	const handlers = new Map<string, Set<(message: unknown) => void>>();
 	let calls = 0;
@@ -96,7 +99,10 @@ function fakeBus(options: {
 			if (set.size === 0) handlers.delete(channel);
 		},
 		disconnect: async () => {
+			if (options.holdDisconnect) await options.holdDisconnect;
 			disconnected += 1;
+			// A closed bus delivers nothing, whoever is still listening.
+			if (options.closesOnDisconnect) handlers.clear();
 		},
 	};
 	return {
@@ -282,6 +288,38 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 		await restarting;
 
 		expect(bus.live()).toBe(1);
+		bus.emit("news", { n: 1 });
+		expect(sse.sent).toHaveLength(1);
+	});
+
+	it("is not closed by a shutdown that was already disconnecting", async () => {
+		// The generation is checked BEFORE `disconnect()` is awaited. A restart
+		// that lands during that await passes the check that already happened,
+		// so the old shutdown went on to close the connection the new
+		// generation had just subscribed on: relay reports itself started, its
+		// handler is live, and nothing reaches it.
+		const closing = deferred();
+		const bus = fakeBus({
+			holdDisconnect: closing.promise,
+			closesOnDisconnect: true,
+		});
+		const relay = new Relay({
+			allowUnauthorizedChannels: true,
+			transport: bus.transport,
+		});
+		const sse = await subscribedClient(relay, "news");
+
+		await relay.startTransport();
+		const stopping = relay.shutdown();
+		// Let the shutdown reach its disconnect before restarting.
+		await Promise.resolve();
+		await Promise.resolve();
+		const restarting = relay.startTransport();
+		closing.resolve();
+		await stopping;
+		await restarting;
+
+		expect(relay.hasStartedTransport()).toBe(true);
 		bus.emit("news", { n: 1 });
 		expect(sse.sent).toHaveLength(1);
 	});
