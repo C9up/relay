@@ -277,7 +277,12 @@ describe("relay > unsubscribing what was never subscribed", () => {
 		expect(client.unsubscribed).toHaveLength(1);
 	});
 
-	it("removes nothing after a subscribe that failed", async () => {
+	it("removes nothing MORE after a subscribe that failed", async () => {
+		// The failed subscribe takes its own registration back off — it cannot
+		// know whether the client kept one. What must not happen is a LATER
+		// unsubscribe reaching the client again: on a shared connection that is
+		// relay dropping listeners it never owned, and on a cold one it opens a
+		// connection just to close it.
 		const { client } = fakeRedis();
 		const failing = {
 			...client,
@@ -293,10 +298,11 @@ describe("relay > unsubscribing what was never subscribed", () => {
 		await expect(
 			transport.subscribe("relay::broadcast", () => {}),
 		).rejects.toThrow();
+		const afterRollback = client.unsubscribed.length;
 
 		await transport.unsubscribe("relay::broadcast");
 
-		expect(client.unsubscribed).toHaveLength(0);
+		expect(client.unsubscribed).toHaveLength(afterRollback);
 	});
 
 	it("removes only the handler it is given", async () => {
@@ -362,11 +368,12 @@ describe("relay > unsubscribing what was never subscribed", () => {
 	});
 
 	it("forgets a subscription the client rejected outright", async () => {
-		// The wrapper is recorded BEFORE the client is called, so relay can
-		// name it if the call resolves. A direct rejection left it recorded and
-		// possibly live: the next `unsubscribe` would ask the client to remove
-		// something it never registered, and a retry would be refused by
-		// bookkeeping for a subscription that never happened.
+		// The wrapper is recorded BEFORE the client is called, so relay can name
+		// it if the call resolves — and the failure path takes it back off,
+		// because the client may have registered it before failing. What is
+		// pinned here is that a LATER unsubscribe adds nothing: the record is
+		// gone, so relay does not ask a shared client to drop a listener it
+		// never owned.
 		const { client } = fakeRedis();
 		const refusing: RelayPubSubClient = {
 			...client,
@@ -380,9 +387,10 @@ describe("relay > unsubscribing what was never subscribed", () => {
 		await expect(
 			transport.subscribe("relay::broadcast", handler),
 		).rejects.toThrow("no route to the bus");
+		const afterRollback = client.unsubscribed.length;
 
 		await transport.unsubscribe("relay::broadcast", handler);
-		expect(client.unsubscribed).toHaveLength(0);
+		expect(client.unsubscribed).toHaveLength(afterRollback);
 	});
 
 	it("keeps a subscription the client refused to remove", async () => {
@@ -409,6 +417,59 @@ describe("relay > unsubscribing what was never subscribed", () => {
 		// The retry still knows what to remove.
 		refuse = false;
 		await transport.unsubscribe("relay::broadcast", handler);
+		expect(client.unsubscribed).toHaveLength(1);
+	});
+
+	it("takes back a registration the client kept while failing", async () => {
+		// A client that registers the callback and THEN fails — an ambiguous
+		// network result, or a duck-typed adapter that does its bookkeeping
+		// first. Forgetting the wrapper left it live and unnameable: the later
+		// unsubscribe did nothing at all.
+		const { client } = fakeRedis();
+		const half: RelayPubSubClient = {
+			...client,
+			subscribe(channel, handler, options) {
+				client.subscribe(channel, handler, options);
+				throw new Error("no route to the bus");
+			},
+		};
+		const transport = new RedisRelayTransport(() => half);
+		const handler = (): void => {};
+
+		await expect(
+			transport.subscribe("relay::broadcast", handler),
+		).rejects.toThrow("no route to the bus");
+
+		// Whatever it registered has been taken back off.
+		expect(client.unsubscribed).toHaveLength(1);
+		await transport.publish("relay::broadcast", { type: "broadcast" });
+	});
+
+	it("keeps a registration it could not take back", async () => {
+		// The compensation failed too, so the subscription may still be live —
+		// and the only way a later shutdown can name it is if the record stays.
+		const { client } = fakeRedis();
+		let refuse = true;
+		const half: RelayPubSubClient = {
+			...client,
+			subscribe(channel, handler, options) {
+				client.subscribe(channel, handler, options);
+				throw new Error("no route to the bus");
+			},
+			unsubscribe(channel, handler) {
+				if (refuse) throw new Error("the connection is busy");
+				return client.unsubscribe(channel, handler);
+			},
+		};
+		const transport = new RedisRelayTransport(() => half);
+		const handler = (): void => {};
+		await expect(
+			transport.subscribe("relay::broadcast", handler),
+		).rejects.toThrow("no route to the bus");
+
+		refuse = false;
+		await transport.unsubscribe("relay::broadcast", handler);
+
 		expect(client.unsubscribed).toHaveLength(1);
 	});
 });

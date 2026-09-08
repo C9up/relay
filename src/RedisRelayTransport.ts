@@ -155,12 +155,38 @@ export class RedisRelayTransport implements RelayTransport {
 				},
 			});
 		} catch (error) {
-			this.#forget(channel, handler);
+			await this.#rollback(client, channel, handler, wrapper);
 			throw error;
 		}
 		if (reported !== undefined) {
-			this.#forget(channel, handler);
+			await this.#rollback(client, channel, handler, wrapper);
 			throw reported instanceof Error ? reported : new Error(String(reported));
+		}
+	}
+
+	/**
+	 * Undo a subscribe that failed, because it may have half-succeeded.
+	 *
+	 * A client is free to register the callback and THEN fail — an ambiguous
+	 * network result, or a duck-typed adapter that does its bookkeeping first.
+	 * Simply forgetting the wrapper left it live and unnameable: the later
+	 * unsubscribe removed nothing, and every broadcast still reached it.
+	 *
+	 * The record is dropped only once the client has accepted the removal. If
+	 * that fails too, keeping it is the only way a shutdown can still name what
+	 * may be listening.
+	 */
+	async #rollback(
+		client: RelayPubSubClient,
+		channel: string,
+		handler: (message: unknown) => void,
+		wrapper: (message: string, channel: string) => void,
+	): Promise<void> {
+		try {
+			await client.unsubscribe(channel, wrapper);
+			this.#forget(channel, handler);
+		} catch {
+			// Left recorded on purpose — see above.
 		}
 	}
 

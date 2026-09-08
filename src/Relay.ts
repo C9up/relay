@@ -416,10 +416,25 @@ export class Relay {
 		// keeps serving its own clients and quietly misses every message
 		// published elsewhere. Awaited by the provider, so that reaches the boot.
 		this.#transportReady = (async () => {
-			// A shutdown still releasing the bus finishes FIRST. Subscribing
-			// underneath one is how a restart ended up on a connection the
-			// shutdown was about to close.
-			if (teardown !== undefined) await teardown.catch(() => {});
+			// A shutdown still releasing the bus finishes FIRST, and its FAILURE
+			// stops this start. Swallowing it and subscribing anyway left the
+			// old handler on the bus beside the new one: every message was
+			// delivered twice, and the next shutdown could only name the newer.
+			//
+			// The error is re-thrown rather than reported, because there is no
+			// safe way to continue — a relay that cannot release its previous
+			// subscription cannot know what is still listening.
+			if (teardown !== undefined) {
+				try {
+					await teardown;
+				} catch (error) {
+					this.#stopTransport({ keepOutcome: true });
+					throw new Error(
+						`Relay.startTransport(): the previous subscription could not be released, so starting again would leave two handlers on the bus. Cause: ${error instanceof Error ? error.message : String(error)}`,
+						{ cause: error },
+					);
+				}
+			}
 			if (this.#transportGeneration !== generation) {
 				throw new Error(
 					"Relay.startTransport() was superseded before it could subscribe.",
@@ -479,7 +494,6 @@ export class Relay {
 			this.#pingTimer = undefined;
 		}
 		this.#transportStarted = false;
-		this.#transportHandler = undefined;
 		this.#transportAttempted = options.keepOutcome === true;
 		if (options.keepOutcome !== true) this.#transportReady = Promise.resolve();
 		// Anything still in flight is now stale, and says so by comparing.
@@ -1107,7 +1121,6 @@ export class Relay {
 		// The live handler is read BEFORE that, because `#stopTransport` is
 		// what makes the relay restartable and a restart replaces it.
 		const handler = this.#transportHandler;
-		this.#transportHandler = undefined;
 		this.#stopTransport();
 		const transport = this.#transport;
 		if (!transport) return;
@@ -1123,6 +1136,11 @@ export class Relay {
 				// harness and a multi-tenant host both take.
 				if (handler !== undefined) {
 					await transport.unsubscribe?.(this.#transportChannel, handler);
+					// Forgotten only once the bus has accepted it. Cleared
+					// first, a refusal left a live handler nothing could name
+					// again — and the next shutdown, seeing none, removed
+					// nothing at all.
+					this.#transportHandler = undefined;
 				}
 			} finally {
 				// Disconnected WHATEVER unsubscribe did. Left in the happy path,
@@ -1138,12 +1156,11 @@ export class Relay {
 			}
 		})();
 		this.#teardown = teardown;
-		try {
-			await teardown;
-		} finally {
-			// Only while it is still ours: a second shutdown installs its own.
-			if (this.#teardown === teardown) this.#teardown = undefined;
-		}
+		await teardown;
+		// KEPT on failure, deliberately: a start has to see that the bus was
+		// not released. A later shutdown installs its own, which is how the
+		// state clears once the connection recovers.
+		if (this.#teardown === teardown) this.#teardown = undefined;
 	}
 
 	// ─── Internals ────────────────────────────────────────────

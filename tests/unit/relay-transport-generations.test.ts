@@ -323,4 +323,45 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 		bus.emit("news", { n: 1 });
 		expect(sse.sent).toHaveLength(1);
 	});
+
+	it("refuses to start again when the teardown left a handler behind", async () => {
+		// `await teardown.catch(() => {})` swallowed the failure and subscribed
+		// anyway. With the old handler still on the bus, every message was then
+		// delivered twice — and the next shutdown could only name the new one.
+		const handlers = new Set<(message: unknown) => void>();
+		let refuse = true;
+		const transport: RelayTransport = {
+			publish: async () => {},
+			subscribe: async (_channel, handler) => {
+				handlers.add(handler);
+			},
+			unsubscribe: async (_channel, handler) => {
+				if (refuse) throw new Error("the connection is busy");
+				if (handler) handlers.delete(handler);
+				else handlers.clear();
+			},
+		};
+		const relay = new Relay({
+			allowUnauthorizedChannels: true,
+			transport,
+		});
+		const sse = await subscribedClient(relay, "news");
+
+		await relay.startTransport();
+		await expect(relay.shutdown()).rejects.toThrow("busy");
+
+		await expect(relay.startTransport()).rejects.toThrow(
+			/could not be released/,
+		);
+		expect(relay.hasStartedTransport()).toBe(false);
+
+		// And once the bus recovers, a start works and delivers ONCE.
+		refuse = false;
+		await relay.shutdown();
+		await relay.startTransport();
+		for (const handler of handlers) {
+			handler({ type: "broadcast", channel: "news", payload: { n: 1 } });
+		}
+		expect(sse.sent).toHaveLength(1);
+	});
 });
