@@ -364,4 +364,46 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 		}
 		expect(sse.sent).toHaveLength(1);
 	});
+
+	it("refuses to start again after a subscribe whose undo failed", async () => {
+		// A client can register the callback and THEN fail, and the undo can
+		// fail too. Relay forgot its handler on the error and had no teardown
+		// to point at, so the next start subscribed beside a listener still
+		// live: two handlers, every message twice, and only the newer nameable.
+		const handlers = new Set<(message: unknown) => void>();
+		let refuseUnsubscribe = true;
+		let failSubscribe = true;
+		const transport: RelayTransport = {
+			publish: async () => {},
+			subscribe: async (_channel, handler) => {
+				handlers.add(handler);
+				if (failSubscribe) throw new Error("no route to the bus");
+			},
+			unsubscribe: async (_channel, handler) => {
+				if (refuseUnsubscribe) throw new Error("the connection is busy");
+				if (handler) handlers.delete(handler);
+				else handlers.clear();
+			},
+		};
+		const relay = new Relay({
+			allowUnauthorizedChannels: true,
+			transport,
+		});
+		const sse = await subscribedClient(relay, "news");
+
+		await expect(relay.startTransport()).rejects.toThrow("no route to the bus");
+
+		failSubscribe = false;
+		await expect(relay.startTransport()).rejects.toThrow(
+			/could not be released/,
+		);
+
+		// Once the bus recovers, the obligation clears and a start delivers ONCE.
+		refuseUnsubscribe = false;
+		await relay.startTransport();
+		for (const handler of handlers) {
+			handler({ type: "broadcast", channel: "news", payload: { n: 1 } });
+		}
+		expect(sse.sent).toHaveLength(1);
+	});
 });

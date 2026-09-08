@@ -472,4 +472,42 @@ describe("relay > unsubscribing what was never subscribed", () => {
 
 		expect(client.unsubscribed).toHaveLength(1);
 	});
+
+	it("keeps every wrapper when the same handler subscribes twice", async () => {
+		// One wrapper per handler meant the second registration overwrote the
+		// only way to name the first: the client held two listeners and an
+		// unsubscribe removed one. The class is exported, so this is not
+		// limited to relay's own use of it.
+		const { client } = fakeRedis();
+		const transport = new RedisRelayTransport(() => client);
+		const seen: unknown[] = [];
+		const handler = (m: unknown): void => {
+			seen.push(m);
+		};
+		await transport.subscribe("relay::broadcast", handler);
+		await transport.subscribe("relay::broadcast", handler);
+
+		await transport.unsubscribe("relay::broadcast", handler);
+		await transport.publish("relay::broadcast", { type: "broadcast" });
+
+		expect(seen).toEqual([]);
+	});
+
+	it("removes its own listeners even on a connection it does not own", async () => {
+		// A borrowed connection is not relay's to close — but the listeners it
+		// put there are its to remove, and leaving them meant a shutdown that
+		// released nothing at all.
+		const { client } = fakeRedis();
+		const transport = new RedisRelayTransport(() => client, false);
+		const seen: unknown[] = [];
+		await transport.subscribe("relay::broadcast", (m) => {
+			seen.push(m);
+		});
+
+		await transport.disconnect();
+		await transport.publish("relay::broadcast", { type: "broadcast" });
+
+		expect(seen).toEqual([]);
+		expect(client.quits).toBe(0);
+	});
 });

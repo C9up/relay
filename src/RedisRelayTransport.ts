@@ -71,7 +71,10 @@ export class RedisRelayTransport implements RelayTransport {
 	 */
 	readonly #handlers = new Map<
 		string,
-		Map<(message: unknown) => void, (message: string, channel: string) => void>
+		Map<
+			(message: unknown) => void,
+			Array<(message: string, channel: string) => void>
+		>
 	>();
 	/**
 	 * Whether closing the sockets is relay's business.
@@ -142,8 +145,12 @@ export class RedisRelayTransport implements RelayTransport {
 		// recorded: `unsubscribe` would then ask the client to remove something
 		// it may never have registered, and a retry was refused by bookkeeping
 		// for a subscription that never happened.
+		// APPENDED, not replaced. Subscribing the same callback twice registers
+		// two wrappers with the client; keeping one meant the second overwrote
+		// the only way to name the first, and an unsubscribe removed one of the
+		// two listeners it was asked about.
 		const wrappers = this.#handlers.get(channel) ?? new Map();
-		wrappers.set(handler, wrapper);
+		wrappers.set(handler, [...(wrappers.get(handler) ?? []), wrapper]);
 		this.#handlers.set(channel, wrappers);
 		// Turn a reported failure back into a rejection. A client that resolves
 		// after failing leaves the caller with no way to tell the two apart.
@@ -184,7 +191,7 @@ export class RedisRelayTransport implements RelayTransport {
 	): Promise<void> {
 		try {
 			await client.unsubscribe(channel, wrapper);
-			this.#forget(channel, handler);
+			this.#forget(channel, handler, wrapper);
 		} catch {
 			// Left recorded on purpose — see above.
 		}
@@ -214,11 +221,13 @@ export class RedisRelayTransport implements RelayTransport {
 			[(message: unknown) => void, (message: string, channel: string) => void]
 		> = [];
 		if (handler === undefined) {
-			doomed.push(...wrappers.entries());
+			for (const [owner, list] of wrappers) {
+				for (const wrapper of list) doomed.push([owner, wrapper]);
+			}
 		} else {
-			const wrapper = wrappers.get(handler);
-			if (wrapper === undefined) return;
-			doomed.push([handler, wrapper]);
+			for (const wrapper of wrappers.get(handler) ?? []) {
+				doomed.push([handler, wrapper]);
+			}
 		}
 		if (doomed.length === 0) return;
 
@@ -227,15 +236,25 @@ export class RedisRelayTransport implements RelayTransport {
 			await client.unsubscribe(channel, wrapper);
 			// One at a time, so a failure halfway through leaves the rest
 			// nameable rather than losing them all with the one that refused.
-			this.#forget(channel, owner);
+			this.#forget(channel, owner, wrapper);
 		}
 	}
 
 	/** Drop one registration without touching the client. */
-	#forget(channel: string, handler: (message: unknown) => void): void {
+	#forget(
+		channel: string,
+		handler: (message: unknown) => void,
+		wrapper?: (message: string, channel: string) => void,
+	): void {
 		const wrappers = this.#handlers.get(channel);
 		if (wrappers === undefined) return;
-		wrappers.delete(handler);
+		if (wrapper === undefined) {
+			wrappers.delete(handler);
+		} else {
+			const rest = (wrappers.get(handler) ?? []).filter((w) => w !== wrapper);
+			if (rest.length > 0) wrappers.set(handler, rest);
+			else wrappers.delete(handler);
+		}
 		if (wrappers.size === 0) this.#handlers.delete(channel);
 	}
 
@@ -249,6 +268,15 @@ export class RedisRelayTransport implements RelayTransport {
 	 * the sessions and the queues that shared it.
 	 */
 	async disconnect(): Promise<void> {
+		// Every listener THIS transport put on the bus comes off, whoever owns
+		// the connection. A borrowed one is not relay's to close — but the
+		// listeners are relay's to remove, and leaving them meant a shutdown
+		// that released nothing at all on the connection an application shares.
+		if (this.#resolved) {
+			for (const channel of [...this.#handlers.keys()]) {
+				await this.unsubscribe(channel);
+			}
+		}
 		if (!this.#ownsConnection || !this.#resolved) return;
 		// FORGOTTEN before it is closed. Left cached, the quit client was handed
 		// straight back to the next `subscribe` — so an application that stops

@@ -330,6 +330,15 @@ export class Relay {
 	 * itself started, with a live handler, on a transport nobody can reach.
 	 */
 	#teardown: Promise<void> | undefined;
+	/**
+	 * A subscription this relay could not take off the bus.
+	 *
+	 * Held as a RETRYABLE attempt rather than a settled promise: a rejection
+	 * memoised once would refuse every start for the life of the process, and
+	 * the bus recovering is exactly the case that has to work. A start clears
+	 * it or refuses.
+	 */
+	#unreleased: (() => Promise<void>) | undefined;
 	/** Keep-alive period, held until the transport actually starts. */
 	readonly #pingInterval: number | false | undefined;
 	/** Whether the endpoints are on the router — mounting twice duplicates them. */
@@ -416,17 +425,22 @@ export class Relay {
 		// keeps serving its own clients and quietly misses every message
 		// published elsewhere. Awaited by the provider, so that reaches the boot.
 		this.#transportReady = (async () => {
-			// A shutdown still releasing the bus finishes FIRST, and its FAILURE
-			// stops this start. Swallowing it and subscribing anyway left the
-			// old handler on the bus beside the new one: every message was
-			// delivered twice, and the next shutdown could only name the newer.
-			//
-			// The error is re-thrown rather than reported, because there is no
-			// safe way to continue — a relay that cannot release its previous
-			// subscription cannot know what is still listening.
-			if (teardown !== undefined) {
+			// A shutdown still releasing the bus finishes FIRST. Subscribing
+			// underneath one left the old handler beside the new: every message
+			// delivered twice, and only the newer nameable at the next
+			// shutdown. Its failure is not read here — it records an obligation
+			// below, which is what a start has to clear.
+			if (teardown !== undefined) await teardown.catch(() => {});
+
+			// A subscription nobody managed to take off the bus. RETRIED here,
+			// because the bus recovering is the case that has to work; the
+			// start refuses while it is still there, since a relay that cannot
+			// release its previous subscription cannot know what is listening.
+			const unreleased = this.#unreleased;
+			if (unreleased !== undefined) {
 				try {
-					await teardown;
+					await unreleased();
+					if (this.#unreleased === unreleased) this.#unreleased = undefined;
 				} catch (error) {
 					this.#stopTransport({ keepOutcome: true });
 					throw new Error(
@@ -459,6 +473,16 @@ export class Relay {
 				// subscription was live — so the next start subscribed a second
 				// time and every broadcast arrived twice.
 				if (this.#transportGeneration === generation) {
+					// The subscribe may have HALF succeeded: a client can
+					// register the callback and then fail, and the transport's
+					// own undo can fail too. Leave the obligation behind, so
+					// the next start has to clear it before subscribing beside
+					// something that may still be listening. A transport that
+					// already undid it finds nothing to remove, and the
+					// obligation clears on the first retry.
+					this.#unreleased = async () => {
+						await this.#transport?.unsubscribe?.(channel, handler);
+					};
 					this.#stopTransport({ keepOutcome: true });
 				}
 				throw error;
@@ -1135,7 +1159,18 @@ export class Relay {
 				// another Relay sharing the same bus, which is the shape a test
 				// harness and a multi-tenant host both take.
 				if (handler !== undefined) {
-					await transport.unsubscribe?.(this.#transportChannel, handler);
+					const channel = this.#transportChannel;
+					try {
+						await transport.unsubscribe?.(channel, handler);
+					} catch (error) {
+						// Recorded as an obligation a later start must clear.
+						// Without it the relay came back up beside a listener
+						// it had failed to remove.
+						this.#unreleased = async () => {
+							await transport.unsubscribe?.(channel, handler);
+						};
+						throw error;
+					}
 					// Forgotten only once the bus has accepted it. Cleared
 					// first, a refusal left a live handler nothing could name
 					// again — and the next shutdown, seeing none, removed
