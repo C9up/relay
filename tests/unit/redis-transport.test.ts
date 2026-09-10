@@ -52,10 +52,14 @@ function fakeRedis() {
 			}
 			return handlers.get(channel)?.size ?? 0;
 		},
-		subscribe(channel, handler) {
+		subscribe(channel, handler, options) {
 			const set = handlers.get(channel) ?? new Set();
 			set.add(handler);
 			handlers.set(channel, set);
+			// Real quasar announces the count once the channel is live, and that
+			// is the signal the transport waits on — a double that stays silent
+			// models a subscription that never completes.
+			options?.onSubscription?.(set.size);
 		},
 		unsubscribe(channel, handler) {
 			unsubscribed.push([channel, handler]);
@@ -198,7 +202,11 @@ describe("relay > redis transport", () => {
 describe("relay > a failed resolution is not kept forever", () => {
 	const fakeClient = () => ({
 		publish: async () => undefined,
-		subscribe: async () => undefined,
+		subscribe: async (
+			_channel: string,
+			_handler: (message: string, channel: string) => void,
+			options?: { onSubscription?: (count: number) => void },
+		) => options?.onSubscription?.(1),
 		unsubscribe: async () => undefined,
 	});
 

@@ -27,7 +27,10 @@ export interface RelayPubSubClient {
 		 * it was subscribed and the instance silently missed every message
 		 * published elsewhere.
 		 */
-		options?: { onError?: (error: unknown) => void },
+		options?: {
+			onSubscription?: (count: number) => void;
+			onError?: (error: unknown) => void;
+		},
 	): unknown;
 	/**
 	 * Stop listening. The HANDLER is what must be passed: a client shared with
@@ -152,22 +155,52 @@ export class RedisRelayTransport implements RelayTransport {
 		const wrappers = this.#handlers.get(channel) ?? new Map();
 		wrappers.set(handler, [...(wrappers.get(handler) ?? []), wrapper]);
 		this.#handlers.set(channel, wrappers);
-		// Turn a reported failure back into a rejection. A client that resolves
-		// after failing leaves the caller with no way to tell the two apart.
-		let reported: unknown;
 		try {
-			await client.subscribe(channel, wrapper, {
-				onError: (error) => {
-					reported = error;
-				},
+			// Waited on through the callbacks, not the call's return value:
+			// quasar reports a failure rather than rejecting, and newer versions
+			// declare `subscribe` itself `void`. This shape is correct on both.
+			await new Promise<void>((resolve, reject) => {
+				let settled = false;
+				const succeed = (): void => {
+					if (!settled) {
+						settled = true;
+						resolve();
+					}
+				};
+				const fail = (error: unknown): void => {
+					if (!settled) {
+						settled = true;
+						reject(error);
+					}
+				};
+				// A callback fired during the call itself is held until the call
+				// RETURNS, so a client that registers the handler and then throws
+				// synchronously counts as the failure it is — announcing success
+				// on the way to throwing must not win.
+				let synchronous = true;
+				let pending: (() => void) | undefined;
+				try {
+					client.subscribe(channel, wrapper, {
+						onSubscription: () => {
+							if (synchronous) pending ??= succeed;
+							else succeed();
+						},
+						onError: (error) => {
+							if (synchronous) pending = () => fail(error);
+							else fail(error);
+						},
+					});
+				} catch (error) {
+					synchronous = false;
+					fail(error);
+					return;
+				}
+				synchronous = false;
+				pending?.();
 			});
 		} catch (error) {
 			await this.#rollback(client, channel, handler, wrapper);
-			throw error;
-		}
-		if (reported !== undefined) {
-			await this.#rollback(client, channel, handler, wrapper);
-			throw reported instanceof Error ? reported : new Error(String(reported));
+			throw error instanceof Error ? error : new Error(String(error));
 		}
 	}
 
