@@ -47,8 +47,9 @@
     "typescript": "^6.0.3",
     "vitest": "4.1.11"
   },
+  "//engines": "Node 24, not 22, because AsyncLocalStorage sits on the request hot path — the container resolves through it, HttpContext is it, and the emitter reads it on every event. Node 24 backs it with AsyncContextFrame by default, and measured on that exact pattern (one context per request, six async boundaries, several reads) it costs 0.61 us per request instead of 1.55 us: 2.5x, on every request, for free. Before 24 the same mechanism existed only behind an experimental flag, and a framework cannot base its performance on a flag the application has to remember to pass. This is NOT 'track the current LTS' — security fixes still land in 22 until 2027, npm 11 is irrelevant under pnpm, and node:sqlite is not what atlas uses.",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=24.0.0"
   },
   "files": [
     "src",
