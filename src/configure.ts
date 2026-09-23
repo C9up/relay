@@ -7,6 +7,8 @@
  * installed AND working.
  */
 
+import { stubsRoot } from "./stubs.js";
+
 interface Codemods {
 	addProvider(importPath: string): Promise<void>;
 	writeFile(
@@ -14,27 +16,15 @@ interface Codemods {
 		content: string,
 		options?: { force?: boolean },
 	): Promise<void>;
+	makeUsingStub(
+		stubsRoot: string,
+		stubPath: string,
+		state?: Record<string, string | number | boolean>,
+		options?: { force?: boolean },
+	): Promise<{ path: string; contents: string }>;
 }
 
 export async function configure(codemods: Codemods): Promise<void> {
 	await codemods.addProvider("@c9up/relay/provider");
-	await codemods.writeFile(
-		"config/relay.ts",
-		`import { defineConfig, transports } from '@c9up/relay'
-
-export default defineConfig({
-  // Let a client subscribe to a channel no authorizer covers. Leave false:
-  // an authorizer is what decides who may listen.
-  allowUnauthorizedChannels: false,
-
-  // Milliseconds between keep-alive frames, or false for none. A stream that
-  // carries no traffic is one a proxy closes: nginx gives an idle upstream
-  // sixty seconds by default.
-  pingInterval: 30_000,
-
-  // Without a transport, a broadcast reaches the SSE clients of the instance
-  // that made it and no further. Uncomment as soon as there are two.
-  // transport: { driver: transports.redis({ connection: 'main' }) },
-})`,
-	);
+	await codemods.makeUsingStub(stubsRoot, "config/relay.stub");
 }
