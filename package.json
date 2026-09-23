@@ -41,7 +41,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.12",
-    "@c9up/ream": "^0.2.26",
+    "@c9up/ream": "^0.2.25",
     "@types/node": "^22.20.1",
     "@vitest/coverage-v8": "4.1.11",
     "typescript": "^6.0.3",
