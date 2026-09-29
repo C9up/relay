@@ -188,7 +188,7 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 			// would reach the client as a half-open connection instead.
 			ctx.response.status(400).json({
 				error: {
-					code: "E_UNKNOWN_CONNECTION",
+					code: "E_RELAY_UNKNOWN_CONNECTION",
 					message: "Unknown or missing connection id — call /negotiate first.",
 				},
 			});
@@ -198,7 +198,7 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		if (!mayActAs(hub.authFor(clientId), ctx)) {
 			ctx.response.status(403).json({
 				error: {
-					code: "E_NOT_OWNER",
+					code: "E_RELAY_NOT_OWNER",
 					message: "This connection belongs to another user.",
 				},
 			});
@@ -209,7 +209,7 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		if (previous === undefined && streams.size >= adapter.maxConnections) {
 			ctx.response.status(503).json({
 				error: {
-					code: "E_MAX_CONNECTIONS",
+					code: "E_RELAY_MAX_CONNECTIONS",
 					message: "Too many open connections — try again later.",
 				},
 			});
@@ -283,7 +283,7 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		if (clientId === undefined) {
 			ctx.response.status(400).json({
 				error: {
-					code: "E_UNKNOWN_CONNECTION",
+					code: "E_RELAY_UNKNOWN_CONNECTION",
 					message: "Unknown or missing connection id — call /negotiate first.",
 				},
 			});
@@ -293,7 +293,7 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		if (!mayActAs(hub.authFor(clientId), ctx)) {
 			ctx.response.status(403).json({
 				error: {
-					code: "E_NOT_OWNER",
+					code: "E_RELAY_NOT_OWNER",
 					message: "This connection belongs to another user.",
 				},
 			});

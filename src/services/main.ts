@@ -28,7 +28,7 @@ let instanceIsLazyDefault = false;
  * new one. The Proxy below builds a default on first access, so an
  * `authorize()` that ran before the provider bound its own instance was
  * recorded on an object nothing ever served from — and the channel answered
- * `E_CHANNEL_NO_AUTHORIZER`, with both calls reading identically at the call
+ * `E_RELAY_CHANNEL_NO_AUTHORIZER`, with both calls reading identically at the call
  * site.
  */
 export function setRelay(value: Relay): void {

@@ -577,7 +577,7 @@ export class Relay {
 	 * When the provider then binds its own — configured one — the default is
 	 * left holding whatever had already been registered on it: an `authorize()`
 	 * from a preload went to an object nothing served from, and the channel
-	 * answered `E_CHANNEL_NO_AUTHORIZER` at request time. Silently, because
+	 * answered `E_RELAY_CHANNEL_NO_AUTHORIZER` at request time. Silently, because
 	 * both calls read as `relay.authorize(...)` at the call site.
 	 *
 	 * Registrations move; connections do not. Nothing has connected before the
@@ -976,11 +976,11 @@ export class Relay {
 			return { ok: false, status: 400, code: "E_RELAY_BAD_REQUEST" };
 		}
 		if (channel.length > 256) {
-			return { ok: false, status: 400, code: "E_CHANNEL_TOO_LONG" };
+			return { ok: false, status: 400, code: "E_RELAY_CHANNEL_TOO_LONG" };
 		}
 		const client = this.#clients.get(uid);
 		if (!client) {
-			return { ok: false, status: 400, code: "E_NOT_CONNECTED" };
+			return { ok: false, status: 400, code: "E_RELAY_NOT_CONNECTED" };
 		}
 		// Ownership: reject subscribe attempts from a request whose auth
 		// identity doesn't match the identity recorded at connect-time.
@@ -998,7 +998,7 @@ export class Relay {
 			return { ok: true };
 		}
 		if (client.channels.size >= this.#config.maxChannelsPerClient) {
-			return { ok: false, status: 429, code: "E_MAX_CHANNELS" };
+			return { ok: false, status: 429, code: "E_RELAY_MAX_CHANNELS" };
 		}
 		const match = this.#findAuthorizer(channel);
 		if (match) {
@@ -1006,13 +1006,13 @@ export class Relay {
 			try {
 				allowed = await match.authorize(ctx, match.params);
 			} catch {
-				return { ok: false, status: 403, code: "E_CHANNEL_FORBIDDEN" };
+				return { ok: false, status: 403, code: "E_RELAY_CHANNEL_FORBIDDEN" };
 			}
 			if (!allowed) {
-				return { ok: false, status: 403, code: "E_CHANNEL_FORBIDDEN" };
+				return { ok: false, status: 403, code: "E_RELAY_CHANNEL_FORBIDDEN" };
 			}
 		} else if (!this.#config.allowUnauthorizedChannels) {
-			return { ok: false, status: 403, code: "E_CHANNEL_NO_AUTHORIZER" };
+			return { ok: false, status: 403, code: "E_RELAY_CHANNEL_NO_AUTHORIZER" };
 		}
 		// An authorizer may await — a database lookup is the usual one — and the
 		// socket can close in that window. Writing the subscription then put the
@@ -1025,14 +1025,14 @@ export class Relay {
 		// ghost attached the old subscription to the NEW connection, which had
 		// never asked for that channel and was never checked for it.
 		if (this.#clients.get(uid) !== client) {
-			return { ok: false, status: 400, code: "E_NOT_CONNECTED" };
+			return { ok: false, status: 400, code: "E_RELAY_NOT_CONNECTED" };
 		}
 		// Checked again after the await: the check above ran before it, and
 		// concurrent subscriptions all passed it while their authorizers were
 		// pending — a cap of one let three through.
 		if (client.channels.has(channel)) return { ok: true };
 		if (client.channels.size >= this.#config.maxChannelsPerClient) {
-			return { ok: false, status: 429, code: "E_MAX_CHANNELS" };
+			return { ok: false, status: 429, code: "E_RELAY_MAX_CHANNELS" };
 		}
 		client.channels.add(channel);
 		this.#indexAdd(channel, uid);
@@ -1224,7 +1224,7 @@ export class Relay {
 			? ctx.auth.user?.id
 			: undefined;
 		if (requesterUserId !== connectedUserId) {
-			return { ok: false, status: 403, code: "E_NOT_OWNER" };
+			return { ok: false, status: 403, code: "E_RELAY_NOT_OWNER" };
 		}
 		return null;
 	}

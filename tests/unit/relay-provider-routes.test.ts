@@ -225,7 +225,7 @@ describe("relay > provider > the routes", () => {
 		// documented as unreachable in tests, and as losing the frame to a
 		// registry race that has since been fixed.
 		expect(capped.frames).toEqual([
-			{ event: "error", data: { code: "E_MAX_CLIENTS" } },
+			{ event: "error", data: { code: "E_RELAY_MAX_CLIENTS" } },
 		]);
 		expect(capped.sseEnded).toBe(true);
 	});

@@ -6,7 +6,7 @@
  * surface. The provider then builds its own — configured — instance and takes
  * the slot. Anything already registered on the default was left behind on an
  * object nothing served from, and the channel answered
- * `E_CHANNEL_NO_AUTHORIZER` at request time even though the application had
+ * `E_RELAY_CHANNEL_NO_AUTHORIZER` at request time even though the application had
  * written the authorizer: both calls read as `relay.authorize(...)`.
  *
  * The whole module graph is re-imported per test. The slot has to be genuinely
@@ -103,7 +103,7 @@ describe("relay > registrations made before the provider bound its instance", ()
 				"users/2/notifications",
 				authed("2"),
 			),
-		).toMatchObject({ code: "E_CHANNEL_FORBIDDEN" });
+		).toMatchObject({ code: "E_RELAY_CHANNEL_FORBIDDEN" });
 	});
 
 	it("keeps a hub mounted through the accessor", async () => {
@@ -174,6 +174,6 @@ describe("relay > registrations made before the provider bound its instance", ()
 
 		expect(
 			await instance.subscribe(connected(instance, "4"), "shared", authed("4")),
-		).toMatchObject({ code: "E_CHANNEL_FORBIDDEN" });
+		).toMatchObject({ code: "E_RELAY_CHANNEL_FORBIDDEN" });
 	});
 });

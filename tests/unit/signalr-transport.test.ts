@@ -261,7 +261,7 @@ describe("relay > SignalR transport ownership", () => {
 		expect(attacker.code).toBe(403);
 		expect(attacker.body).toEqual({
 			error: {
-				code: "E_NOT_OWNER",
+				code: "E_RELAY_NOT_OWNER",
 				message: "This connection belongs to another user.",
 			},
 		});

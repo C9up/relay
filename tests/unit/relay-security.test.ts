@@ -108,7 +108,7 @@ describe("relay-security > subscribe() ownership", () => {
 		expect(attackerResult).toEqual({
 			ok: false,
 			status: 403,
-			code: "E_NOT_OWNER",
+			code: "E_RELAY_NOT_OWNER",
 		});
 		// Even an unauthenticated attacker is rejected.
 		const anonResult = await r.subscribe(victim.uid, "private/feed", {
@@ -117,7 +117,7 @@ describe("relay-security > subscribe() ownership", () => {
 		expect(anonResult).toEqual({
 			ok: false,
 			status: 403,
-			code: "E_NOT_OWNER",
+			code: "E_RELAY_NOT_OWNER",
 		});
 	});
 
@@ -141,7 +141,7 @@ describe("relay-security > subscribe() ownership", () => {
 		if (anon.outcome !== "ok") throw new Error("unreachable");
 		// Without an auth identity at connect-time, the server-issued
 		// random uid IS the proof of ownership. A requester who has it can
-		// subscribe; one who doesn't can't (E_NOT_CONNECTED).
+		// subscribe; one who doesn't can't (E_RELAY_NOT_CONNECTED).
 		const result = await r.subscribe(anon.uid, "public/feed", {
 			auth: { isAuthenticated: false },
 		});
@@ -175,7 +175,7 @@ describe("relay-security > subscribe() ownership", () => {
 		expect(overQuota).toEqual({
 			ok: false,
 			status: 429,
-			code: "E_MAX_CHANNELS",
+			code: "E_RELAY_MAX_CHANNELS",
 		});
 	});
 });
@@ -282,7 +282,7 @@ describe("relay-security > a subscription outliving its client", () => {
 		expect(await pending).toEqual({
 			ok: false,
 			status: 400,
-			code: "E_NOT_CONNECTED",
+			code: "E_RELAY_NOT_CONNECTED",
 		});
 		// The entry that used to stay for the life of the process: counted by
 		// channelSubscribers, returned by getSubscribersFor, walked on every

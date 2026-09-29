@@ -270,7 +270,7 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 			// The frame does arrive: the stream registry keeps a closed
 			// entry until its receiver has been taken, so a send followed
 			// immediately by an end no longer loses the body.
-			await sse.send("error", { code: "E_MAX_CLIENTS" });
+			await sse.send("error", { code: "E_RELAY_MAX_CLIENTS" });
 			await sse.end();
 		}
 		// outcome === 'ok' → the canonical uid is already shipped to the
@@ -307,7 +307,7 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 		);
 		if (r === "forbidden") {
 			ctx.response.status(403).json({
-				error: { code: "E_NOT_OWNER", message: "E_NOT_OWNER" },
+				error: { code: "E_RELAY_NOT_OWNER", message: "E_RELAY_NOT_OWNER" },
 			});
 			return;
 		}
