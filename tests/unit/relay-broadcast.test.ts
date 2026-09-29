@@ -47,7 +47,7 @@ async function connectAndSubscribe(
 	channel: string,
 ): Promise<{ sse: ReturnType<typeof fakeSse>; uid: string }> {
 	const sse = fakeSse(`s-${userId}`);
-	const outcome = r.connect(undefined, sse, {
+	const outcome = r.connect(sse, {
 		auth: { isAuthenticated: true, user: { id: userId } },
 	});
 	if (outcome.outcome !== "ok") throw new Error("connect failed");
@@ -113,6 +113,8 @@ describe("relay-broadcast > multi-instance transport sync", () => {
 			type: "broadcast",
 			channel: "news",
 			payload: { headline: "hi" },
+			// This relay's id, so it can skip its own publication.
+			origin: expect.any(String),
 		});
 	});
 
@@ -325,7 +327,7 @@ describe("relay > rejections that used to escape", () => {
 		};
 
 		const { rejections, written } = await watch(async () => {
-			const outcome = r.connect(undefined, sse, {
+			const outcome = r.connect(sse, {
 				auth: { isAuthenticated: true, user: { id: "u" } },
 			});
 			expect(outcome.outcome).toBe("ok");
@@ -399,7 +401,7 @@ describe("relay > keep-alive", () => {
 			await r.startTransport();
 			const { sse } = await connectAndSubscribe(r, "u1", "feed");
 			const idle = fakeSse("idle");
-			r.connect(undefined, idle, {});
+			r.connect(idle, {});
 			idle.sent.length = 0;
 
 			await vi.advanceTimersByTimeAsync(3_000);
@@ -470,7 +472,12 @@ describe("relay > broadcast payloads", () => {
 		expect(sse.sent).toEqual([{ event: "feed", data: null }]);
 		expect(seen).toEqual([null]);
 		expect(published).toEqual([
-			{ type: "broadcast", channel: "feed", payload: null },
+			{
+				type: "broadcast",
+				channel: "feed",
+				payload: null,
+				origin: expect.any(String),
+			},
 		]);
 	});
 });

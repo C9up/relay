@@ -79,7 +79,7 @@ const sink = () =>
 
 /** Connect `id` and hand back the uid the relay issued — `subscribe` needs one. */
 function connected(instance: RelayType, id: string): string {
-	const outcome = instance.connect(id, sink(), { auth: authed(id).auth });
+	const outcome = instance.connect(sink(), { auth: authed(id).auth });
 	if (outcome.outcome !== "ok") throw new Error(`connect: ${outcome.outcome}`);
 	return outcome.uid;
 }

@@ -40,7 +40,7 @@ async function subscribedClient(
 ): Promise<ReturnType<typeof fakeSse>> {
 	const sse = fakeSse();
 	const auth = { isAuthenticated: true, user: { id: "u1" } };
-	const outcome = relay.connect(undefined, sse, { auth });
+	const outcome = relay.connect(sse, { auth });
 	if (outcome.outcome !== "ok") throw new Error("connect failed");
 	const sub = await relay.subscribe(outcome.uid, channel, { auth });
 	if (!sub.ok) throw new Error("subscribe failed");

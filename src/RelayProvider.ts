@@ -157,9 +157,7 @@ export default class RelayProvider {
 }
 
 interface ReamRequest {
-	header(name: string): string | undefined;
 	body(): Promise<unknown> | unknown;
-	qs?(): Record<string, unknown>;
 	// Declared because the hub routes read them, and ream's Request has both.
 	// Leaving them out is what made this context fail to satisfy HubHttpContext,
 	// and the caller reach for a double cast rather than describe the object it
@@ -262,45 +260,8 @@ function isAdapter(value: object): value is SignalRAdapter {
 
 function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 	const events = router.get("/__relay/events", async (ctx) => {
-		// The query `uid` is only a HINT now — the relay derives the
-		// canonical uid from `ctx.auth` (or generates one for anonymous
-		// clients). Forwarding the hint lets us 403 when an authenticated
-		// client tries to claim someone else's id; absent or matching hint
-		// proceeds normally. The hint is NEVER trusted as the connection
-		// identity — see Relay.connect() docs.
-		const uidHint = readQueryParam(ctx.request, "uid");
-
-		// Pre-flight uid-hint check BEFORE upgrading to SSE.
-		//
-		// A hint that claims someone else is a pure auth-vs-claim
-		// comparison, so it is answered with a real 403 rather than a 200
-		// stream carrying an error frame. That distinction is what a client
-		// can act on: an EventSource sees a successful connection either
-		// way, and only the status code tells a fetch caller that the
-		// request was refused.
-		//
-		// The `capped` case cannot be answered this early — the slot count
-		// is instance state that `relay.connect` owns — so it is handled
-		// below on the open stream.
-		const authUserId = ctx.auth?.isAuthenticated
-			? ctx.auth.user?.id
-			: undefined;
-		if (
-			uidHint !== undefined &&
-			authUserId !== undefined &&
-			uidHint !== authUserId
-		) {
-			ctx.response.status(403).json({
-				error: {
-					code: "E_UID_HIJACK",
-					message: "uid hint does not match authenticated user",
-				},
-			});
-			return;
-		}
-
 		const sse = await ctx.response.sse();
-		const outcome = relay.connect(uidHint, sse, { auth: ctx.auth });
+		const outcome = relay.connect(sse, ctx);
 		if (outcome.outcome === "capped") {
 			// Cap reached. The SSE writer is already open — send an error
 			// frame and close cleanly so the client sees a structured
@@ -311,17 +272,6 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 			// immediately by an end no longer loses the body.
 			await sse.send("error", { code: "E_MAX_CLIENTS" });
 			await sse.end();
-		} else if (outcome.outcome === "forbidden") {
-			// The pre-flight above catches the hint-mismatch case before
-			// we upgrade to SSE, so this branch is now effectively dead —
-			// kept defensively in case `relay.connect` grows additional
-			// `forbidden` predicates that don't depend on the uid hint
-			// alone.
-			await sse.send("error", {
-				code: "E_UID_HIJACK",
-				message: outcome.reason,
-			});
-			await sse.end();
 		}
 		// outcome === 'ok' → the canonical uid is already shipped to the
 		// client via the `connected` SSE frame inside Relay.connect.
@@ -330,12 +280,13 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 
 	const subscribe = router.post("/__relay/subscribe", async (ctx) => {
 		const body = await ctx.request.body();
+		// The whole context, as Transmit hands its authorizers the HttpContext:
+		// an authorizer checks `ctx.bouncer`, the tenant, whatever a
+		// middleware put there — `{ auth }` alone refused those with a 403.
 		const result = await relay.subscribe(
 			field(body, "uid"),
 			field(body, "channel"),
-			{
-				auth: ctx.auth,
-			},
+			ctx,
 		);
 		if (!result.ok) {
 			ctx.response.status(result.status).json({
@@ -349,9 +300,11 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 
 	const unsubscribe = router.post("/__relay/unsubscribe", async (ctx) => {
 		const body = await ctx.request.body();
-		const r = relay.unsubscribe(field(body, "uid"), field(body, "channel"), {
-			auth: ctx.auth,
-		});
+		const r = relay.unsubscribe(
+			field(body, "uid"),
+			field(body, "channel"),
+			ctx,
+		);
 		if (r === "forbidden") {
 			ctx.response.status(403).json({
 				error: { code: "E_NOT_OWNER", message: "E_NOT_OWNER" },
@@ -375,14 +328,4 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 function field(body: unknown, name: string): unknown {
 	if (typeof body !== "object" || body === null) return undefined;
 	return Reflect.get(body, name);
-}
-
-function readQueryParam(
-	request: ReamRequest,
-	name: string,
-): string | undefined {
-	const qs = request.qs?.();
-	if (!qs) return undefined;
-	const v = qs[name];
-	return typeof v === "string" ? v : undefined;
 }

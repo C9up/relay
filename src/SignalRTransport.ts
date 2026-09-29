@@ -37,7 +37,11 @@ export interface HubSseStream {
 /** The slice of the host request/response a hub route reads. */
 export interface HubHttpContext {
 	request: {
-		url(): string;
+		/**
+		 * The request URL. Ream leaves the query string out unless asked
+		 * (`url(true)`), and the connection token is in the query string.
+		 */
+		url(includeQueryString?: boolean): string;
 		raw(): string;
 	};
 	response: {
@@ -47,7 +51,8 @@ export interface HubHttpContext {
 	};
 	auth?: {
 		isAuthenticated?: boolean;
-		strategy?: string;
+		/** The guard that authenticated the request (Warden's Authenticator). */
+		authenticatedViaGuard?: string;
 		user?: Record<string, unknown>;
 		roles?: string[];
 		permissions?: string[];
@@ -95,7 +100,8 @@ function hubAuth(ctx: HubHttpContext): {
 } {
 	return {
 		isAuthenticated: ctx.auth?.isAuthenticated === true,
-		strategy: ctx.auth?.strategy,
+		// The hub's guard check compares its `guards` with this.
+		strategy: ctx.auth?.authenticatedViaGuard,
 		user: ctx.auth?.user,
 		roles: ctx.auth?.roles,
 		permissions: ctx.auth?.permissions,
@@ -161,6 +167,12 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 	const { path, hub, adapter } = mounted;
 	/** Live streams by connectionId, so an upstream POST can answer downstream. */
 	const streams = new Map<string, HubSseStream>();
+	/**
+	 * Hub contexts of streams whose handshake is still pending: `onConnect`
+	 * runs once the handshake is answered, never before — a frame sent ahead of
+	 * the handshake reply makes the SignalR client refuse the connection.
+	 */
+	const awaitingHandshake = new Map<string, HubContext>();
 
 	const negotiate = router.post(`${path}/negotiate`, async (ctx) => {
 		// The connectionId is the hub's client id; the token is what the client
@@ -169,7 +181,7 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 	});
 
 	const stream = router.get(path, async (ctx) => {
-		const token = readConnectionToken(ctx.request.url());
+		const token = readConnectionToken(ctx.request.url(true));
 		const clientId = token ? adapter.resolveToken(token) : undefined;
 		if (clientId === undefined) {
 			// Answered BEFORE opening a stream: a 400 written after the upgrade
@@ -193,11 +205,37 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 			return;
 		}
 
+		const previous = streams.get(clientId);
+		if (previous === undefined && streams.size >= adapter.maxConnections) {
+			ctx.response.status(503).json({
+				error: {
+					code: "E_MAX_CONNECTIONS",
+					message: "Too many open connections — try again later.",
+				},
+			});
+			return;
+		}
+
 		const sse = await ctx.response.sse();
 		// The token is in use now, so it stops counting against the unclaimed
 		// budget and stops expiring.
 		if (token !== undefined) adapter.claimToken(token);
 		streams.set(clientId, sse);
+		// The same token opened again: the older stream would stay open and
+		// unused. Its close is ignored below, since it is no longer the one
+		// registered.
+		if (previous?.isOpen()) void previous.end().catch(() => {});
+		// A stream that never completes the handshake is closed: its token no
+		// longer expires, so nothing else would ever end it.
+		const handshakeTimer = setTimeout(() => {
+			if (
+				!adapter.hasCompletedHandshake(clientId) &&
+				streams.get(clientId) === sse
+			) {
+				void sse.end().catch(() => {});
+			}
+		}, adapter.handshakeTimeoutMs);
+		handshakeTimer.unref?.();
 		// An SSE event with NO name arrives as `onmessage`, which is where the
 		// SignalR client reads its frames.
 		const send = (event: string, data: unknown): void => {
@@ -221,6 +259,7 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 			send,
 		});
 		sse.onClose(() => {
+			clearTimeout(handshakeTimer);
 			// Identity-guarded: a client id can carry a second stream — a
 			// reconnect that opens before the old socket has finished closing —
 			// and the old one's close must not tear down the live connection that
@@ -229,16 +268,17 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 			// was open and could no longer receive anything.
 			if (streams.get(clientId) !== sse) return;
 			streams.delete(clientId);
+			awaitingHandshake.delete(clientId);
 			// `removeClient` fires `onDisconnect` itself — calling it here too
 			// would deliver every disconnect twice.
 			hub.removeClient(clientId);
 			adapter.forget(clientId);
 		});
-		await hub.onConnect(context);
+		awaitingHandshake.set(clientId, context);
 	});
 
 	const send = router.post(path, async (ctx) => {
-		const token = readConnectionToken(ctx.request.url());
+		const token = readConnectionToken(ctx.request.url(true));
 		const clientId = token ? adapter.resolveToken(token) : undefined;
 		if (clientId === undefined) {
 			ctx.response.status(400).json({
@@ -274,6 +314,12 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 				// opens the stream first, and buffering for a connection that may
 				// never arrive is how a hub leaks memory.
 				if (sse?.isOpen()) await sse.send("", out);
+			}
+			// The handshake reply is out: the hub may speak now.
+			const pending = awaitingHandshake.get(clientId);
+			if (pending !== undefined && adapter.hasCompletedHandshake(clientId)) {
+				awaitingHandshake.delete(clientId);
+				await hub.onConnect(pending);
 			}
 			if (clientClosed || SignalRAdapter.containsClose(outbound)) {
 				await sse?.end();

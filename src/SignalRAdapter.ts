@@ -21,7 +21,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { Hub } from "./Hub.js";
+import type { DispatchResult, Hub } from "./Hub.js";
 
 /** SignalR record separator — every JSON message ends with this byte. */
 const RS = "\x1e";
@@ -40,6 +40,9 @@ const DEFAULT_MAX_FRAME_SIZE = 65_536;
  */
 const DEFAULT_TOKEN_TTL_MS = 30_000;
 const DEFAULT_MAX_PENDING_TOKENS = 1_024;
+/** The SignalR client's own default handshake timeout. */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
+const DEFAULT_MAX_CONNECTIONS = 10_000;
 
 /** A token handed out by `negotiate`, before or after its stream attaches. */
 interface IssuedToken {
@@ -139,6 +142,8 @@ export class SignalRAdapter {
 	#maxFrameSize: number;
 	#tokenTtlMs: number;
 	#maxPendingTokens: number;
+	readonly #handshakeTimeoutMs: number;
+	readonly #maxConnections: number;
 
 	constructor(
 		hub: Hub,
@@ -148,6 +153,14 @@ export class SignalRAdapter {
 			tokenTtlMs?: number;
 			/** How many unclaimed tokens may wait at once. */
 			maxPendingTokens?: number;
+			/**
+			 * Milliseconds an opened stream has to complete the handshake before
+			 * it is closed. A claimed token no longer expires, so without this a
+			 * client could hold streams open that never speak.
+			 */
+			handshakeTimeoutMs?: number;
+			/** How many streams may be open at once; a new one past it gets 503. */
+			maxConnections?: number;
 		},
 	) {
 		this.#hub = hub;
@@ -155,6 +168,24 @@ export class SignalRAdapter {
 		this.#tokenTtlMs = options?.tokenTtlMs ?? DEFAULT_TOKEN_TTL_MS;
 		this.#maxPendingTokens =
 			options?.maxPendingTokens ?? DEFAULT_MAX_PENDING_TOKENS;
+		this.#handshakeTimeoutMs =
+			options?.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+		this.#maxConnections = options?.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
+	}
+
+	/** Milliseconds an opened stream has to complete the handshake. */
+	get handshakeTimeoutMs(): number {
+		return this.#handshakeTimeoutMs;
+	}
+
+	/** How many streams may be open at once. */
+	get maxConnections(): number {
+		return this.#maxConnections;
+	}
+
+	/** Whether `clientId` has completed the handshake. */
+	hasCompletedHandshake(clientId: string): boolean {
+		return this.#handshakes.has(clientId);
 	}
 
 	/**
@@ -318,27 +349,28 @@ export class SignalRAdapter {
 						break;
 					}
 					const inv = msg;
-					let ok = false;
+					let dispatched: DispatchResult = { ok: false };
 					try {
-						ok = await this.#hub.dispatch(
+						dispatched = await this.#hub.dispatch(
 							clientId,
 							inv.target,
 							...(inv.arguments ?? []),
 						);
 					} catch {
-						// dispatch() reports failures via its boolean return; guard
-						// against an unexpected throw so one bad invocation can't
-						// abort the whole frame batch.
-						ok = false;
+						// dispatch() reports failures via its return; guard against an
+						// unexpected throw so one bad invocation can't abort the whole
+						// frame batch.
 					}
 					// Only a request-style invocation (with an invocationId) expects
 					// a Completion. A failed handler MUST answer with an error
 					// Completion, not a success one — else the client's invoke()
 					// promise resolves as if the call succeeded.
+					// A success carries the handler's return value: that is what the
+					// client's `invoke()` resolves with.
 					if (inv.invocationId) {
 						out.push(
-							ok
-								? this.#encodeCompletion(inv.invocationId)
+							dispatched.ok
+								? this.#encodeCompletion(inv.invocationId, dispatched.result)
 								: this.#encodeCompletion(
 										inv.invocationId,
 										undefined,

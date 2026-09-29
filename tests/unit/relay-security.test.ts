@@ -7,9 +7,8 @@
  * private channels, or disconnect the legit client.
  *
  * Post-fix:
- *   - connect() derives uid from ctx.auth.user.id when authenticated;
- *     server-issues a randomUUID for anonymous clients; rejects hint
- *     mismatches with 'forbidden'.
+ *   - connect() server-issues a randomUUID for every connection; the
+ *     client never picks it, and one user's tabs each get their own.
  *   - subscribe()/unsubscribe() verify the requester's auth identity
  *     matches the identity recorded at connect-time (when the client
  *     was authenticated). Anonymous clients use uid-as-secret.
@@ -38,102 +37,58 @@ function fakeSse(id = `s_${Math.random()}`): RelaySseStream {
 }
 
 describe("relay-security > connect() identity binding", () => {
-	it("forces uid = ctx.auth.user.id when authenticated, ignores hint when omitted", () => {
+	const UUID =
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+	it("issues a server uid for every connection, authenticated or not", () => {
 		const r = new Relay();
-		const outcome = r.connect(undefined, fakeSse(), {
+		const authed = r.connect(fakeSse(), {
 			auth: { isAuthenticated: true, user: { id: "user-42" } },
 		});
-		expect(outcome).toEqual({ outcome: "ok", uid: "user-42" });
-	});
-
-	it("accepts a matching hint and uses the auth-derived uid", () => {
-		const r = new Relay();
-		const outcome = r.connect("user-42", fakeSse(), {
-			auth: { isAuthenticated: true, user: { id: "user-42" } },
-		});
-		expect(outcome).toEqual({ outcome: "ok", uid: "user-42" });
-	});
-
-	it("REJECTS a mismatched hint — authenticated client cannot claim another id", () => {
-		const r = new Relay();
-		const outcome = r.connect("user-other", fakeSse(), {
-			auth: { isAuthenticated: true, user: { id: "user-42" } },
-		});
-		expect(outcome.outcome).toBe("forbidden");
-	});
-
-	it("server-issues a randomUUID for anonymous clients, ignoring the hint", () => {
-		const r = new Relay();
-		const outcome = r.connect("attacker-picked-uid", fakeSse(), {
+		const anonymous = r.connect(fakeSse(), {
 			auth: { isAuthenticated: false },
 		});
-		expect(outcome.outcome).toBe("ok");
-		// outcome is narrowed to the 'ok' branch
-		if (outcome.outcome !== "ok") throw new Error("unreachable");
-		expect(outcome.uid).not.toBe("attacker-picked-uid");
-		// UUID v4 shape (8-4-4-4-12 hex segments).
-		expect(outcome.uid).toMatch(
-			/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
-		);
-	});
-
-	it("issues distinct uids across two anonymous connects (no collision/hint reuse)", () => {
-		const r = new Relay();
-		const a = r.connect(undefined, fakeSse(), {
-			auth: { isAuthenticated: false },
-		});
-		const b = r.connect(undefined, fakeSse(), {
-			auth: { isAuthenticated: false },
-		});
-		if (a.outcome !== "ok" || b.outcome !== "ok")
+		if (authed.outcome !== "ok" || anonymous.outcome !== "ok") {
 			throw new Error("unreachable");
-		expect(a.uid).not.toBe(b.uid);
+		}
+		// Never the user id: that made every tab of one account the same uid.
+		expect(authed.uid).not.toBe("user-42");
+		expect(authed.uid).toMatch(UUID);
+		expect(anonymous.uid).toMatch(UUID);
+		expect(authed.uid).not.toBe(anonymous.uid);
 	});
 
-	it("returns 'capped' when the maxClients ceiling is reached by a NEW uid", () => {
+	it("keeps two tabs of the same user open side by side", () => {
+		const r = new Relay();
+		const first = fakeSse("first");
+		const second = fakeSse("second");
+		const auth = { isAuthenticated: true, user: { id: "u1" } };
+		r.connect(first, { auth });
+		r.connect(second, { auth });
+		expect(first.isOpen()).toBe(true);
+		expect(second.isOpen()).toBe(true);
+		expect(r.clientCount()).toBe(2);
+	});
+
+	it("returns 'capped' once maxClients connections are open", () => {
 		const r = new Relay({ maxClients: 1 });
-		const first = r.connect(undefined, fakeSse(), {
-			auth: { isAuthenticated: true, user: { id: "u1" } },
+		expect(
+			r.connect(fakeSse(), { auth: { isAuthenticated: false } }).outcome,
+		).toBe("ok");
+		expect(r.connect(fakeSse(), { auth: { isAuthenticated: false } })).toEqual({
+			outcome: "capped",
 		});
-		expect(first.outcome).toBe("ok");
-		const second = r.connect(undefined, fakeSse(), {
-			auth: { isAuthenticated: true, user: { id: "u2" } },
-		});
-		expect(second).toEqual({ outcome: "capped" });
 	});
 
-	it("reconnect by the SAME uid at full capacity replaces the prior writer (not 'capped')", () => {
+	it("frees the slot when a connection closes", async () => {
 		const r = new Relay({ maxClients: 1 });
-		const first = r.connect(undefined, fakeSse("s-first"), {
-			auth: { isAuthenticated: true, user: { id: "u1" } },
-		});
-		expect(first).toEqual({ outcome: "ok", uid: "u1" });
-		// User refresh / network reconnect: same uid, cap is full BUT the slot
-		// is already this user's — must not 503.
-		const reconnect = r.connect(undefined, fakeSse("s-second"), {
-			auth: { isAuthenticated: true, user: { id: "u1" } },
-		});
-		expect(reconnect).toEqual({ outcome: "ok", uid: "u1" });
-		expect(r.clientCount()).toBe(1);
-	});
-
-	// Audit 2026-06-13: reconnect dropped the prior client from #clients but never
-	// end()-ed its stream → an orphaned writer leaked per refresh. It must be
-	// closed, and the stale onClose must NOT drop the new client (count stays 1).
-	it("ends the prior SSE stream on reconnect and keeps the new one", () => {
-		const r = new Relay({ maxClients: 5 });
-		const oldSse = fakeSse("s-old");
-		r.connect(undefined, oldSse, {
-			auth: { isAuthenticated: true, user: { id: "u1" } },
-		});
-		expect(oldSse.isOpen()).toBe(true);
-		const newSse = fakeSse("s-new");
-		r.connect(undefined, newSse, {
-			auth: { isAuthenticated: true, user: { id: "u1" } },
-		});
-		expect(oldSse.isOpen()).toBe(false); // orphaned stream closed (no leak)
-		expect(newSse.isOpen()).toBe(true); // new stream survives the stale onClose
-		expect(r.clientCount()).toBe(1);
+		const sse = fakeSse();
+		r.connect(sse, { auth: { isAuthenticated: false } });
+		await sse.end();
+		expect(r.clientCount()).toBe(0);
+		expect(
+			r.connect(fakeSse(), { auth: { isAuthenticated: false } }).outcome,
+		).toBe("ok");
 	});
 });
 
@@ -141,7 +96,7 @@ describe("relay-security > subscribe() ownership", () => {
 	it("rejects subscribe from a request whose auth doesn't match the connected client", async () => {
 		const r = new Relay({ allowUnauthorizedChannels: true });
 		// Victim connects authenticated as user-42.
-		const victim = r.connect(undefined, fakeSse(), {
+		const victim = r.connect(fakeSse(), {
 			auth: { isAuthenticated: true, user: { id: "user-42" } },
 		});
 		if (victim.outcome !== "ok") throw new Error("unreachable");
@@ -168,7 +123,7 @@ describe("relay-security > subscribe() ownership", () => {
 
 	it("accepts subscribe from the SAME authenticated identity as the connect", async () => {
 		const r = new Relay({ allowUnauthorizedChannels: true });
-		const owner = r.connect(undefined, fakeSse(), {
+		const owner = r.connect(fakeSse(), {
 			auth: { isAuthenticated: true, user: { id: "user-42" } },
 		});
 		if (owner.outcome !== "ok") throw new Error("unreachable");
@@ -180,7 +135,7 @@ describe("relay-security > subscribe() ownership", () => {
 
 	it("accepts subscribe on an anonymous client — uid is the only secret (uid-as-bearer)", async () => {
 		const r = new Relay({ allowUnauthorizedChannels: true });
-		const anon = r.connect(undefined, fakeSse(), {
+		const anon = r.connect(fakeSse(), {
 			auth: { isAuthenticated: false },
 		});
 		if (anon.outcome !== "ok") throw new Error("unreachable");
@@ -198,7 +153,7 @@ describe("relay-security > subscribe() ownership", () => {
 			allowUnauthorizedChannels: true,
 			maxChannelsPerClient: 1,
 		});
-		const owner = r.connect(undefined, fakeSse(), {
+		const owner = r.connect(fakeSse(), {
 			auth: { isAuthenticated: true, user: { id: "u1" } },
 		});
 		if (owner.outcome !== "ok") throw new Error("unreachable");
@@ -228,7 +183,7 @@ describe("relay-security > subscribe() ownership", () => {
 describe("relay-security > unsubscribe() ownership", () => {
 	it("rejects unsubscribe from a non-owner authenticated requester", async () => {
 		const r = new Relay({ allowUnauthorizedChannels: true });
-		const owner = r.connect(undefined, fakeSse(), {
+		const owner = r.connect(fakeSse(), {
 			auth: { isAuthenticated: true, user: { id: "user-42" } },
 		});
 		if (owner.outcome !== "ok") throw new Error("unreachable");
@@ -246,7 +201,7 @@ describe("relay-security > unsubscribe() ownership", () => {
 
 	it("accepts unsubscribe from the SAME authenticated identity as the connect", async () => {
 		const r = new Relay({ allowUnauthorizedChannels: true });
-		const owner = r.connect(undefined, fakeSse(), {
+		const owner = r.connect(fakeSse(), {
 			auth: { isAuthenticated: true, user: { id: "user-42" } },
 		});
 		if (owner.outcome !== "ok") throw new Error("unreachable");
@@ -273,7 +228,7 @@ describe("relay-security > a body is not a shape just because the type says so",
 	it("refuses a channel that is not a string, instead of throwing out of the route", async () => {
 		const r = new Relay();
 		r.authorize("room/:id", () => true);
-		const c = r.connect(undefined, fakeSse(), {
+		const c = r.connect(fakeSse(), {
 			auth: { isAuthenticated: false },
 		});
 		if (c.outcome !== "ok") throw new Error("unreachable");
@@ -315,7 +270,7 @@ describe("relay-security > a subscription outliving its client", () => {
 			return true;
 		});
 		const sse = fakeSse();
-		const c = r.connect(undefined, sse, { auth: { isAuthenticated: false } });
+		const c = r.connect(sse, { auth: { isAuthenticated: false } });
 		if (c.outcome !== "ok") throw new Error("unreachable");
 
 		const pending = r.subscribe(c.uid, "room/7", {});
@@ -349,7 +304,7 @@ describe("relay-security > a subscription outliving its client", () => {
 			seen.push({ pattern: "users/me", ...params });
 			return true;
 		});
-		const c = r.connect(undefined, fakeSse(), {});
+		const c = r.connect(fakeSse(), {});
 		if (c.outcome !== "ok") throw new Error("unreachable");
 
 		await r.subscribe(c.uid, "users/me", {});

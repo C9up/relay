@@ -4,7 +4,7 @@
  * handful of `authorize` / `broadcast` calls. The provider auto-
  * registers three routes against the host router:
  *
- *     GET  /__relay/events?uid=<client_uid>
+ *     GET  /__relay/events      (the first frame carries the connection's uid)
  *     POST /__relay/subscribe   { uid, channel }
  *     POST /__relay/unsubscribe { uid, channel }
  *
@@ -63,8 +63,19 @@ export interface RelayAuth {
 	permissions?: string[];
 }
 
+/**
+ * What an authorizer is handed: the context of the subscribe request. The
+ * provider passes the whole `HttpContext`, as Transmit hands its authorizers
+ * the HttpContext — so `ctx.bouncer`, the tenant, anything a middleware set is
+ * there at run time. The two an authorizer reaches for are typed here.
+ */
 export interface RelayContext {
 	auth?: RelayAuth;
+	/** The request's authorizer — Warden's Bouncer, when it is set up. */
+	bouncer?: {
+		allows(ability: string, ...args: unknown[]): Promise<boolean>;
+		denies(ability: string, ...args: unknown[]): Promise<boolean>;
+	};
 }
 
 export type ChannelAuthorizer<TParams = Record<string, string>> = (
@@ -177,9 +188,10 @@ export interface RelayConfig {
 	 */
 	transportChannel?: string;
 	/**
-	 * Milliseconds between keep-alive frames sent to every connected client,
-	 * or `false` for none. Default `false` — Transmit's `pingInterval`, same
-	 * shape and same default.
+	 * Time between keep-alive frames sent to every connected client — a
+	 * number of milliseconds or a duration (`'30s'`, `'1m'`) — or `false` for
+	 * none. Default `false` — Transmit's `pingInterval`, same shape and same
+	 * default.
 	 *
 	 * An SSE connection that carries no traffic is indistinguishable from a
 	 * hung one to everything between the client and the process: nginx closes
@@ -188,7 +200,7 @@ export interface RelayConfig {
 	 * is not silence but a connection that drops and reopens forever, losing
 	 * whatever was published in between. A periodic frame is what stops that.
 	 */
-	pingInterval?: number | false;
+	pingInterval?: number | string | false;
 }
 
 /** Cross-instance broadcast envelope carried over `RelayTransport`. */
@@ -196,6 +208,13 @@ interface RelayTransportMessage {
 	type: "broadcast";
 	channel: string;
 	payload: unknown;
+	/**
+	 * The relay that published it. The bus delivers a publication to every
+	 * subscriber, the publisher included, and that relay has already delivered
+	 * it to its own clients — so it ignores its own (the `busId` of
+	 * `@boringnode/bus`).
+	 */
+	origin?: string;
 }
 
 export interface RelayLifecycleEvents {
@@ -266,6 +285,8 @@ interface RegisteredClient {
  */
 export class Relay {
 	#clients = new Map<string, RegisteredClient>();
+	/** Marks this relay's publications, so it can skip its own on the bus. */
+	readonly #instanceId = randomUUID();
 	/** channel → set of uids subscribed to it (O(1) broadcast). */
 	#channelIndex = new Map<string, Set<string>>();
 	#authorizers = new Map<string, ChannelAuthorizer<Record<string, string>>>();
@@ -378,7 +399,7 @@ export class Relay {
 		// `RelayProvider.ready()` calls {@link startTransport}, which is the
 		// phase upstream reserves for sockets and background work, and the one
 		// an inspection never reaches.
-		this.#pingInterval = config?.pingInterval;
+		this.#pingInterval = toMilliseconds(config?.pingInterval);
 	}
 
 	/**
@@ -416,7 +437,10 @@ export class Relay {
 		// remove exactly it at shutdown. The bus stacks handlers, so anything
 		// coarser either leaves one behind or takes down someone else's.
 		const handler = (message: unknown): void => {
-			if (isRelayTransportMessage(message)) {
+			if (
+				isRelayTransportMessage(message) &&
+				message.origin !== this.#instanceId
+			) {
 				this.#deliver(message.channel, message.payload);
 			}
 		};
@@ -834,6 +858,7 @@ export class Relay {
 			type: "broadcast",
 			channel,
 			payload,
+			origin: this.#instanceId,
 		};
 		// A publish that fails means the other instances never hear this
 		// broadcast — the same split-brain a failed subscribe causes, and worth
@@ -888,71 +913,36 @@ export class Relay {
 	 * Register a freshly-opened SSE stream. Called by the auto-registered
 	 * `GET /__relay/events` route handler.
 	 *
-	 * SECURITY: the uid is server-derived, not client-chosen. A client that
-	 * could pick its own uid could (a) impersonate another user by claiming
-	 * their id, (b) evict their stream via the reconnect short-circuit, or
-	 * (c) listen to their channels by re-using the uid. To prevent this:
+	 * SECURITY: the uid is issued by the server — a fresh `randomUUID()` for
+	 * every connection — and never chosen by the client, who learns it from
+	 * the initial `connected` frame and echoes it in `subscribe` /
+	 * `unsubscribe`. Who OWNS the connection is recorded beside it: the
+	 * authenticated user, if any, and every later subscribe must come from the
+	 * same user (`#assertOwnership`). A uid per connection rather than per
+	 * user is what lets two tabs of one account stay open side by side; using
+	 * the user id as the uid made each new tab evict the previous one.
 	 *
-	 *   - authenticated request → uid is forced to `ctx.auth.user.id`;
-	 *     any client-supplied hint that disagrees yields `'forbidden'`.
-	 *   - anonymous request → uid is a fresh server-generated `randomUUID()`;
-	 *     the client learns it from the initial `connected` SSE frame and
-	 *     must echo it back in `subscribe`/`unsubscribe` bodies. The hint
-	 *     parameter is ignored.
-	 *
-	 * Returns `'ok'` with the issued uid on success, `'capped'` when the
-	 * client cap is reached (handler responds 503), `'forbidden'` when the
-	 * client tried to claim a uid that doesn't match the authenticated
-	 * identity (handler responds 403).
+	 * Returns `'ok'` with the issued uid, or `'capped'` when the client cap is
+	 * reached (the handler answers with an error frame).
 	 */
 	connect(
-		clientUidHint: string | undefined,
 		sse: RelaySseStream,
 		ctx: RelayContext,
-	):
-		| { outcome: "ok"; uid: string }
-		| { outcome: "capped" }
-		| { outcome: "forbidden"; reason: string } {
-		const authUserId = ctx.auth?.isAuthenticated
-			? ctx.auth.user?.id
-			: undefined;
-		let uid: string;
-		if (authUserId !== undefined) {
-			// Authenticated: identity is fixed. A mismatched hint is a hijack
-			// attempt — reject rather than silently rewriting.
-			if (clientUidHint !== undefined && clientUidHint !== authUserId) {
-				return {
-					outcome: "forbidden",
-					reason: "uid hint does not match authenticated user",
-				};
-			}
-			uid = authUserId;
-		} else {
-			// Anonymous: server issues a cryptographically random uid so a
-			// guessing attacker can't connect on behalf of a specific session.
-			uid = randomUUID();
-		}
-		// Reconnect short-circuit BEFORE the cap check: the slot for `uid` is
-		// already accounted for in `#clients.size`, so a refresh / network
-		// reconnect should replace the prior writer (drop + re-add) rather
-		// than 503 with `capped`. The cap only matters for *new* uids — those
-		// genuinely add a slot to the map.
-		const isReconnect = this.#clients.has(uid);
-		if (isReconnect) {
-			this.#dropClient(uid);
-		} else if (this.#clients.size >= this.#config.maxClients) {
+	): { outcome: "ok"; uid: string } | { outcome: "capped" } {
+		if (this.#clients.size >= this.#config.maxClients) {
 			return { outcome: "capped" };
 		}
+		const uid = randomUUID();
 		this.#clients.set(uid, {
 			uid,
 			sse,
 			channels: new Set(),
 			auth: ctx.auth,
 		});
-		// Identity-guarded: a stale stream's onClose must not drop a newer client
-		// that reused the same uid after a reconnect.
+		// A uid is never reused, so whatever this stream reports later — a
+		// close, a failed write — can only concern this connection.
 		sse.onClose(() => {
-			if (this.#clients.get(uid)?.sse.id === sse.id) this.#dropClient(uid);
+			this.#dropClient(uid);
 		});
 		// Initial frame: confirms the connection to the JS client. Adonis
 		// Transmit ships `{ uid }` too. The client uses this uid for the
@@ -1036,6 +1026,13 @@ export class Relay {
 		// never asked for that channel and was never checked for it.
 		if (this.#clients.get(uid) !== client) {
 			return { ok: false, status: 400, code: "E_NOT_CONNECTED" };
+		}
+		// Checked again after the await: the check above ran before it, and
+		// concurrent subscriptions all passed it while their authorizers were
+		// pending — a cap of one let three through.
+		if (client.channels.has(channel)) return { ok: true };
+		if (client.channels.size >= this.#config.maxChannelsPerClient) {
+			return { ok: false, status: 429, code: "E_MAX_CHANNELS" };
 		}
 		client.channels.add(channel);
 		this.#indexAdd(channel, uid);
@@ -1239,10 +1236,9 @@ export class Relay {
 			this.#indexRemove(channel, uid);
 		}
 		this.#clients.delete(uid);
-		// Close the underlying stream so a reconnect (drop + re-add) doesn't leak
-		// the prior writer — once it's out of #clients, broadcast()'s dead-writer
-		// sweep can never reach it. Already-closed streams (the onClose path)
-		// no-op via isOpen().
+		// Close the underlying stream: once it is out of #clients, broadcast()'s
+		// dead-writer sweep can never reach it, and a failed writer would stay
+		// open. Already-closed streams (the onClose path) no-op via isOpen().
 		if (client.sse.isOpen()) {
 			void client.sse.end().catch(() => {});
 		}
@@ -1300,9 +1296,17 @@ export class Relay {
 		if (!listeners) return;
 		for (const cb of listeners) {
 			try {
-				cb(evt);
-			} catch {
+				const result: unknown = cb(evt);
+				// An async listener's failure is a rejection, not a throw: left
+				// unhandled, one observer could end the process.
+				if (result instanceof Promise) {
+					result.catch((error: unknown) => {
+						this.#warn(`a '${event}' listener failed`, error);
+					});
+				}
+			} catch (error) {
 				// Listener errors are isolated.
+				this.#warn(`a '${event}' listener failed`, error);
 			}
 		}
 	}
@@ -1345,6 +1349,46 @@ function isTransportConfig(
 /** A transport, or the call that answers one. */
 function build(source: RelayTransportSource): RelayTransport {
 	return typeof source === "function" ? source() : source;
+}
+
+const DURATION_UNITS_MS: Record<string, number> = {
+	ms: 1,
+	millisecond: 1,
+	milliseconds: 1,
+	s: 1000,
+	sec: 1000,
+	secs: 1000,
+	second: 1000,
+	seconds: 1000,
+	m: 60_000,
+	min: 60_000,
+	mins: 60_000,
+	minute: 60_000,
+	minutes: 60_000,
+	h: 3_600_000,
+	hr: 3_600_000,
+	hour: 3_600_000,
+	hours: 3_600_000,
+};
+
+/**
+ * A ping interval in milliseconds. A number is milliseconds; a string is a
+ * duration (`'30s'`), or milliseconds when it has no unit — what Transmit
+ * accepts. Anything else is refused at construction rather than silently
+ * turning the keep-alive off.
+ */
+function toMilliseconds(
+	value: number | string | false | undefined,
+): number | false | undefined {
+	if (typeof value !== "string") return value;
+	const match = /^\s*(\d+(?:\.\d+)?)\s*([a-z]*)\s*$/i.exec(value);
+	const factor = DURATION_UNITS_MS[(match?.[2] ?? "").toLowerCase() || "ms"];
+	if (match === null || factor === undefined) {
+		throw new Error(
+			`[relay] pingInterval must be milliseconds or a duration like '30s', got '${value}'`,
+		);
+	}
+	return Number(match[1]) * factor;
 }
 
 /** A uid or a channel, as it has to arrive to be usable at all. */

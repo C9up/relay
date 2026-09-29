@@ -95,7 +95,12 @@ function context(
 		body: undefined as unknown,
 		code: 200,
 		sse,
-		request: { url: () => url, raw: () => raw },
+		request: {
+			// As Ream's Request does: the query string only when asked for.
+			url: (includeQueryString?: boolean) =>
+				includeQueryString === true ? url : (url.split("?")[0] ?? url),
+			raw: () => raw,
+		},
 		response: {
 			status(code: number) {
 				ctx.code = code;
@@ -150,15 +155,22 @@ describe("relay > SignalR transport", () => {
 		expect(body.connectionToken).not.toBe(body.connectionId);
 	});
 
-	it("opens the stream and registers the client on the hub", async () => {
+	it("runs onConnect once the handshake is answered, never before", async () => {
 		const hub = new ChatHub();
-		const { stream } = await connectedClient(hub);
+		const { router, connectionToken, stream } = await connectedClient(hub);
+		// The stream is open, the handshake is not done: nothing may be sent,
+		// or the SignalR client refuses the connection.
+		expect(hub.connected).toBe(0);
+		expect(stream.sse.frames).toHaveLength(0);
+
+		await router.routes.get("POST /hubs/chat")?.(
+			context(`/hubs/chat?id=${connectionToken}`, HANDSHAKE),
+		);
 
 		expect(hub.connected).toBe(1);
-		// onConnect pushed a frame down the stream, record-separated.
-		expect(stream.sse.frames).toHaveLength(1);
-		expect(stream.sse.frames[0]?.endsWith(RS)).toBe(true);
-		expect(stream.sse.frames[0]).toContain("welcome");
+		// The handshake reply first, then what onConnect sent.
+		expect(stream.sse.frames[0]).toBe(`{}${RS}`);
+		expect(stream.sse.frames[1]).toContain("welcome");
 	});
 
 	it("refuses a stream with no negotiated token, before upgrading", async () => {

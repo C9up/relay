@@ -23,6 +23,9 @@
  * @implements MISS-20 (Epic 23)
  */
 
+/** What {@link Hub.dispatch} reports: the handler's result, or a failure. */
+export type DispatchResult = { ok: true; result: unknown } | { ok: false };
+
 export interface HubContext {
 	/** Client ID. */
 	readonly clientId: string;
@@ -223,25 +226,26 @@ export abstract class Hub {
 	/**
 	 * Dispatch an incoming message to the appropriate handler method.
 	 *
-	 * Returns `true` when the handler ran to completion, `false` on any failure
-	 * (unknown client/event, auth rejection, or a throwing handler). A bare
-	 * `error` event is still emitted to the client for each failure (transport
-	 * agnostic), and the boolean lets a correlated transport — SignalR, whose
-	 * invocations carry an `invocationId` — answer with an error Completion
-	 * instead of a misleading success one.
+	 * Returns `{ ok: true, result }` when the handler ran to completion — its
+	 * return value, which a SignalR `invoke()` resolves with — and
+	 * `{ ok: false }` on any failure (unknown client/event, auth rejection, or
+	 * a throwing handler). A bare `error` event is still emitted to the client
+	 * for each failure (transport agnostic), and `ok` lets a correlated
+	 * transport answer with an error Completion instead of a misleading
+	 * success one.
 	 */
 	async dispatch(
 		clientId: string,
 		event: string,
 		...args: unknown[]
-	): Promise<boolean> {
+	): Promise<DispatchResult> {
 		const client = this.#clients.get(clientId);
-		if (!client) return false;
+		if (!client) return { ok: false };
 
 		const authError = this.#checkDispatchAuth(client);
 		if (authError) {
 			client.send("error", authError);
-			return false;
+			return { ok: false };
 		}
 
 		// Find handler from allowlist (never dispatches to lifecycle hooks or inherited methods)
@@ -251,7 +255,7 @@ export abstract class Hub {
 				code: "E_RELAY_UNKNOWN_EVENT",
 				message: `No handler for: ${event}`,
 			});
-			return false;
+			return { ok: false };
 		}
 
 		const ctx = this.#buildContext(client);
@@ -260,14 +264,14 @@ export abstract class Hub {
 			// `connection.invoke('Method', a, b, c)` sends three; passing only
 			// `a` dropped the rest without a word. A handler declaring one
 			// parameter is unaffected — JavaScript ignores the extras.
-			await handler.call(this, ctx, ...args);
-			return true;
+			const result: unknown = await handler.call(this, ctx, ...args);
+			return { ok: true, result };
 		} catch {
 			client.send("error", {
 				code: "E_RELAY_HANDLER_ERROR",
 				message: "Handler error",
 			});
-			return false;
+			return { ok: false };
 		}
 	}
 

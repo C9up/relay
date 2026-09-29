@@ -122,7 +122,9 @@ describe("relay > Hub > dispatch — handler routing", () => {
 		// dispatch() reports outcome via its boolean return so a correlated
 		// transport (SignalR) can answer with an error Completion; an unknown
 		// client is a non-handled dispatch → false, but never throws.
-		await expect(hub.dispatch("ghost", "ping", {})).resolves.toBe(false);
+		await expect(hub.dispatch("ghost", "ping", {})).resolves.toEqual({
+			ok: false,
+		});
 	});
 
 	it("returns UNKNOWN_EVENT for unmapped events", async () => {
@@ -292,7 +294,7 @@ describe("Hub > handlers a subclass inherits", () => {
 		const hub = new ChildHub();
 		const sent = connected(hub);
 
-		expect(await hub.dispatch("c1", "ping")).toBe(true);
+		expect(await hub.dispatch("c1", "ping")).toMatchObject({ ok: true });
 		expect(hub.ran).toEqual(["base:ping"]);
 		expect(sent).toEqual([]);
 	});
@@ -312,8 +314,8 @@ describe("Hub > handlers a subclass inherits", () => {
 		const hub = new ChildHub();
 		const sent = connected(hub);
 
-		expect(await hub.dispatch("c1", "connect")).toBe(false);
-		expect(await hub.dispatch("c1", "disconnect")).toBe(false);
+		expect(await hub.dispatch("c1", "connect")).toEqual({ ok: false });
+		expect(await hub.dispatch("c1", "disconnect")).toEqual({ ok: false });
 		expect(sent.map((s) => s.event)).toEqual(["error", "error"]);
 	});
 });
@@ -402,7 +404,7 @@ describe("Hub > the singular guard reaches the check", () => {
 
 		// `useGuards` folds the singular into `guards`, and the check reads that
 		// one list. It used to read a `guard` key nothing ever wrote as well.
-		expect(await hub.dispatch("c1", "ping")).toBe(false);
+		expect(await hub.dispatch("c1", "ping")).toEqual({ ok: false });
 		expect(sent[0]?.data).toMatchObject({ code: "E_RELAY_UNAUTHORIZED" });
 		expect(hub.ran).toBe(0);
 	});
@@ -412,7 +414,7 @@ describe("Hub > the singular guard reaches the check", () => {
 		hub.useGuards({ guard: "session" });
 		connect(hub, { isAuthenticated: true, strategy: "session" });
 
-		expect(await hub.dispatch("c1", "ping")).toBe(true);
+		expect(await hub.dispatch("c1", "ping")).toMatchObject({ ok: true });
 		expect(hub.ran).toBe(1);
 	});
 
@@ -421,7 +423,7 @@ describe("Hub > the singular guard reaches the check", () => {
 		hub.useGuards({ guard: "session", guards: ["jwt"] });
 		connect(hub, { isAuthenticated: true, strategy: "jwt" });
 
-		expect(await hub.dispatch("c1", "ping")).toBe(true);
+		expect(await hub.dispatch("c1", "ping")).toMatchObject({ ok: true });
 	});
 
 	it("needs every permission and only one of the roles", async () => {
@@ -438,7 +440,7 @@ describe("Hub > the singular guard reaches the check", () => {
 
 		// Roles are any-of, permissions are all-of — the rule every other entry
 		// point in the framework applies.
-		expect(await hub.dispatch("c1", "ping")).toBe(false);
+		expect(await hub.dispatch("c1", "ping")).toEqual({ ok: false });
 		expect(sent[0]?.data).toMatchObject({
 			message: "Insufficient permissions",
 		});

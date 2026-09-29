@@ -230,7 +230,7 @@ describe("relay > provider > the routes", () => {
 		expect(capped.sseEnded).toBe(true);
 	});
 
-	it("refuses a uid hint that claims someone else, without opening a stream", async () => {
+	it("opens the stream whatever uid the client claims — the server issues it", async () => {
 		const { app, router } = fakeApp({ withRouter: true });
 		const provider = new RelayProvider(app as never);
 		provider.register();
@@ -244,30 +244,6 @@ describe("relay > provider > the routes", () => {
 		const response = fakeResponse();
 		await router.routes.get("GET /__relay/events")?.({
 			request: fakeRequest({ uid: "somebody-else" }),
-			response,
-			auth: { isAuthenticated: true, user: { id: "u-a" } },
-		});
-
-		// Answering after the upgrade would leave a half-open stream behind;
-		// this one is a pure auth-versus-claim comparison and is buffered.
-		expect(response.sseOpened).toBe(false);
-		expect(response.sent[0]?.status).toBe(403);
-	});
-
-	it("opens the stream when the hint matches the authenticated user", async () => {
-		const { app, router } = fakeApp({ withRouter: true });
-		const provider = new RelayProvider(app as never);
-		provider.register();
-		await provider.boot();
-		// What a preload writes. Upstream's Transmit is the same: the routes
-		// exist because the application asked for them.
-		getRelay()?.registerRoutes();
-		await provider.start();
-		await provider.ready();
-
-		const response = fakeResponse();
-		await router.routes.get("GET /__relay/events")?.({
-			request: fakeRequest({ uid: "u-a" }),
 			response,
 			auth: { isAuthenticated: true, user: { id: "u-a" } },
 		});
@@ -376,6 +352,42 @@ describe("relay > the missing-registerRoutes warning", () => {
  * wiring accident, not a reason to break the boot, but it must not silently
  * double the routing table either.
  */
+describe("relay > provider > authorizers get the request's context", () => {
+	it("hands an authorizer the whole context — ctx.bouncer included", async () => {
+		const { app, router } = fakeApp({ withRouter: true });
+		const provider = new RelayProvider(app as never);
+		provider.register();
+		await provider.boot();
+		const relay = await app.container.resolve<Relay>(Relay);
+		relay.registerRoutes();
+		relay.authorize(
+			"news",
+			async (ctx) => (await ctx.bouncer?.allows("read")) === true,
+		);
+
+		const auth = { isAuthenticated: true, user: { id: "u-a" } };
+		const events = fakeResponse();
+		await router.routes.get("GET /__relay/events")?.({
+			request: fakeRequest(),
+			response: events,
+			auth,
+		});
+		const connected = events.frames[0]?.data;
+		const uid = Reflect.get(Object(connected), "uid");
+
+		const response = fakeResponse();
+		await router.routes.get("POST /__relay/subscribe")?.({
+			request: fakeRequest({}, { uid, channel: "news" }),
+			response,
+			auth,
+			// Only `{ auth }` used to reach the authorizer: this was a 403.
+			bouncer: { allows: async () => true, denies: async () => false },
+		});
+		expect(response.sent[0]?.status).toBeUndefined();
+		expect(relay.channelSubscribers("news")).toBe(1);
+	});
+});
+
 describe("relay > registerRoutes is mount-once", () => {
 	it("mounts the three endpoints once, however many times it is called", async () => {
 		const { app, router } = fakeApp({ withRouter: true });

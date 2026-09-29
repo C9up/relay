@@ -96,7 +96,7 @@ describe("relay > redis transport", () => {
 		await Promise.resolve();
 
 		const sse = fakeSse("s-a");
-		const connected = subscriber.connect(undefined, sse, {
+		const connected = subscriber.connect(sse, {
 			auth: { isAuthenticated: true, user: { id: "u-a" } },
 		});
 		if (connected.outcome !== "ok") throw new Error("connect failed");
