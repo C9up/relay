@@ -31,23 +31,49 @@ interface ConnectionSource {
  * `"connection" in manager` is FALSE while reading it returns the function —
  * gating on `in` rejected the real manager. And a module namespace under a
  * test double RAISES for an export it does not have, rather than answering
- * undefined, so a bare read fails on the mock. Reading through a catch is what
- * satisfies both.
+ * undefined, so a bare read fails on the mock.
+ *
+ * So the read is caught, but what it raised is kept: on quasar's accessor a
+ * throw is not an absence, it is the accessor saying its provider has not
+ * booted, and dropping that turned it into a wrong diagnosis.
  */
-function readMember(value: unknown, name: string): unknown {
-	if (typeof value !== "object" || value === null) return undefined;
+type MemberRead = { value: unknown } | { threw: unknown };
+
+function readMember(value: unknown, name: string): MemberRead {
+	if (typeof value !== "object" || value === null) return { value: undefined };
 	try {
-		return Reflect.get(value, name);
-	} catch {
-		return undefined;
+		return { value: Reflect.get(value, name) };
+	} catch (threw) {
+		return { threw };
 	}
 }
 
-function isConnectionSource(value: unknown): value is ConnectionSource {
-	return typeof readMember(value, "connection") === "function";
+function memberValue(read: MemberRead): unknown {
+	return "value" in read ? read.value : undefined;
 }
 
-export interface QuasarConnectionRequest {
+function isConnectionSource(value: unknown): value is ConnectionSource {
+	return typeof memberValue(readMember(value, "connection")) === "function";
+}
+
+/**
+ * Whether `value` carries every one of `commands` as a function.
+ *
+ * The building block of the guard a caller passes as `isConnection`, over the
+ * commands it issues. Reads go through the same catch as above, so a command
+ * whose read throws counts as missing.
+ */
+export function hasCommands(
+	value: unknown,
+	commands: readonly string[],
+): value is object {
+	if (typeof value !== "object" || value === null) return false;
+	return commands.every(
+		(command) => typeof memberValue(readMember(value, command)) === "function",
+	);
+}
+
+export interface QuasarConnectionRequest<T> {
 	/** The package asking. It prefixes every message this can raise. */
 	pkg: string;
 	/**
@@ -65,8 +91,16 @@ export interface QuasarConnectionRequest {
 	) => Error;
 	/** Connection name, or `undefined` for quasar's default. */
 	name?: string;
-	/** The commands the caller will actually issue. */
+	/** The commands the caller will actually issue, named in the message. */
 	required: readonly string[];
+	/**
+	 * The caller's check that the connection is the client it needs.
+	 *
+	 * Written by the caller over the commands it issues (`hasCommands` with
+	 * `required` does it), because only the caller knows its client type. The
+	 * connection is handed over only once this has said yes.
+	 */
+	isConnection: (value: unknown) => value is T;
 	/** What the caller does with them, for the message that names a gap. */
 	what: string;
 	/**
@@ -86,9 +120,10 @@ export interface QuasarConnectionRequest {
  * command, far from the line that asked for it.
  */
 export async function quasarConnection<T>(
-	request: QuasarConnectionRequest,
+	request: QuasarConnectionRequest<T>,
 ): Promise<T> {
-	const { pkg, name, required, what, raise, alternative } = request;
+	const { pkg, name, required, what, raise, alternative, isConnection } =
+		request;
 	const specifier = "@c9up/quasar/services/main";
 	let loaded: unknown;
 	try {
@@ -102,9 +137,22 @@ export async function quasarConnection<T>(
 		);
 	}
 
-	const manager = isConnectionSource(loaded)
-		? loaded
-		: Reflect.get(Object(loaded), "default");
+	// The namespace itself may be the manager (a test double); a throw there is
+	// the mock refusing an export it lacks, not an answer.
+	const direct = memberValue(readMember(loaded, "connection"));
+	const manager =
+		typeof direct === "function"
+			? loaded
+			: memberValue(readMember(Object(loaded), "default"));
+	const read = readMember(manager, "connection");
+	if ("threw" in read) {
+		throw raise(
+			"quasar-missing",
+			`[${pkg}] ${what} asks for the quasar connection "${name ?? "default"}", but @c9up/quasar's manager is not available yet: ` +
+				"its provider has not booted, or is not registered in this application's providers.",
+			read.threw,
+		);
+	}
 	if (!isConnectionSource(manager)) {
 		throw raise(
 			"quasar-missing",
@@ -114,7 +162,8 @@ export async function quasarConnection<T>(
 
 	const connection = manager.connection(name);
 	const missing = required.filter(
-		(command) => typeof readMember(connection, command) !== "function",
+		(command) =>
+			typeof memberValue(readMember(connection, command)) !== "function",
 	);
 	if (missing.length > 0) {
 		throw raise(
@@ -122,8 +171,11 @@ export async function quasarConnection<T>(
 			`[${pkg}] the quasar connection${name ? ` '${name}'` : ""} is missing ${missing.join(", ")}, which ${what} issues`,
 		);
 	}
-	// Load-bearing: every member of `required` has just been checked to be a
-	// function on this object. The caller names the type it needs because only
-	// the caller knows which commands it asked for.
-	return connection as T;
+	if (!isConnection(connection)) {
+		throw raise(
+			"incomplete-connection",
+			`[${pkg}] the quasar connection${name ? ` '${name}'` : ""} is not the client ${what} needs`,
+		);
+	}
+	return connection;
 }

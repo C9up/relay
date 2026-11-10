@@ -9,19 +9,30 @@
  */
 
 import type { RelayPubSubClient } from "./RedisRelayTransport.js";
-import { quasarConnection as loadQuasarConnection } from "./vendor/quasarConnection.js";
+import {
+	hasCommands,
+	quasarConnection as loadQuasarConnection,
+} from "./vendor/quasarConnection.js";
 
 // A transport publishes, subscribes and unsubscribes. Nothing else.
 const REQUIRED = ["publish", "subscribe", "unsubscribe"] as const;
+
+/**
+ * The connection is handed over only once it carries every command above.
+ */
+function isRelayPubSubClient(value: unknown): value is RelayPubSubClient {
+	return hasCommands(value, REQUIRED);
+}
 
 /** The named connection, once it is known to carry what this package issues. */
 export async function quasarConnection(
 	name?: string,
 ): Promise<RelayPubSubClient> {
-	return loadQuasarConnection<RelayPubSubClient>({
+	return loadQuasarConnection({
 		pkg: "relay",
 		name,
 		required: REQUIRED,
+		isConnection: isRelayPubSubClient,
 		what: "the relay transport",
 		raise: (_reason, message, cause) => new Error(message, { cause }),
 	});
