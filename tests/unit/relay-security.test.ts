@@ -148,6 +148,59 @@ describe("relay-security > subscribe() ownership", () => {
 		expect(result).toEqual({ ok: true });
 	});
 
+	it("refuses an authenticated subscribe on an anonymous connection, before any authorizer runs", async () => {
+		// Whoever holds the anonymous stream would receive what the victim's
+		// credentials authorized: a forged `connected` frame makes the victim's
+		// own client re-post its channels under the attacker's uid, with valid
+		// cookies.
+		const r = new Relay();
+		const asked: string[] = [];
+		r.authorize<{ id: string }>("users/:id/notifications", (ctx, { id }) => {
+			asked.push(id);
+			return ctx.auth?.user?.id === id;
+		});
+		const sent: unknown[] = [];
+		const attackerStream = fakeSse("attacker");
+		attackerStream.send = async (_event, data) => {
+			sent.push(data);
+			return true;
+		};
+		const attacker = r.connect(attackerStream, {});
+		if (attacker.outcome !== "ok") throw new Error("unreachable");
+
+		const result = await r.subscribe(
+			attacker.uid,
+			"users/victim/notifications",
+			{
+				auth: { isAuthenticated: true, user: { id: "victim" } },
+			},
+		);
+		r.broadcast("users/victim/notifications", { secret: "victim-only" });
+
+		expect(result).toEqual({
+			ok: false,
+			status: 403,
+			code: "E_RELAY_NOT_OWNER",
+		});
+		expect(asked).toEqual([]);
+		expect(r.channelSubscribers("users/victim/notifications")).toBe(0);
+		expect(JSON.stringify(sent)).not.toContain("victim-only");
+	});
+
+	it("refuses an authenticated unsubscribe on an anonymous connection", async () => {
+		const r = new Relay({ allowUnauthorizedChannels: true });
+		const anon = r.connect(fakeSse(), {});
+		if (anon.outcome !== "ok") throw new Error("unreachable");
+		await r.subscribe(anon.uid, "public/feed", {});
+
+		const result = r.unsubscribe(anon.uid, "public/feed", {
+			auth: { isAuthenticated: true, user: { id: "someone" } },
+		});
+
+		expect(result).toBe("forbidden");
+		expect(r.channelSubscribers("public/feed")).toBe(1);
+	});
+
 	it("is idempotent: re-subscribing to an already-held channel returns ok (no 429 at quota)", async () => {
 		const r = new Relay({
 			allowUnauthorizedChannels: true,

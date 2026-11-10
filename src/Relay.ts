@@ -1214,29 +1214,22 @@ export class Relay {
 	 * Verify that the current request is allowed to manipulate `client`'s
 	 * subscriptions. Returns `null` when allowed, or a `SubscribeResult`
 	 * rejection (subscribe uses it directly; unsubscribe maps non-null to
-	 * `'forbidden'`). Ownership policy:
+	 * `'forbidden'`). The request must carry the identity the stream was
+	 * opened with, in both directions:
 	 *
-	 *   - If the client was authenticated at connect-time, the current
-	 *     request MUST be authenticated as the same user id.
-	 *   - If the client was anonymous at connect-time, the uid itself is
-	 *     the proof of ownership (server-issued randomUUID; an attacker
-	 *     can't guess it). No further check needed.
-	 *
-	 * This is the symmetric ownership boundary to `connect()`'s identity
-	 * binding — without both, the uid path can be hijacked downstream.
+	 *   - a stream opened as user X takes requests from X only;
+	 *   - a stream opened anonymously takes anonymous requests only. Its
+	 *     server-issued uid is its credential, and an authenticated request
+	 *     naming it would have the authorizer approve, with that user's
+	 *     credentials, frames that land on a stream someone else may hold —
+	 *     the request a forged `connected` frame or a cross-site POST makes.
+	 *     A client that logs in reconnects to get an authenticated stream.
 	 */
 	#assertOwnership(
 		client: { auth?: RelayAuth },
 		ctx: RelayContext,
 	): SubscribeResult | null {
-		const connectedUserId = client.auth?.isAuthenticated
-			? client.auth.user?.id
-			: undefined;
-		if (connectedUserId === undefined) return null;
-		const requesterUserId = ctx.auth?.isAuthenticated
-			? ctx.auth.user?.id
-			: undefined;
-		if (requesterUserId !== connectedUserId) {
+		if (userIdOf(client.auth) !== userIdOf(ctx.auth)) {
 			return { ok: false, status: 403, code: "E_RELAY_NOT_OWNER" };
 		}
 		return null;
@@ -1420,6 +1413,11 @@ function encodePayload(payload: unknown): string {
 	// `undefined`, a function or a symbol encode to nothing at all; the client
 	// would receive an empty data line it cannot parse.
 	return JSON.stringify(payload) ?? "null";
+}
+
+/** The user an auth slice identifies, or `undefined` for an anonymous one. */
+function userIdOf(auth: RelayAuth | undefined): string | undefined {
+	return auth?.isAuthenticated === true ? auth.user?.id : undefined;
 }
 
 /** A uid or a channel, as it has to arrive to be usable at all. */
