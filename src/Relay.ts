@@ -77,6 +77,12 @@ export interface RelayContext {
 	 * a new random id on every request until a cookie pins it.
 	 */
 	session?: { readonly sessionId: string; readonly fresh: boolean };
+	/**
+	 * The request, for the client address an anonymous connection is counted
+	 * under (`maxClientsPerOwner`). Ream's `request.ip()` honours the trusted
+	 * proxy setting.
+	 */
+	request?: { ip?(): string };
 	/** The request's authorizer — Warden's Bouncer, when it is set up. */
 	bouncer?: {
 		allows(ability: string, ...args: unknown[]): Promise<boolean>;
@@ -153,6 +159,18 @@ export interface RelayConfig {
 	 * cap before degraded behavior (new connects 503'd).
 	 */
 	maxClients?: number;
+	/**
+	 * Concurrent SSE clients one owner may hold: an authenticated user, or the
+	 * client address (`request.ip()`) of an anonymous connection. Default 20;
+	 * `false` for none. The global `maxClients` protects the process — this is
+	 * what stops one client from taking all of it, and locking everybody else
+	 * out with a few thousand streams on one HTTP/2 socket.
+	 *
+	 * Behind a proxy, configure the trusted proxies so `request.ip()` is the
+	 * client's address and not the proxy's: otherwise every anonymous visitor
+	 * shares one owner.
+	 */
+	maxClientsPerOwner?: number | false;
 	/**
 	 * Per-client channel subscription cap. Default 100. A bound is
 	 * essential because client-supplied channel names land in the
@@ -301,6 +319,8 @@ interface RegisteredClient {
 	auth?: RelayAuth;
 	/** The established session the stream was opened in, if any. */
 	session?: string;
+	/** What the connection counts against for `maxClientsPerOwner`, if anything. */
+	owner?: string;
 	/** The connect request's context, handed to the `disconnect` listeners. */
 	context: RelayContext;
 }
@@ -395,6 +415,9 @@ export class Relay {
 	 * Transmit's stream manager latches the same way (`#isClosed`).
 	 */
 	#closed = false;
+	/** Open connections per owner key, for `maxClientsPerOwner`. */
+	readonly #perOwner = new Map<string, number>();
+	readonly #maxClientsPerOwner: number | false;
 	/** Hub transports mounted against this relay, closed with it. */
 	readonly #hubTransports = new Set<HubTransportLifecycle>();
 	/** Whether the endpoints are on the router — mounting twice duplicates them. */
@@ -407,6 +430,7 @@ export class Relay {
 			maxClients: config?.maxClients ?? 10_000,
 			maxChannelsPerClient: config?.maxChannelsPerClient ?? 100,
 		};
+		this.#maxClientsPerOwner = config?.maxClientsPerOwner ?? 20;
 		const resolved = resolveTransport(config?.transport);
 		this.#transport = resolved.transport;
 		const channel =
@@ -1007,8 +1031,9 @@ export class Relay {
 	 * the user id as the uid made each new tab evict the previous one.
 	 *
 	 * Returns `'ok'` with the issued uid, `'capped'` when the client cap is
-	 * reached (the handler answers with an error frame), or `'closed'` after a
-	 * shutdown (the handler ends the stream).
+	 * reached, `'owner-capped'` when this owner's is (the handler answers both
+	 * with an error frame), or `'closed'` after a shutdown (the handler ends
+	 * the stream).
 	 */
 	connect(
 		sse: RelaySseStream,
@@ -1016,18 +1041,31 @@ export class Relay {
 	):
 		| { outcome: "ok"; uid: string }
 		| { outcome: "capped" }
+		| { outcome: "owner-capped" }
 		| { outcome: "closed" } {
 		if (this.#closed) return { outcome: "closed" };
+		const owner = this.#maxClientsPerOwner === false ? undefined : ownerOf(ctx);
+		if (
+			owner !== undefined &&
+			this.#maxClientsPerOwner !== false &&
+			(this.#perOwner.get(owner) ?? 0) >= this.#maxClientsPerOwner
+		) {
+			return { outcome: "owner-capped" };
+		}
 		if (this.#clients.size >= this.#config.maxClients) {
 			return { outcome: "capped" };
 		}
 		const uid = randomUUID();
+		if (owner !== undefined) {
+			this.#perOwner.set(owner, (this.#perOwner.get(owner) ?? 0) + 1);
+		}
 		this.#clients.set(uid, {
 			uid,
 			sse,
 			channels: new Set(),
 			auth: ctx.auth,
 			session: sessionOf(ctx),
+			owner,
 			context: ctx,
 		});
 		// A uid is never reused, so whatever this stream reports later — a
@@ -1350,6 +1388,11 @@ export class Relay {
 			this.#indexRemove(channel, uid);
 		}
 		this.#clients.delete(uid);
+		if (client.owner !== undefined) {
+			const left = (this.#perOwner.get(client.owner) ?? 1) - 1;
+			if (left > 0) this.#perOwner.set(client.owner, left);
+			else this.#perOwner.delete(client.owner);
+		}
 		// Close the underlying stream: once it is out of #clients, broadcast()'s
 		// dead-writer sweep can never reach it, and a failed writer would stay
 		// open. Already-closed streams (the onClose path) no-op via isOpen().
@@ -1542,6 +1585,18 @@ function sessionOf(ctx: RelayContext): string | undefined {
 	return session !== undefined && session.fresh === false
 		? session.sessionId
 		: undefined;
+}
+
+/**
+ * What a connection counts against for the per-owner cap: the user when the
+ * request is authenticated, the client address otherwise, nothing when the
+ * host gives neither.
+ */
+function ownerOf(ctx: RelayContext): string | undefined {
+	const user = userIdOf(ctx.auth);
+	if (user !== undefined) return `user:${user}`;
+	const ip = ctx.request?.ip?.();
+	return typeof ip === "string" && ip !== "" ? `ip:${ip}` : undefined;
 }
 
 /** A uid or a channel, as it has to arrive to be usable at all. */

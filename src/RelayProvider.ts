@@ -164,6 +164,8 @@ interface ReamRequest {
 	// actually had.
 	url(includeQs?: boolean): string;
 	raw(): string;
+	/** The client address, honouring the trusted proxies — for the per-owner caps. */
+	ip?(): string;
 }
 interface ReamResponse {
 	status(code: number): ReamResponse;
@@ -268,7 +270,7 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 	const events = router.get("/__relay/events", async (ctx) => {
 		const sse = await ctx.response.sse();
 		const outcome = relay.connect(sse, ctx);
-		if (outcome.outcome === "capped") {
+		if (outcome.outcome === "capped" || outcome.outcome === "owner-capped") {
 			// Cap reached. The SSE writer is already open — send an error
 			// frame and close cleanly so the client sees a structured
 			// shutdown instead of a half-open connection.
@@ -276,7 +278,12 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 			// The frame does arrive: the stream registry keeps a closed
 			// entry until its receiver has been taken, so a send followed
 			// immediately by an end no longer loses the body.
-			await sse.send("error", { code: "E_RELAY_MAX_CLIENTS" });
+			await sse.send("error", {
+				code:
+					outcome.outcome === "capped"
+						? "E_RELAY_MAX_CLIENTS"
+						: "E_RELAY_MAX_CLIENTS_PER_OWNER",
+			});
 			await sse.end();
 		} else if (outcome.outcome === "closed") {
 			// Shut down: the stream ends at once, as Transmit destroys the

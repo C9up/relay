@@ -43,6 +43,11 @@ export interface HubHttpContext {
 		 */
 		url(includeQueryString?: boolean): string;
 		raw(): string;
+		/**
+		 * The client address, honouring the trusted proxies — what an
+		 * anonymous request is counted under for the per-owner caps.
+		 */
+		ip?(): string;
 	};
 	response: {
 		status(code: number): { json(body: unknown): void };
@@ -140,6 +145,17 @@ function mayActAs(
 }
 
 /**
+ * What a request counts against for the per-owner caps: the user when it is
+ * authenticated, the client address otherwise, nothing when neither is known.
+ */
+function ownerOf(ctx: HubHttpContext): string | undefined {
+	const user = userIdOf(ctx.auth);
+	if (user !== undefined) return `user:${user}`;
+	const ip = ctx.request.ip?.();
+	return typeof ip === "string" && ip !== "" ? `ip:${ip}` : undefined;
+}
+
+/**
  * Split a request body into SignalR frames.
  *
  * A single POST may carry several messages, each terminated by the record
@@ -196,12 +212,25 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 	 * the handshake reply makes the SignalR client refuse the connection.
 	 */
 	const awaitingHandshake = new Map<string, HubContext>();
+	/** Open streams per owner, and the owner each client id counts against. */
+	const perOwner = new Map<string, number>();
+	const ownerOfClient = new Map<string, string>();
 
 	const negotiate = router.post(`${path}/negotiate`, async (ctx) => {
 		if (refuseWhileClosed(ctx)) return;
+		const owner = ownerOf(ctx);
+		if (!adapter.admits(owner)) {
+			ctx.response.status(503).json({
+				error: {
+					code: "E_RELAY_MAX_PENDING",
+					message: "Too many pending connections — try again later.",
+				},
+			});
+			return;
+		}
 		// The connectionId is the hub's client id; the token is what the client
 		// echoes back on the two data routes.
-		ctx.response.json(adapter.negotiate(crypto.randomUUID()));
+		ctx.response.json(adapter.negotiate(crypto.randomUUID(), undefined, owner));
 	});
 
 	const stream = router.get(path, async (ctx) => {
@@ -231,6 +260,22 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		}
 
 		const previous = streams.get(clientId);
+		const owner = ownerOf(ctx);
+		const ownerCap = adapter.maxConnectionsPerOwner;
+		if (
+			previous === undefined &&
+			owner !== undefined &&
+			ownerCap !== false &&
+			(perOwner.get(owner) ?? 0) >= ownerCap
+		) {
+			ctx.response.status(503).json({
+				error: {
+					code: "E_RELAY_MAX_CONNECTIONS_PER_OWNER",
+					message: "Too many open connections from this client.",
+				},
+			});
+			return;
+		}
 		if (previous === undefined && streams.size >= adapter.maxConnections) {
 			ctx.response.status(503).json({
 				error: {
@@ -246,6 +291,11 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		// budget and stops expiring.
 		if (token !== undefined) adapter.claimToken(token);
 		streams.set(clientId, sse);
+		// A reopened stream for the same client id takes over its slot.
+		if (previous === undefined && owner !== undefined) {
+			perOwner.set(owner, (perOwner.get(owner) ?? 0) + 1);
+			ownerOfClient.set(clientId, owner);
+		}
 		// The same token opened again: the older stream would stay open and
 		// unused. Its close is ignored below, since it is no longer the one
 		// registered.
@@ -360,6 +410,13 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		if (streams.get(clientId) !== sse) return;
 		streams.delete(clientId);
 		awaitingHandshake.delete(clientId);
+		const owner = ownerOfClient.get(clientId);
+		if (owner !== undefined) {
+			ownerOfClient.delete(clientId);
+			const left = (perOwner.get(owner) ?? 1) - 1;
+			if (left > 0) perOwner.set(owner, left);
+			else perOwner.delete(owner);
+		}
 		// `removeClient` fires `onDisconnect` itself — calling it here too
 		// would deliver every disconnect twice.
 		hub.removeClient(clientId);

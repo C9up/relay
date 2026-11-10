@@ -450,16 +450,17 @@ describe("relay > SignalRAdapter negotiate is an unauthenticated write", () => {
 	it("caps how many unclaimed tokens may wait at once", () => {
 		const adapter = new SignalRAdapter(new TestHub(), { maxPendingTokens: 4 });
 		const tokens = Array.from(
-			{ length: 20 },
+			{ length: 4 },
 			(_, i) => adapter.negotiate(`c${i}`).connectionToken,
 		);
 
-		const live = tokens.filter((t) => adapter.resolveToken(t) !== undefined);
-
-		// The cap is applied before the new token is written, so the newest and
-		// the four before it stand; the oldest are dropped.
-		expect(live.length).toBeLessThanOrEqual(5);
-		expect(live).toContain(tokens[19]);
+		// Past the cap a negotiate is refused, and the tokens already issued
+		// stand: evicting the oldest let one client's flood invalidate every
+		// other client's token before its stream could attach.
+		expect(() => adapter.negotiate("c4")).toThrow(/refused/);
+		expect(tokens.every((t) => adapter.resolveToken(t) !== undefined)).toBe(
+			true,
+		);
 	});
 
 	it("forgets every token a client accumulated, claimed or not", () => {

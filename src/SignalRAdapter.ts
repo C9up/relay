@@ -40,6 +40,14 @@ const DEFAULT_MAX_FRAME_SIZE = 65_536;
  */
 const DEFAULT_TOKEN_TTL_MS = 30_000;
 const DEFAULT_MAX_PENDING_TOKENS = 1_024;
+/**
+ * Unclaimed tokens one owner — a user, or the client address of an anonymous
+ * request — may hold at once. `/negotiate` is an open POST: without a share per
+ * owner, one address filled the whole table.
+ */
+const DEFAULT_MAX_PENDING_TOKENS_PER_OWNER = 20;
+/** Open streams one owner may hold on a hub. */
+const DEFAULT_MAX_CONNECTIONS_PER_OWNER = 20;
 /** The SignalR client's own default handshake timeout. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_CONNECTIONS = 10_000;
@@ -50,6 +58,8 @@ interface IssuedToken {
 	issuedAt: number;
 	/** True once a stream has been opened with it — no longer on the clock. */
 	claimed: boolean;
+	/** Who negotiated it, for the per-owner share of the table. */
+	owner?: string;
 }
 
 export type SignalRMessageType = 1 | 2 | 3 | 4 | 5 | 6 | 7;
@@ -144,6 +154,8 @@ export class SignalRAdapter {
 	#maxPendingTokens: number;
 	readonly #handshakeTimeoutMs: number;
 	readonly #maxConnections: number;
+	readonly #maxPendingTokensPerOwner: number | false;
+	readonly #maxConnectionsPerOwner: number | false;
 
 	constructor(
 		hub: Hub,
@@ -161,6 +173,17 @@ export class SignalRAdapter {
 			handshakeTimeoutMs?: number;
 			/** How many streams may be open at once; a new one past it gets 503. */
 			maxConnections?: number;
+			/**
+			 * How many unclaimed tokens one owner — a user, or an anonymous
+			 * client's address — may hold. Default 20; `false` for none.
+			 */
+			maxPendingTokensPerOwner?: number | false;
+			/**
+			 * How many streams one owner may hold open. Default 20; `false` for
+			 * none. Behind a proxy, configure the trusted proxies so the client
+			 * address is not the proxy's.
+			 */
+			maxConnectionsPerOwner?: number | false;
 		},
 	) {
 		this.#hub = hub;
@@ -171,6 +194,38 @@ export class SignalRAdapter {
 		this.#handshakeTimeoutMs =
 			options?.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
 		this.#maxConnections = options?.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
+		this.#maxPendingTokensPerOwner =
+			options?.maxPendingTokensPerOwner ?? DEFAULT_MAX_PENDING_TOKENS_PER_OWNER;
+		this.#maxConnectionsPerOwner =
+			options?.maxConnectionsPerOwner ?? DEFAULT_MAX_CONNECTIONS_PER_OWNER;
+	}
+
+	/** How many streams one owner may hold open, or `false` for no limit. */
+	get maxConnectionsPerOwner(): number | false {
+		return this.#maxConnectionsPerOwner;
+	}
+
+	/**
+	 * Whether a negotiate from `owner` would be accepted now: the table has
+	 * room, and so does that owner's share of it. A full table REFUSES rather
+	 * than evicting: evicting the oldest let one address's flood invalidate
+	 * every other client's token between its negotiate and its GET.
+	 */
+	admits(owner?: string): boolean {
+		this.#expireTokens();
+		let pending = 0;
+		let mine = 0;
+		for (const issued of this.#tokenToId.values()) {
+			if (issued.claimed) continue;
+			pending++;
+			if (owner !== undefined && issued.owner === owner) mine++;
+		}
+		if (pending >= this.#maxPendingTokens) return false;
+		return (
+			owner === undefined ||
+			this.#maxPendingTokensPerOwner === false ||
+			mine < this.#maxPendingTokensPerOwner
+		);
 	}
 
 	/** Milliseconds an opened stream has to complete the handshake. */
@@ -195,17 +250,27 @@ export class SignalRAdapter {
 	 * Server-Sent Events, which is the transport `@c9up/relay` provides and a
 	 * first-class SignalR transport — announcing WebSockets when nothing can
 	 * upgrade would send every client down a road that dead-ends.
+	 *
+	 * `owner` is who asked (see {@link admits}). Throws when the table, or
+	 * the owner's share of it, is full — check {@link admits} first to answer
+	 * with a status instead.
 	 */
 	negotiate(
 		connectionId: string,
 		transports: readonly string[] = ["ServerSentEvents"],
+		owner?: string,
 	): NegotiateResponse {
-		this.#expireTokens();
+		if (!this.admits(owner)) {
+			throw new Error(
+				"Too many pending SignalR connections — the negotiate was refused.",
+			);
+		}
 		const connectionToken = randomUUID();
 		this.#tokenToId.set(connectionToken, {
 			clientId: connectionId,
 			issuedAt: Date.now(),
 			claimed: false,
+			...(owner === undefined ? {} : { owner }),
 		});
 		return {
 			connectionId,
@@ -242,25 +307,14 @@ export class SignalRAdapter {
 	}
 
 	/**
-	 * Drop unclaimed tokens that have run out of time, and, if too many are
-	 * still waiting, the oldest of those. The sweep runs on `negotiate`, which
-	 * is the only thing that grows the table.
+	 * Drop unclaimed tokens that have run out of time. The sweep runs before
+	 * every negotiate, which is the only thing that grows the table.
 	 */
 	#expireTokens(): void {
-		const pending: string[] = [];
 		for (const [token, issued] of this.#tokenToId) {
-			if (issued.claimed) continue;
-			if (this.#isExpired(issued)) {
+			if (!issued.claimed && this.#isExpired(issued)) {
 				this.#tokenToId.delete(token);
-				continue;
 			}
-			pending.push(token);
-		}
-		// Insertion order is issue order, so the front of the list is the oldest.
-		const excess = pending.length - this.#maxPendingTokens;
-		for (let i = 0; i < excess; i++) {
-			const token = pending[i];
-			if (token !== undefined) this.#tokenToId.delete(token);
 		}
 	}
 
