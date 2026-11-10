@@ -88,6 +88,84 @@ describe("relay > Hub > construction + allowlist", () => {
 	});
 });
 
+describe("relay > Hub > method names are matched case-insensitively", () => {
+	class MathHub extends Hub {
+		async onSum(_ctx: HubContext, a: number, b: number, c: number) {
+			return a + b + c;
+		}
+	}
+
+	it("reaches onSum from Sum, sum and SUM, as a SignalR client invokes it", async () => {
+		const hub = new MathHub();
+		const c = makeClient("c1", { isAuthenticated: false });
+		hub.registerClient(c);
+
+		const results = [
+			await hub.dispatch("c1", "Sum", 1, 2, 3),
+			await hub.dispatch("c1", "sum", 1, 2, 3),
+			await hub.dispatch("c1", "SUM", 1, 2, 3),
+		];
+
+		expect(results).toEqual([
+			{ ok: true, result: 6 },
+			{ ok: true, result: 6 },
+			{ ok: true, result: 6 },
+		]);
+		expect(c.sent).toEqual([]);
+	});
+
+	it("still refuses the lifecycle hooks whatever their case", async () => {
+		const hub = new MathHub();
+		const c = makeClient("c1", { isAuthenticated: false });
+		hub.registerClient(c);
+
+		const results = [
+			await hub.dispatch("c1", "Connect"),
+			await hub.dispatch("c1", "DISCONNECT", "c1"),
+		];
+
+		expect(results).toEqual([{ ok: false }, { ok: false }]);
+	});
+
+	it("refuses at construction two handlers that differ only by case", () => {
+		class Ambiguous extends Hub {
+			async onFoo() {}
+			async onfoo() {}
+		}
+		expect(() => new Ambiguous()).toThrow(/onFoo.*onfoo|onfoo.*onFoo/);
+	});
+
+	it("refuses a subclass handler that shadows a base one under another case", () => {
+		class Base extends Hub {
+			async onFoo() {}
+		}
+		class Derived extends Base {
+			async onFOO() {}
+		}
+		expect(() => new Derived()).toThrow(/onFOO.*onFoo/);
+	});
+
+	it("keeps a same-name override in a subclass", async () => {
+		class Base extends Hub {
+			async onFoo() {
+				return "base";
+			}
+		}
+		class Derived extends Base {
+			override async onFoo() {
+				return "derived";
+			}
+		}
+		const hub = new Derived();
+		hub.registerClient(makeClient("c1", { isAuthenticated: false }));
+
+		expect(await hub.dispatch("c1", "Foo")).toEqual({
+			ok: true,
+			result: "derived",
+		});
+	});
+});
+
 describe("relay > Hub > registerClient / removeClient / stats", () => {
 	it("registerClient + stats report client count", () => {
 		const hub = new TestHub();

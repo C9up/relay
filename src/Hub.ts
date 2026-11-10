@@ -70,15 +70,19 @@ interface ConnectedHubClient {
  * Base Hub class — extend to create typed hubs.
  *
  * Methods starting with "on" are auto-registered as message handlers. The
- * event name is the method name after "on", with its first letter lowercased:
- * `onTaskUpdate` handles `taskUpdate`. (`onConnect` / `onDisconnect` are
- * lifecycle hooks and are not dispatchable.)
+ * event name is the method name after "on", matched case-insensitively as
+ * SignalR resolves hub methods: `onTaskUpdate` handles `taskUpdate`,
+ * `TaskUpdate` and `TASKUPDATE`. (`onConnect` / `onDisconnect` are lifecycle
+ * hooks and are not dispatchable.)
  */
 export abstract class Hub {
 	#clients: Map<string, ConnectedHubClient> = new Map();
 	#groupIndex: Map<string, Set<string>> = new Map();
 	#guards: HubGuardOptions = {};
-	/** Allowlist of dispatchable handler methods (populated at construction). */
+	/**
+	 * Allowlist of dispatchable handler methods (populated at construction),
+	 * keyed by the lowercased event name.
+	 */
 	#handlerMethods: Map<
 		string,
 		(ctx: HubContext, ...args: unknown[]) => Promise<void> | void
@@ -100,21 +104,37 @@ export abstract class Hub {
 	 * method resolution already says they do.
 	 */
 	constructor() {
-		const reserved = new Set(["onConnect", "onDisconnect"]);
+		const reserved = new Set(["connect", "disconnect"]);
+		/** Lowercased event → the method name that claimed it. */
+		const claimedBy = new Map<string, string>();
 		let proto: object | null = Object.getPrototypeOf(this);
 		while (proto !== null && proto !== Hub.prototype) {
 			for (const name of Object.getOwnPropertyNames(proto)) {
-				if (!name.startsWith("on") || name.length <= 2 || reserved.has(name)) {
-					continue;
+				if (!name.startsWith("on") || name.length <= 2) continue;
+				// Lowercased because SignalR resolves a hub method name without
+				// regard to case, and its clients invoke PascalCase names
+				// (`invoke('Sum')`) that an exact lookup never found.
+				const eventName = name.slice(2).toLowerCase();
+				if (reserved.has(eventName)) continue;
+				const claimant = claimedBy.get(eventName);
+				if (claimant !== undefined) {
+					// The same name lower in the chain is an override: the
+					// subclass's wins, as method resolution already says.
+					if (claimant === name) continue;
+					// Two spellings of one event would leave the invocation to
+					// whichever happened to be walked first.
+					throw new Error(
+						`Hub handlers '${claimant}' and '${name}' answer the same invocation — method names are matched case-insensitively. Rename one.`,
+					);
 				}
-				const eventName = name.charAt(2).toLowerCase() + name.slice(3);
-				// A base class does not override the subclass that extends it.
-				if (this.#handlerMethods.has(eventName)) continue;
 				// Read the descriptor rather than the property: a getter would
 				// otherwise be invoked here, during construction, just to find out
 				// whether it answers a function.
 				const handler = Object.getOwnPropertyDescriptor(proto, name)?.value;
-				if (isHandler(handler)) this.#handlerMethods.set(eventName, handler);
+				if (isHandler(handler)) {
+					claimedBy.set(eventName, name);
+					this.#handlerMethods.set(eventName, handler);
+				}
 			}
 			proto = Object.getPrototypeOf(proto);
 		}
@@ -286,7 +306,7 @@ export abstract class Hub {
 		}
 
 		// Find handler from allowlist (never dispatches to lifecycle hooks or inherited methods)
-		const handler = this.#handlerMethods.get(event);
+		const handler = this.#handlerMethods.get(event.toLowerCase());
 		if (!handler) {
 			client.send("error", {
 				code: "E_RELAY_UNKNOWN_EVENT",
