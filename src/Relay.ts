@@ -291,7 +291,8 @@ export class Relay {
 	readonly #instanceId = randomUUID();
 	/** channel → set of uids subscribed to it (O(1) broadcast). */
 	#channelIndex = new Map<string, Set<string>>();
-	#authorizers = new Map<string, ChannelAuthorizer<Record<string, string>>>();
+	/** Pattern → its authorizer, in registration order (the match order). */
+	#authorizers = new Map<string, RegisteredAuthorizer>();
 	#listeners: { [E in LifecycleEventName]?: Set<LifecycleListener<E>> } = {};
 	#routeCustomizer?: RelayRouteCustomizer;
 	/**
@@ -588,11 +589,11 @@ export class Relay {
 	 * @internal Called by `setRelay` when the instance is replaced.
 	 */
 	adoptRegistrationsFrom(previous: Relay): void {
-		for (const [pattern, callback] of previous.#authorizers) {
+		for (const [pattern, registered] of previous.#authorizers) {
 			// An authorizer this instance already declared wins: it was
 			// registered against the served instance on purpose.
 			if (!this.#authorizers.has(pattern)) {
-				this.#authorizers.set(pattern, callback);
+				this.#authorizers.set(pattern, registered);
 			}
 		}
 		if (previous.#routesRequested) this.#routesRequested = true;
@@ -615,20 +616,30 @@ export class Relay {
 	}
 
 	/**
-	 * Register an authorization callback. Patterns support a single
-	 * `:param` slot or a trailing `:*` wildcard:
+	 * Register an authorization callback for a channel pattern, in Transmit's
+	 * grammar: static segments, `:param`, `:param.suffix`, trailing optional
+	 * `:param?`, and a trailing `*` after any prefix (its match is handed over
+	 * as `'*'`):
 	 *
 	 *   authorize('users/:id/notifications', (ctx, { id }) => ...)
-	 *   authorize('projects/*', (ctx, _) => ...)
+	 *   authorize('orgs/:org/*', (ctx, { org }) => ...)
+	 *   authorize('posts/:id?', (ctx, { id }) => ...)
+	 *
+	 * An exact registration wins over a pattern; patterns are tried in
+	 * registration order. Throws on a pattern that could never match.
 	 */
 	authorize<TParams extends Record<string, string> = Record<string, string>>(
 		pattern: string,
 		callback: ChannelAuthorizer<TParams>,
 	): void {
-		this.#authorizers.set(
-			pattern,
-			callback as ChannelAuthorizer<Record<string, string>>,
-		);
+		const segments = parseChannelPattern(pattern);
+		this.#authorizers.set(pattern, {
+			// The params handed over are the ones THIS pattern yields, which is
+			// what `TParams` describes; the method slot takes the callback as is.
+			authorize: callback,
+			segments,
+			isStatic: segments.every((segment) => segment.kind === "static"),
+		});
 	}
 
 	// ─── Auto-registered route customization ──────────────────
@@ -1300,10 +1311,15 @@ export class Relay {
 				params: Record<string, string>;
 		  }
 		| undefined {
+		// An exact registration wins over a pattern — but only a STATIC one: a
+		// channel literally spelled `users/:id` goes to the pattern with its
+		// params, not to its authorizer with none.
 		const exact = this.#authorizers.get(channel);
-		if (exact) return { authorize: exact, params: {} };
-		for (const [pattern, authorize] of this.#authorizers) {
-			const params = extractParams(pattern, channel);
+		if (exact?.isStatic === true) {
+			return { authorize: exact.authorize, params: {} };
+		}
+		for (const { authorize, segments } of this.#authorizers.values()) {
+			const params = matchChannel(segments, channel);
 			if (params) return { authorize, params };
 		}
 		return undefined;
@@ -1466,48 +1482,117 @@ function isRelayTransportMessage(
 	);
 }
 
-/**
- * Match `pattern` against `channel`. Patterns can contain `:param`
- * placeholders (`users/:id/notifications`) and a trailing `*`
- * wildcard (`projects/*`).
- */
-function matchesPattern(pattern: string, channel: string): boolean {
-	if (pattern === channel) return true;
-	if (pattern.endsWith("/*")) {
-		const prefix = pattern.slice(0, -2);
-		return channel === prefix || channel.startsWith(`${prefix}/`);
-	}
-	const patternParts = pattern.split("/");
-	const channelParts = channel.split("/");
-	if (patternParts.length !== channelParts.length) return false;
-	// Both lists are the same length, checked just above; walking them in step
-	// is what lets each pair be read as two strings rather than two maybes.
-	for (const [i, p] of patternParts.entries()) {
-		const c = channelParts[i];
-		if (p.startsWith(":")) continue;
-		if (p !== c) return false;
-	}
-	return true;
+/** One segment of a channel pattern, in Transmit's (matchit's) grammar. */
+type PatternSegment =
+	| { kind: "static"; value: string }
+	| { kind: "param"; name: string; suffix: string; optional: boolean }
+	| { kind: "wildcard" };
+
+/** A registered authorizer and the pattern it was registered under, parsed once. */
+interface RegisteredAuthorizer {
+	authorize(
+		ctx: RelayContext,
+		params: Record<string, string>,
+	): Promise<boolean> | boolean;
+	segments: readonly PatternSegment[];
+	/** No param and no wildcard: matched by equality, ahead of every pattern. */
+	isStatic: boolean;
+}
+
+/** Split on `/`, past one leading and one trailing slash, as matchit does. */
+function splitChannel(value: string): string[] {
+	let trimmed = value.startsWith("/") ? value.slice(1) : value;
+	if (trimmed.endsWith("/")) trimmed = trimmed.slice(0, -1);
+	return trimmed.split("/");
 }
 
 /**
- * Extract named params from a pattern + channel pair. Returns
- * `undefined` when the pattern doesn't match — `Relay.#findAuthorizer`
- * already filtered the input so this is mostly a re-walk.
+ * Parse a channel pattern: static segments, `:name`, `:name.suffix`,
+ * `:name?` (optional, trailing only) and a trailing `*` — matchit's grammar,
+ * which Transmit matches secured channels with.
+ *
+ * A pattern that could never match as written throws here, at `authorize()`,
+ * rather than being stored and silently never matching.
  */
-function extractParams(
-	pattern: string,
+function parseChannelPattern(pattern: string): PatternSegment[] {
+	const fail = (why: string): never => {
+		throw new Error(`[relay] invalid channel pattern '${pattern}': ${why}`);
+	};
+	if (splitChannel(pattern).join("") === "") fail("it is empty");
+	const segments: PatternSegment[] = [];
+	const names = new Set<string>();
+	for (const raw of splitChannel(pattern)) {
+		const last = segments.at(-1);
+		if (last?.kind === "wildcard")
+			fail("the wildcard `*` must be the last segment");
+		const optionalBefore = last?.kind === "param" && last.optional;
+		if (raw.startsWith("*")) {
+			if (raw !== "*") fail("a wildcard segment is `*` alone");
+			if (optionalBefore)
+				fail("an optional param must be followed only by optional params");
+			segments.push({ kind: "wildcard" });
+			continue;
+		}
+		if (!raw.startsWith(":")) {
+			if (optionalBefore)
+				fail("an optional param must be followed only by optional params");
+			segments.push({ kind: "static", value: raw });
+			continue;
+		}
+		const match = /^:([A-Za-z0-9_$-]+)(\.[^?]+)?(\?)?$/.exec(raw);
+		const name = match?.[1];
+		if (match === null || name === undefined) {
+			return fail(
+				`'${raw}' is not a param (\`:name\`, \`:name?\` or \`:name.suffix\`)`,
+			);
+		}
+		const optional = match[3] === "?";
+		const suffix = match[2] ?? "";
+		if (optional && suffix !== "")
+			fail(`'${raw}' cannot be both optional and suffixed`);
+		if (optionalBefore && !optional) {
+			fail("an optional param must be followed only by optional params");
+		}
+		if (names.has(name)) fail(`the param '${name}' appears twice`);
+		names.add(name);
+		segments.push({ kind: "param", name, suffix, optional });
+	}
+	return segments;
+}
+
+/**
+ * The params `segments` yields for `channel`, or `undefined` when the pattern
+ * does not cover it. A trailing `*` hands over everything it matched as `'*'`.
+ */
+function matchChannel(
+	segments: readonly PatternSegment[],
 	channel: string,
 ): Record<string, string> | undefined {
-	if (!matchesPattern(pattern, channel)) return undefined;
-	const patternParts = pattern.split("/");
-	const channelParts = channel.split("/");
-	const out: Record<string, string> = {};
-	for (const [i, p] of patternParts.entries()) {
-		const value = channelParts[i];
-		if (p.startsWith(":") && value !== undefined) {
-			out[p.slice(1)] = value;
-		}
+	const parts = splitChannel(channel);
+	const wildcard = segments.at(-1)?.kind === "wildcard";
+	const required = segments.filter(
+		(segment) => !(segment.kind === "param" && segment.optional),
+	).length;
+	if (wildcard ? parts.length < segments.length : parts.length < required) {
+		return undefined;
 	}
-	return out;
+	if (!wildcard && parts.length > segments.length) return undefined;
+	const params: Record<string, string> = {};
+	for (const [i, segment] of segments.entries()) {
+		const part = parts[i];
+		if (segment.kind === "wildcard") {
+			params["*"] = parts.slice(i).join("/");
+			break;
+		}
+		// Only an optional param can run out of channel; the length checks
+		// above stop at the first required segment.
+		if (part === undefined) break;
+		if (segment.kind === "static") {
+			if (part !== segment.value) return undefined;
+			continue;
+		}
+		if (!part.endsWith(segment.suffix)) return undefined;
+		params[segment.name] = part.slice(0, part.length - segment.suffix.length);
+	}
+	return params;
 }
