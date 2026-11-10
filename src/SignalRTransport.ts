@@ -124,19 +124,19 @@ function userIdOf(
  *
  * The connectionToken travels in a query string — SignalR's own design — so it
  * reaches access logs, proxies and `Referer` headers. Holding it must not be
- * enough to speak as the connection: the frames a POST carries are dispatched
- * with the auth recorded when the stream opened, so a leaked token was an
- * invocation as somebody else. This is the same rule `Relay` applies to its own
- * uid — if the connection was authenticated, the request must be the same user;
- * if it was anonymous, the token is all the identity there is.
+ * enough to speak as the connection. This is the rule `Relay` applies to its
+ * own uid, in both directions: a connection opened as a user takes requests
+ * from that user only, and one opened anonymously takes anonymous requests
+ * only — the replies go down a stream someone else may hold, so a victim's
+ * credentials on the POST (a cross-site form) must not pass the guards for it.
+ * No connection registered yet (the first GET) has nobody to match.
  */
 function mayActAs(
 	registered: HubContext["auth"] | undefined,
 	ctx: HubHttpContext,
 ): boolean {
-	const owner = userIdOf(registered);
-	if (owner === undefined) return true;
-	return userIdOf(ctx.auth) === owner;
+	if (registered === undefined) return true;
+	return userIdOf(ctx.auth) === userIdOf(registered);
 }
 
 /**
@@ -307,7 +307,9 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 			// no reply — so watching only the outbound frames meant a graceful
 			// disconnect left the stream open until the socket happened to drop.
 			const clientClosed = SignalRAdapter.containsClose([frame]);
-			const outbound = await adapter.handleFrame(clientId, frame);
+			// Authorized against THIS request, not the one that opened the
+			// stream: a role revoked since then stops working now.
+			const outbound = await adapter.handleFrame(clientId, frame, hubAuth(ctx));
 			for (const out of outbound) {
 				// No stream yet means the client posted before opening the GET.
 				// The frames are dropped rather than queued: SignalR's own client

@@ -29,7 +29,10 @@ export type DispatchResult = { ok: true; result: unknown } | { ok: false };
 export interface HubContext {
 	/** Client ID. */
 	readonly clientId: string;
-	/** Auth state from the upgrade request. */
+	/**
+	 * Auth state: the invoking request's in a handler dispatched with
+	 * {@link Hub.dispatchAs}, the connection's otherwise (and in `onConnect`).
+	 */
 	readonly auth: {
 		isAuthenticated: boolean;
 		strategy?: string;
@@ -140,11 +143,17 @@ export abstract class Hub {
 	/** Called when a client disconnects. Override to customize. */
 	async onDisconnect(_clientId: string): Promise<void> {}
 
-	/** Build a HubContext for a client. */
-	#buildContext(client: ConnectedHubClient): HubContext {
+	/**
+	 * Build a HubContext for a client, carrying `auth` — the invoking
+	 * request's when there is one, the connection's otherwise.
+	 */
+	#buildContext(
+		client: ConnectedHubClient,
+		auth: HubContext["auth"] = client.auth,
+	): HubContext {
 		const ctx: HubContext = {
 			clientId: client.id,
-			auth: client.auth,
+			auth,
 			joinGroup: (group: string) => {
 				client.groups.add(group);
 				if (!this.#groupIndex.has(group))
@@ -239,10 +248,38 @@ export abstract class Hub {
 		event: string,
 		...args: unknown[]
 	): Promise<DispatchResult> {
+		return this.#dispatch(clientId, undefined, event, args);
+	}
+
+	/**
+	 * {@link dispatch}, authorized against `auth` — the request that carries
+	 * the invocation — rather than the auth recorded when the client connected.
+	 *
+	 * A transport whose invocations arrive on requests of their own (SignalR
+	 * over SSE posts each one) uses this: the guards then see a revoked role on
+	 * the next request, not at the next reconnect, and the handler's context
+	 * carries the same auth the guards checked.
+	 */
+	async dispatchAs(
+		clientId: string,
+		auth: HubContext["auth"],
+		event: string,
+		args: readonly unknown[],
+	): Promise<DispatchResult> {
+		return this.#dispatch(clientId, auth, event, args);
+	}
+
+	async #dispatch(
+		clientId: string,
+		requestAuth: HubContext["auth"] | undefined,
+		event: string,
+		args: readonly unknown[],
+	): Promise<DispatchResult> {
 		const client = this.#clients.get(clientId);
 		if (!client) return { ok: false };
+		const auth = requestAuth ?? client.auth;
 
-		const authError = this.#checkDispatchAuth(client);
+		const authError = this.#checkDispatchAuth(auth);
 		if (authError) {
 			client.send("error", authError);
 			return { ok: false };
@@ -258,7 +295,7 @@ export abstract class Hub {
 			return { ok: false };
 		}
 
-		const ctx = this.#buildContext(client);
+		const ctx = this.#buildContext(client, auth);
 		try {
 			// EVERY argument, not just the first. A SignalR client calling
 			// `connection.invoke('Method', a, b, c)` sends three; passing only
@@ -277,8 +314,8 @@ export abstract class Hub {
 
 	/**
 	 * Enforce the hub's guard / strategy / role / permission requirements against
-	 * the client's auth state. Returns the error envelope to send, or null when
-	 * the client is authorised.
+	 * an auth state. Returns the error envelope to send, or null when it is
+	 * authorised.
 	 *
 	 * Roles are ANY-of and permissions are ALL-of, and the asymmetry is
 	 * deliberate: a role names who someone is, and holding one of several
@@ -290,7 +327,7 @@ export abstract class Hub {
 	 * looks like one of them is a typo.
 	 */
 	#checkDispatchAuth(
-		client: ConnectedHubClient,
+		auth: HubContext["auth"],
 	): { code: string; message: string } | null {
 		// `useGuards` already folded the singular `guard` into `guards`, so
 		// reading it again here answered undefined every time — a branch that
@@ -302,12 +339,12 @@ export abstract class Hub {
 			(this.#guards.roles?.length ?? 0) > 0 ||
 			(this.#guards.permissions?.length ?? 0) > 0;
 
-		if (needsAuth && !client.auth.isAuthenticated) {
+		if (needsAuth && !auth.isAuthenticated) {
 			return { code: "E_RELAY_UNAUTHORIZED", message: "Not authenticated" };
 		}
 
 		if (requiredStrategies.length > 0) {
-			const actualStrategy = client.auth.strategy;
+			const actualStrategy = auth.strategy;
 			if (!actualStrategy || !requiredStrategies.includes(actualStrategy)) {
 				return {
 					code: "E_RELAY_UNAUTHORIZED",
@@ -322,14 +359,14 @@ export abstract class Hub {
 		// someone is (an admin OR an owner may act), a permission names what an
 		// action needs (all of them, or it is not allowed).
 		if (this.#guards.roles && this.#guards.roles.length > 0) {
-			const userRoles = client.auth.roles ?? [];
+			const userRoles = auth.roles ?? [];
 			if (!this.#guards.roles.some((r) => userRoles.includes(r))) {
 				return { code: "E_RELAY_FORBIDDEN", message: "Insufficient role" };
 			}
 		}
 
 		if (this.#guards.permissions && this.#guards.permissions.length > 0) {
-			const userPerms = client.auth.permissions ?? [];
+			const userPerms = auth.permissions ?? [];
 			if (!this.#guards.permissions.every((p) => userPerms.includes(p))) {
 				return {
 					code: "E_RELAY_FORBIDDEN",

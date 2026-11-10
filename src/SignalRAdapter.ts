@@ -21,7 +21,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { DispatchResult, Hub } from "./Hub.js";
+import type { DispatchResult, Hub, HubContext } from "./Hub.js";
 
 /** SignalR record separator — every JSON message ends with this byte. */
 const RS = "\x1e";
@@ -275,8 +275,16 @@ export class SignalRAdapter {
 	 *
 	 * The first frame must be a handshake `{"protocol":"json","version":1}<RS>`.
 	 * Subsequent frames are SignalR messages (Invocation, Ping, Close).
+	 *
+	 * `auth` is the auth of the request that carried the frame. Given, every
+	 * invocation in it is authorized against that rather than against the auth
+	 * recorded when the client connected.
 	 */
-	async handleFrame(clientId: string, frame: string): Promise<string[]> {
+	async handleFrame(
+		clientId: string,
+		frame: string,
+		auth?: HubContext["auth"],
+	): Promise<string[]> {
 		if (frame.length > this.#maxFrameSize) {
 			return [
 				this.#encode({
@@ -351,11 +359,11 @@ export class SignalRAdapter {
 					const inv = msg;
 					let dispatched: DispatchResult = { ok: false };
 					try {
-						dispatched = await this.#hub.dispatch(
-							clientId,
-							inv.target,
-							...(inv.arguments ?? []),
-						);
+						const args = Array.isArray(inv.arguments) ? inv.arguments : [];
+						dispatched =
+							auth === undefined
+								? await this.#hub.dispatch(clientId, inv.target, ...args)
+								: await this.#hub.dispatchAs(clientId, auth, inv.target, args);
 					} catch {
 						// dispatch() reports failures via its return; guard against an
 						// unexpected throw so one bad invocation can't abort the whole

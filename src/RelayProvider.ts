@@ -245,6 +245,7 @@ function isHub(value: object): value is Hub {
 	return (
 		value instanceof Hub ||
 		(typeof Reflect.get(value, "dispatch") === "function" &&
+			typeof Reflect.get(value, "dispatchAs") === "function" &&
 			typeof Reflect.get(value, "registerClient") === "function" &&
 			typeof Reflect.get(value, "authFor") === "function")
 	);
