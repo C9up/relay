@@ -57,20 +57,33 @@ function isConnectionSource(value: unknown): value is ConnectionSource {
 }
 
 /**
+ * The commands among `commands` that `value` does not carry as functions.
+ *
+ * Reads go through the same catch as above, so a command whose read throws
+ * counts as missing.
+ */
+export function missingCommands(
+	value: unknown,
+	commands: readonly string[],
+): string[] {
+	return commands.filter(
+		(command) => typeof memberValue(readMember(value, command)) !== "function",
+	);
+}
+
+/**
  * Whether `value` carries every one of `commands` as a function.
  *
  * The building block of the guard a caller passes as `isConnection`, over the
- * commands it issues. Reads go through the same catch as above, so a command
- * whose read throws counts as missing.
+ * same list it passes as `required` — which is what names the gap when the
+ * guard says no.
  */
 export function hasCommands(
 	value: unknown,
 	commands: readonly string[],
 ): value is object {
 	if (typeof value !== "object" || value === null) return false;
-	return commands.every(
-		(command) => typeof memberValue(readMember(value, command)) === "function",
-	);
+	return missingCommands(value, commands).length === 0;
 }
 
 export interface QuasarConnectionRequest<T> {
@@ -161,10 +174,7 @@ export async function quasarConnection<T>(
 	}
 
 	const connection = manager.connection(name);
-	const missing = required.filter(
-		(command) =>
-			typeof memberValue(readMember(connection, command)) !== "function",
-	);
+	const missing = missingCommands(connection, required);
 	if (missing.length > 0) {
 		throw raise(
 			"incomplete-connection",
