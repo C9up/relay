@@ -71,6 +71,12 @@ export interface RelayAuth {
  */
 export interface RelayContext {
 	auth?: RelayAuth;
+	/**
+	 * The request's session, when the session middleware runs on the relay
+	 * routes. `fresh` is true for a session the request did not come in with —
+	 * a new random id on every request until a cookie pins it.
+	 */
+	session?: { readonly sessionId: string; readonly fresh: boolean };
 	/** The request's authorizer — Warden's Bouncer, when it is set up. */
 	bouncer?: {
 		allows(ability: string, ...args: unknown[]): Promise<boolean>;
@@ -284,6 +290,8 @@ interface RegisteredClient {
 	sse: RelaySseStream;
 	channels: Set<string>;
 	auth?: RelayAuth;
+	/** The established session the stream was opened in, if any. */
+	session?: string;
 	/** The connect request's context, handed to the `disconnect` listeners. */
 	context: RelayContext;
 }
@@ -985,6 +993,7 @@ export class Relay {
 			sse,
 			channels: new Set(),
 			auth: ctx.auth,
+			session: sessionOf(ctx),
 			context: ctx,
 		});
 		// A uid is never reused, so whatever this stream reports later — a
@@ -1250,21 +1259,31 @@ export class Relay {
 	 * subscriptions. Returns `null` when allowed, or a `SubscribeResult`
 	 * rejection (subscribe uses it directly; unsubscribe maps non-null to
 	 * `'forbidden'`). The request must carry the identity the stream was
-	 * opened with, in both directions:
+	 * opened with — the same user AND the same established session — in both
+	 * directions:
 	 *
-	 *   - a stream opened as user X takes requests from X only;
-	 *   - a stream opened anonymously takes anonymous requests only. Its
-	 *     server-issued uid is its credential, and an authenticated request
-	 *     naming it would have the authorizer approve, with that user's
-	 *     credentials, frames that land on a stream someone else may hold —
-	 *     the request a forged `connected` frame or a cross-site POST makes.
-	 *     A client that logs in reconnects to get an authenticated stream.
+	 *   - a stream opened as user X, or in session S, takes requests from X,
+	 *     in S, only;
+	 *   - a stream opened anonymously, or with no session, takes requests
+	 *     carrying neither. Its server-issued uid is its credential, and a
+	 *     request with credentials naming it would have the authorizer
+	 *     approve, with THOSE credentials, frames that land on a stream someone
+	 *     else may hold — the request a forged `connected` frame or a
+	 *     cross-site POST makes. A client that logs in, or is handed a session
+	 *     cookie, reconnects to get a stream bound to it.
+	 *
+	 * Transmit has no such check — its uid is chosen by the client — so this
+	 * is relay's own hardening, and it has to hold in both directions to hold
+	 * at all.
 	 */
 	#assertOwnership(
-		client: { auth?: RelayAuth },
+		client: { auth?: RelayAuth; session?: string },
 		ctx: RelayContext,
 	): SubscribeResult | null {
-		if (userIdOf(client.auth) !== userIdOf(ctx.auth)) {
+		if (
+			userIdOf(client.auth) !== userIdOf(ctx.auth) ||
+			client.session !== sessionOf(ctx)
+		) {
 			return { ok: false, status: 403, code: "E_RELAY_NOT_OWNER" };
 		}
 		return null;
@@ -1458,6 +1477,17 @@ function encodePayload(payload: unknown): string {
 /** The user an auth slice identifies, or `undefined` for an anonymous one. */
 function userIdOf(auth: RelayAuth | undefined): string | undefined {
 	return auth?.isAuthenticated === true ? auth.user?.id : undefined;
+}
+
+/**
+ * The session a request came in with, or `undefined`. A fresh session is a new
+ * random id on every request until a cookie pins it: it identifies nobody.
+ */
+function sessionOf(ctx: RelayContext): string | undefined {
+	const session = ctx.session;
+	return session !== undefined && session.fresh === false
+		? session.sessionId
+		: undefined;
 }
 
 /** A uid or a channel, as it has to arrive to be usable at all. */

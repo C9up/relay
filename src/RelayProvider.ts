@@ -185,6 +185,8 @@ interface ReamHttpContext {
 		isAuthenticated: boolean;
 		user?: { id: string; [key: string]: unknown };
 	};
+	/** Ream's session, when its middleware runs on the relay routes. */
+	session?: { readonly sessionId: string; readonly fresh: boolean };
 }
 interface ReamRouter {
 	get(
