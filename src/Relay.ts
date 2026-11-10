@@ -441,7 +441,7 @@ export class Relay {
 				isRelayTransportMessage(message) &&
 				message.origin !== this.#instanceId
 			) {
-				this.#deliver(message.channel, message.payload);
+				this.#redeliver(message);
 			}
 		};
 		const teardown = this.#teardown;
@@ -772,7 +772,9 @@ export class Relay {
 		// of those a listener sees would depend on where it happened to run.
 		// Transmit substitutes null here for the same reason.
 		const carried = payload === undefined ? null : payload;
-		const reached = this.#deliver(channel, carried);
+		// Encoded first, so a payload JSON cannot carry throws here, at the
+		// caller, before anything reaches a client or the bus.
+		const reached = this.#deliver(channel, encodePayload(carried));
 		this.#publishToBus(channel, carried);
 		this.#emit("broadcast", { channel, payload: carried });
 		return reached;
@@ -791,19 +793,18 @@ export class Relay {
 		payload: unknown,
 		senderUid: string | string[],
 	): number {
-		return this.#deliver(channel, payload, senderUid);
+		return this.#deliver(channel, encodePayload(payload), senderUid);
 	}
 
 	/**
-	 * Fan a payload out to the local SSE clients subscribed to `channel`,
-	 * skipping any uid in `exclude`. Reaps dead writers during the walk.
-	 * Shared by `broadcast` / `broadcastExcept` and the transport re-emit.
+	 * Fan an encoded payload out to the local SSE clients subscribed to
+	 * `channel`, skipping any uid in `exclude`. Reaps dead writers during the
+	 * walk. Shared by `broadcast` / `broadcastExcept` and the transport re-emit.
+	 *
+	 * `data` is the payload's JSON text (see {@link encodePayload}), handed to
+	 * the stream as a string so it is written as it is.
 	 */
-	#deliver(
-		channel: string,
-		payload: unknown,
-		exclude?: string | string[],
-	): number {
+	#deliver(channel: string, data: string, exclude?: string | string[]): number {
 		const subscribers = this.#channelIndex.get(channel);
 		if (!subscribers || subscribers.size === 0) return 0;
 		const excluded =
@@ -842,7 +843,7 @@ export class Relay {
 			// the map to fail on every later broadcast. Unhandled, that
 			// rejection took the process down on a default Node — one dead
 			// socket ending the broadcast for everybody.
-			void client.sse.send(channel, payload).catch((error: unknown) => {
+			void client.sse.send(channel, data).catch((error: unknown) => {
 				this.#warn(`delivery to ${uid} on '${channel}' failed`, error);
 				this.#dropClient(uid);
 			});
@@ -850,6 +851,18 @@ export class Relay {
 		}
 		for (const uid of dead) this.#dropClient(uid);
 		return reached;
+	}
+
+	/** A broadcast another instance published, delivered to this one's clients. */
+	#redeliver(message: RelayTransportMessage): void {
+		let data: string;
+		try {
+			data = encodePayload(message.payload);
+		} catch (error) {
+			this.#warn(`a bus message on '${message.channel}' was dropped`, error);
+			return;
+		}
+		this.#deliver(message.channel, data);
 	}
 
 	#publishToBus(channel: string, payload: unknown): void {
@@ -1389,6 +1402,24 @@ function toMilliseconds(
 		);
 	}
 	return Number(match[1]) * factor;
+}
+
+/**
+ * A payload as the JSON text the client parses.
+ *
+ * Always encoded here, strings included. The stream writes a string as it is,
+ * and the event-stream parser ends a line at a lone CR as well as at LF: a
+ * string payload carrying `\r\r` ended its own event and forged the next one,
+ * `connected` included. Encoded, a string becomes a JSON string literal in
+ * which every line terminator is escaped, and the client can tell `'{"a":1}'`
+ * from `{ a: 1 }`. Transmit encodes for the same reason (`dataToString`).
+ *
+ * Throws on what JSON cannot carry (a cycle, a BigInt).
+ */
+function encodePayload(payload: unknown): string {
+	// `undefined`, a function or a symbol encode to nothing at all; the client
+	// would receive an empty data line it cannot parse.
+	return JSON.stringify(payload) ?? "null";
 }
 
 /** A uid or a channel, as it has to arrive to be usable at all. */

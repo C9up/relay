@@ -11,6 +11,15 @@ import {
 	transports,
 } from "../../src/index.js";
 
+/**
+ * A frame's data as the browser client reads it. The relay hands a broadcast
+ * payload over as JSON text, which the client parses; its own frames
+ * (`connected`, the keep-alive) are objects the stream encodes.
+ */
+function asClientReadsIt(data: unknown): unknown {
+	return typeof data === "string" ? JSON.parse(data) : data;
+}
+
 /** Minimal SSE double that records every `send(event, data)`. */
 function fakeSse(id: string): RelaySseStream & {
 	sent: Array<{ event: string; data: unknown }>;
@@ -21,7 +30,7 @@ function fakeSse(id: string): RelaySseStream & {
 		sent,
 		isOpen: () => true,
 		async send(event, data) {
-			sent.push({ event, data });
+			sent.push({ event, data: asClientReadsIt(data) });
 			return true;
 		},
 		onClose() {},
