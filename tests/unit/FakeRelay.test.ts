@@ -108,8 +108,10 @@ describe("FakeRelay > payload parity with the real relay", () => {
 		const relay = new FakeRelay();
 
 		relay.broadcast("feed", undefined);
+		relay.broadcastExcept("feed", undefined, "uid-1");
 
 		expect(relay.getSent()).toEqual([
+			{ channel: "feed", data: null, clients: 0 },
 			{ channel: "feed", data: null, clients: 0 },
 		]);
 	});

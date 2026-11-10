@@ -96,7 +96,7 @@ describe("relay-broadcast > broadcastExcept", () => {
 		expect(c.sse.sent).toEqual([{ event: "room/1", data: { n: 1 } }]);
 	});
 
-	it("does NOT mirror onto the bus (local-only, like Transmit)", async () => {
+	it("mirrors onto the bus with the excluded uids, like Transmit", async () => {
 		const publish = vi.fn();
 		const transport: RelayTransport = { publish, subscribe: vi.fn() };
 		const r = new Relay({ allowUnauthorizedChannels: true, transport });
@@ -105,7 +105,74 @@ describe("relay-broadcast > broadcastExcept", () => {
 
 		r.broadcastExcept("room/1", { x: 1 }, a.uid);
 
-		expect(publish).not.toHaveBeenCalled();
+		expect(publish).toHaveBeenCalledWith("relay::broadcast", {
+			type: "broadcast",
+			channel: "room/1",
+			payload: { x: 1 },
+			exceptUids: a.uid,
+			origin: expect.any(String),
+		});
+	});
+
+	it("reaches a subscriber on another instance and skips an excluded uid living there", async () => {
+		// One in-process bus shared by two instances, delivering to every
+		// subscriber the way a pub/sub server does.
+		const handlers: Array<(message: unknown) => void> = [];
+		const bus: RelayTransport = {
+			publish: (_channel, message) => {
+				for (const handler of handlers) handler(message);
+			},
+			subscribe: (_channel, handler) => {
+				handlers.push(handler);
+			},
+		};
+		const a = new Relay({ allowUnauthorizedChannels: true, transport: bus });
+		const b = new Relay({ allowUnauthorizedChannels: true, transport: bus });
+		await a.startTransport();
+		await b.startTransport();
+		const onA = await connectAndSubscribe(a, "u-a", "room/1");
+		const keptOnB = await connectAndSubscribe(b, "u-b", "room/1");
+		const excludedOnB = await connectAndSubscribe(b, "u-c", "room/1");
+
+		const reached = a.broadcastExcept("room/1", { n: 1 }, [
+			onA.uid,
+			excludedOnB.uid,
+		]);
+
+		expect(reached).toBe(0);
+		expect(onA.sse.sent).toEqual([]);
+		expect(keptOnB.sse.sent).toEqual([{ event: "room/1", data: { n: 1 } }]);
+		expect(excludedOnB.sse.sent).toEqual([]);
+	});
+
+	it("drops a bus message whose exceptUids is neither a uid nor a list of them", async () => {
+		let busHandler: ((message: unknown) => void) | undefined;
+		const transport: RelayTransport = {
+			publish: vi.fn(),
+			subscribe: (_channel, handler) => {
+				busHandler = handler;
+			},
+		};
+		const r = new Relay({ allowUnauthorizedChannels: true, transport });
+		await r.startTransport();
+		const a = await connectAndSubscribe(r, "u-a", "room/1");
+
+		// A malformed exclusion would otherwise read as "exclude nobody" and
+		// deliver to the very client the sender meant to skip.
+		busHandler?.({
+			type: "broadcast",
+			channel: "room/1",
+			payload: {},
+			exceptUids: 42,
+		});
+		busHandler?.({
+			type: "broadcast",
+			channel: "room/1",
+			payload: {},
+			exceptUids: [a.uid, 7],
+		});
+
+		expect(a.sse.sent).toEqual([]);
 	});
 });
 

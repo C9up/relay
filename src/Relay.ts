@@ -208,6 +208,8 @@ interface RelayTransportMessage {
 	type: "broadcast";
 	channel: string;
 	payload: unknown;
+	/** Uids that must not receive it — `broadcastExcept`, as Transmit carries it. */
+	exceptUids?: string | string[];
 	/**
 	 * The relay that published it. The bus delivers a publication to every
 	 * subscriber, the publisher included, and that relay has already delivered
@@ -782,18 +784,26 @@ export class Relay {
 
 	/**
 	 * Broadcast to every subscriber of `channel` EXCEPT the given uid(s).
-	 * Returns the number of clients reached. Mirrors Adonis Transmit's
+	 * Returns the number of LOCAL clients reached. Mirrors Adonis Transmit's
 	 * `broadcastExcept` — used to skip the socket that originated an action
-	 * (e.g. optimistic-UI echo suppression). Local-only, like Transmit: it
-	 * does not mirror onto the bus, so the exclusion is honored on the
-	 * originating instance where the sender lives.
+	 * (e.g. optimistic-UI echo suppression). Like Transmit, it is mirrored
+	 * onto the bus with the excluded uids, so the subscribers of the other
+	 * instances receive it and the exclusion holds wherever the uid lives.
 	 */
 	broadcastExcept(
 		channel: string,
 		payload: unknown,
 		senderUid: string | string[],
 	): number {
-		return this.#deliver(channel, encodePayload(payload), senderUid);
+		const reached = this.#deliver(channel, encodePayload(payload), senderUid);
+		// `null` on the bus for an absent payload: a JSON bus drops the key, and
+		// the other instances would then refuse the message as malformed.
+		this.#publishToBus(
+			channel,
+			payload === undefined ? null : payload,
+			senderUid,
+		);
+		return reached;
 	}
 
 	/**
@@ -862,15 +872,20 @@ export class Relay {
 			this.#warn(`a bus message on '${message.channel}' was dropped`, error);
 			return;
 		}
-		this.#deliver(message.channel, data);
+		this.#deliver(message.channel, data, message.exceptUids);
 	}
 
-	#publishToBus(channel: string, payload: unknown): void {
+	#publishToBus(
+		channel: string,
+		payload: unknown,
+		exceptUids?: string | string[],
+	): void {
 		if (!this.#transport) return;
 		const message: RelayTransportMessage = {
 			type: "broadcast",
 			channel,
 			payload,
+			...(exceptUids === undefined ? {} : { exceptUids }),
 			origin: this.#instanceId,
 		};
 		// A publish that fails means the other instances never hear this
@@ -1437,7 +1452,18 @@ function isRelayTransportMessage(
 	if (!("type" in value) || !("channel" in value) || !("payload" in value)) {
 		return false;
 	}
-	return value.type === "broadcast" && typeof value.channel === "string";
+	if (value.type !== "broadcast" || typeof value.channel !== "string") {
+		return false;
+	}
+	// A malformed exclusion is not "exclude nobody": that would deliver to the
+	// very client the sender meant to skip.
+	if (!("exceptUids" in value) || value.exceptUids === undefined) return true;
+	const except = value.exceptUids;
+	return (
+		typeof except === "string" ||
+		(Array.isArray(except) &&
+			except.every((uid: unknown) => typeof uid === "string"))
+	);
 }
 
 /**

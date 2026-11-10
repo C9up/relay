@@ -50,14 +50,14 @@ export class FakeRelay {
 
 	/** Mirrors the real `Relay.broadcastExcept` — captures the call
 	 *  (the excluded uid(s) are irrelevant to assertions, since the fake
-	 *  holds no real clients) and returns 0. Like the real one, it does NOT
-	 *  substitute for an absent payload: only `broadcast` does. */
+	 *  holds no real clients) and returns 0. An absent payload is captured
+	 *  as null, which is what the real one puts on the wire and the bus. */
 	broadcastExcept(
 		channel: string,
 		data: unknown,
 		_senderUid: string | string[],
 	): number {
-		return this.#capture(channel, data);
+		return this.#capture(channel, data === undefined ? null : data);
 	}
 
 	#capture(channel: string, data: unknown): number {
