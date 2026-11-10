@@ -219,11 +219,17 @@ interface RelayTransportMessage {
 	origin?: string;
 }
 
+/**
+ * What each lifecycle listener receives. `context` is the request's, as
+ * Transmit's hooks carry it: the connect request's for `connect` and
+ * `disconnect` (a disconnect has no request of its own), the subscribe or
+ * unsubscribe request's for those — so a listener can tell who it was.
+ */
 export interface RelayLifecycleEvents {
-	connect: { uid: string };
-	disconnect: { uid: string };
-	subscribe: { uid: string; channel: string };
-	unsubscribe: { uid: string; channel: string };
+	connect: { uid: string; context: RelayContext };
+	disconnect: { uid: string; context: RelayContext };
+	subscribe: { uid: string; channel: string; context: RelayContext };
+	unsubscribe: { uid: string; channel: string; context: RelayContext };
 	broadcast: { channel: string; payload: unknown };
 }
 
@@ -278,6 +284,8 @@ interface RegisteredClient {
 	sse: RelaySseStream;
 	channels: Set<string>;
 	auth?: RelayAuth;
+	/** The connect request's context, handed to the `disconnect` listeners. */
+	context: RelayContext;
 }
 
 /**
@@ -977,6 +985,7 @@ export class Relay {
 			sse,
 			channels: new Set(),
 			auth: ctx.auth,
+			context: ctx,
 		});
 		// A uid is never reused, so whatever this stream reports later — a
 		// close, a failed write — can only concern this connection.
@@ -994,7 +1003,7 @@ export class Relay {
 			this.#warn(`the connected frame for ${uid} failed`, error);
 			this.#dropClient(uid);
 		});
-		this.#emit("connect", { uid });
+		this.#emit("connect", { uid, context: ctx });
 		return { outcome: "ok", uid };
 	}
 
@@ -1075,7 +1084,7 @@ export class Relay {
 		}
 		client.channels.add(channel);
 		this.#indexAdd(channel, uid);
-		this.#emit("subscribe", { uid, channel });
+		this.#emit("subscribe", { uid, channel, context: ctx });
 		return { ok: true };
 	}
 
@@ -1104,7 +1113,7 @@ export class Relay {
 		if (ownership !== null) return "forbidden";
 		if (!client.channels.delete(channel)) return "ok";
 		this.#indexRemove(channel, uid);
-		this.#emit("unsubscribe", { uid, channel });
+		this.#emit("unsubscribe", { uid, channel, context: ctx });
 		return "ok";
 	}
 
@@ -1274,7 +1283,7 @@ export class Relay {
 		if (client.sse.isOpen()) {
 			void client.sse.end().catch(() => {});
 		}
-		this.#emit("disconnect", { uid });
+		this.#emit("disconnect", { uid, context: client.context });
 	}
 
 	#indexAdd(channel: string, uid: string): void {
