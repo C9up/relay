@@ -163,8 +163,31 @@ export function splitFrames(body: string): string[] {
 export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 	router: HubRouter<Ctx, Route>,
 	mounted: MountedHub,
-): { negotiate: Route; stream: Route; send: Route } {
+): {
+	negotiate: Route;
+	stream: Route;
+	send: Route;
+	/**
+	 * End every open stream and refuse the three routes with 503 until
+	 * {@link reopen} — what a shutdown does, as Transmit's `closeAllStreams`.
+	 */
+	close(): Promise<void>;
+	/** Accept connections again after {@link close}. */
+	reopen(): void;
+} {
 	const { path, hub, adapter } = mounted;
+	/** Set by `close()`: the routes refuse until `reopen()`. */
+	let closed = false;
+	const refuseWhileClosed = (ctx: Ctx): boolean => {
+		if (!closed) return false;
+		ctx.response.status(503).json({
+			error: {
+				code: "E_RELAY_SHUT_DOWN",
+				message: "The realtime service is shutting down.",
+			},
+		});
+		return true;
+	};
 	/** Live streams by connectionId, so an upstream POST can answer downstream. */
 	const streams = new Map<string, HubSseStream>();
 	/**
@@ -175,12 +198,14 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 	const awaitingHandshake = new Map<string, HubContext>();
 
 	const negotiate = router.post(`${path}/negotiate`, async (ctx) => {
+		if (refuseWhileClosed(ctx)) return;
 		// The connectionId is the hub's client id; the token is what the client
 		// echoes back on the two data routes.
 		ctx.response.json(adapter.negotiate(crypto.randomUUID()));
 	});
 
 	const stream = router.get(path, async (ctx) => {
+		if (refuseWhileClosed(ctx)) return;
 		const token = readConnectionToken(ctx.request.url(true));
 		const clientId = token ? adapter.resolveToken(token) : undefined;
 		if (clientId === undefined) {
@@ -260,24 +285,13 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		});
 		sse.onClose(() => {
 			clearTimeout(handshakeTimer);
-			// Identity-guarded: a client id can carry a second stream — a
-			// reconnect that opens before the old socket has finished closing —
-			// and the old one's close must not tear down the live connection that
-			// replaced it. Unguarded, the stale close unregistered the new
-			// client from the hub and dropped its tokens, leaving a socket that
-			// was open and could no longer receive anything.
-			if (streams.get(clientId) !== sse) return;
-			streams.delete(clientId);
-			awaitingHandshake.delete(clientId);
-			// `removeClient` fires `onDisconnect` itself — calling it here too
-			// would deliver every disconnect twice.
-			hub.removeClient(clientId);
-			adapter.forget(clientId);
+			release(clientId, sse);
 		});
 		awaitingHandshake.set(clientId, context);
 	});
 
 	const send = router.post(path, async (ctx) => {
+		if (refuseWhileClosed(ctx)) return;
 		const token = readConnectionToken(ctx.request.url(true));
 		const clientId = token ? adapter.resolveToken(token) : undefined;
 		if (clientId === undefined) {
@@ -332,5 +346,40 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		ctx.response.status(200).json({});
 	});
 
-	return { negotiate, stream, send };
+	/**
+	 * Forget a stream that has closed.
+	 *
+	 * Identity-guarded: a client id can carry a second stream — a reconnect
+	 * that opens before the old socket has finished closing — and the old
+	 * one's close must not tear down the live connection that replaced it.
+	 * Unguarded, the stale close unregistered the new client from the hub and
+	 * dropped its tokens, leaving a socket that was open and could no longer
+	 * receive anything.
+	 */
+	function release(clientId: string, sse: HubSseStream): void {
+		if (streams.get(clientId) !== sse) return;
+		streams.delete(clientId);
+		awaitingHandshake.delete(clientId);
+		// `removeClient` fires `onDisconnect` itself — calling it here too
+		// would deliver every disconnect twice.
+		hub.removeClient(clientId);
+		adapter.forget(clientId);
+	}
+
+	const close = async (): Promise<void> => {
+		closed = true;
+		await Promise.all(
+			[...streams].map(async ([clientId, sse]) => {
+				await sse.end().catch(() => {});
+				// A stream whose end did not report its close is released
+				// here, or its client stays registered on the hub.
+				release(clientId, sse);
+			}),
+		);
+	};
+	const reopen = (): void => {
+		closed = false;
+	};
+
+	return { negotiate, stream, send, close, reopen };
 }

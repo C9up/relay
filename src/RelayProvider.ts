@@ -240,6 +240,9 @@ function registerMountedHub(
 		for (const route of [routes.negotiate, routes.stream, routes.send]) {
 			relay.applyRouteCustomization(route);
 		}
+		// The relay's shutdown ends the hub's streams too, and its next start
+		// reopens them.
+		relay.attachHubTransport(routes);
 	}
 }
 
@@ -274,6 +277,11 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 			// entry until its receiver has been taken, so a send followed
 			// immediately by an end no longer loses the body.
 			await sse.send("error", { code: "E_RELAY_MAX_CLIENTS" });
+			await sse.end();
+		} else if (outcome.outcome === "closed") {
+			// Shut down: the stream ends at once, as Transmit destroys the
+			// response. Not a refusal status — an EventSource gives up for good
+			// on one, and this client should reconnect to the next instance.
 			await sse.end();
 		}
 		// outcome === 'ok' → the canonical uid is already shipped to the

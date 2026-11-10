@@ -207,8 +207,6 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 			allowUnauthorizedChannels: true,
 			transport: bus.transport,
 		});
-		const sse = await subscribedClient(relay, "news");
-
 		const first = relay.startTransport();
 		const stopping = relay.shutdown();
 		const second = relay.startTransport();
@@ -218,6 +216,8 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 		await stopping;
 		await relay.startTransport();
 
+		// Subscribed after the restart: a shutdown ends the streams it finds.
+		const sse = await subscribedClient(relay, "news");
 		bus.emit("news", { n: 1 });
 		expect(sse.sent).toHaveLength(1);
 	});
@@ -277,8 +277,6 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 			allowUnauthorizedChannels: true,
 			transport: bus.transport,
 		});
-		const sse = await subscribedClient(relay, "news");
-
 		const starting = relay.startTransport();
 		const stopping = relay.shutdown();
 		const restarting = relay.startTransport();
@@ -288,6 +286,8 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 		await restarting;
 
 		expect(bus.live()).toBe(1);
+		// Subscribed after the restart: a shutdown ends the streams it finds.
+		const sse = await subscribedClient(relay, "news");
 		bus.emit("news", { n: 1 });
 		expect(sse.sent).toHaveLength(1);
 	});
@@ -307,8 +307,6 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 			allowUnauthorizedChannels: true,
 			transport: bus.transport,
 		});
-		const sse = await subscribedClient(relay, "news");
-
 		await relay.startTransport();
 		const stopping = relay.shutdown();
 		// Let the shutdown reach its disconnect before restarting.
@@ -320,6 +318,8 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 		await restarting;
 
 		expect(relay.hasStartedTransport()).toBe(true);
+		// Subscribed after the restart: a shutdown ends the streams it finds.
+		const sse = await subscribedClient(relay, "news");
 		bus.emit("news", { n: 1 });
 		expect(sse.sent).toHaveLength(1);
 	});
@@ -345,8 +345,6 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 			allowUnauthorizedChannels: true,
 			transport,
 		});
-		const sse = await subscribedClient(relay, "news");
-
 		await relay.startTransport();
 		await expect(relay.shutdown()).rejects.toThrow("busy");
 
@@ -359,6 +357,8 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 		refuse = false;
 		await relay.shutdown();
 		await relay.startTransport();
+		// Subscribed after the restart: a shutdown ends the streams it finds.
+		const sse = await subscribedClient(relay, "news");
 		for (const handler of handlers) {
 			handler({ type: "broadcast", channel: "news", payload: { n: 1 } });
 		}

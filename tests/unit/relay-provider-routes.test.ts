@@ -253,6 +253,63 @@ describe("relay > provider > the routes", () => {
 });
 
 describe("relay > provider > shutdown", () => {
+	it("ends the event streams and the hub streams, and the next ready reopens both", async () => {
+		class ChatHub extends Hub {}
+		const { app, router } = fakeApp({ withRouter: true });
+		const provider = new RelayProvider(app);
+		provider.register();
+		await provider.boot();
+		const relay = getRelay();
+		if (relay === undefined) throw new Error("no relay");
+		relay.registerRoutes();
+		relay.hub("/hubs/chat", new ChatHub());
+		await provider.start();
+		await provider.ready();
+
+		const events = router.routes.get("GET /__relay/events");
+		const open = fakeResponse();
+		await events?.({ request: fakeRequest(), response: open });
+		const negotiated = fakeResponse();
+		await router.routes.get("POST /hubs/chat/negotiate")?.({
+			request: fakeRequest(),
+			response: negotiated,
+		});
+		const token = String(
+			Reflect.get(Object(negotiated.sent[0]?.body), "connectionToken"),
+		);
+		const hubStream = fakeResponse();
+		const hubUrl = `/hubs/chat?id=${token}`;
+		await router.routes.get("GET /hubs/chat")?.({
+			request: { ...fakeRequest(), url: () => hubUrl },
+			response: hubStream,
+		});
+		expect(open.sseEnded).toBe(false);
+		expect(hubStream.sseOpened).toBe(true);
+
+		await provider.shutdown();
+
+		expect(open.sseEnded).toBe(true);
+		expect(hubStream.sseEnded).toBe(true);
+		// A connection arriving afterwards is ended at once, with no uid.
+		const late = fakeResponse();
+		await events?.({ request: fakeRequest(), response: late });
+		expect(late.sseEnded).toBe(true);
+		expect(late.frames).toEqual([]);
+
+		// The next ready starts again, and the hub takes streams again.
+		await provider.ready();
+		const renegotiated = fakeResponse();
+		await router.routes.get("POST /hubs/chat/negotiate")?.({
+			request: fakeRequest(),
+			response: renegotiated,
+		});
+		expect(renegotiated.sent[0]?.status).toBeUndefined();
+		const again = fakeResponse();
+		await events?.({ request: fakeRequest(), response: again });
+		expect(again.sseEnded).toBe(false);
+		expect(again.frames.map((f) => f.event)).toEqual(["connected"]);
+	});
+
 	it("releases the bus so a redeploy leaks no transport handle", async () => {
 		const { app } = fakeApp();
 		const provider = new RelayProvider(app as never);

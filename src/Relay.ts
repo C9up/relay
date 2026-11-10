@@ -285,6 +285,15 @@ export interface RelayRouteMounter {
 	): void;
 }
 
+/**
+ * What a mounted hub's transport exposes to the relay's lifecycle, so a
+ * shutdown ends its streams too.
+ */
+export interface HubTransportLifecycle {
+	close(): Promise<void>;
+	reopen(): void;
+}
+
 interface RegisteredClient {
 	uid: string;
 	sse: RelaySseStream;
@@ -381,6 +390,13 @@ export class Relay {
 	#unreleased: (() => Promise<void>) | undefined;
 	/** Keep-alive period, held until the transport actually starts. */
 	readonly #pingInterval: number | false | undefined;
+	/**
+	 * Set by `shutdown()`: new connections are refused until the next start.
+	 * Transmit's stream manager latches the same way (`#isClosed`).
+	 */
+	#closed = false;
+	/** Hub transports mounted against this relay, closed with it. */
+	readonly #hubTransports = new Set<HubTransportLifecycle>();
 	/** Whether the endpoints are on the router — mounting twice duplicates them. */
 	#routesMounted = false;
 	#pingTimer?: ReturnType<typeof setInterval>;
@@ -433,6 +449,11 @@ export class Relay {
 	 *   to, which is a split-brain the caller can still refuse to boot on.
 	 */
 	async startTransport(): Promise<void> {
+		// A start after a shutdown takes connections again.
+		if (this.#closed) {
+			this.#closed = false;
+			for (const transport of this.#hubTransports) transport.reopen();
+		}
 		if (this.#transportStarted) return this.#transportReady;
 		this.#transportStarted = true;
 		this.#transportAttempted = true;
@@ -750,6 +771,14 @@ export class Relay {
 		for (const mounted of this.#hubs.values()) mounter.mountHub(this, mounted);
 	}
 
+	/**
+	 * @internal Tie a mounted hub's transport to this relay's lifecycle: a
+	 * shutdown ends its streams, the next start reopens it.
+	 */
+	attachHubTransport(transport: HubTransportLifecycle): void {
+		this.#hubTransports.add(transport);
+	}
+
 	/** @internal Whether the application ever asked for the SSE endpoints. */
 	hasRegisteredRoutes(): boolean {
 		return this.#routesRequested;
@@ -977,13 +1006,18 @@ export class Relay {
 	 * user is what lets two tabs of one account stay open side by side; using
 	 * the user id as the uid made each new tab evict the previous one.
 	 *
-	 * Returns `'ok'` with the issued uid, or `'capped'` when the client cap is
-	 * reached (the handler answers with an error frame).
+	 * Returns `'ok'` with the issued uid, `'capped'` when the client cap is
+	 * reached (the handler answers with an error frame), or `'closed'` after a
+	 * shutdown (the handler ends the stream).
 	 */
 	connect(
 		sse: RelaySseStream,
 		ctx: RelayContext,
-	): { outcome: "ok"; uid: string } | { outcome: "capped" } {
+	):
+		| { outcome: "ok"; uid: string }
+		| { outcome: "capped" }
+		| { outcome: "closed" } {
+		if (this.#closed) return { outcome: "closed" };
 		if (this.#clients.size >= this.#config.maxClients) {
 			return { outcome: "capped" };
 		}
@@ -1178,10 +1212,12 @@ export class Relay {
 	// ─── Shutdown ─────────────────────────────────────────────
 
 	/**
-	 * Release external resources: unsubscribe from and disconnect the bus.
-	 * Mirrors Adonis Transmit's `shutdown` (clear timers + disconnect the
-	 * transport). Call from the provider's graceful-shutdown hook. Idempotent
-	 * — both bus methods are optional on the duck-typed transport.
+	 * Stop: clear the keep-alive, end every open stream — the relay's and the
+	 * mounted hubs' — and refuse new ones until the next `startTransport()`,
+	 * then unsubscribe from and disconnect the bus. Transmit's `shutdown` in
+	 * that order: clear the interval, `closeAllStreams()`, disconnect the bus.
+	 * Call from the provider's graceful-shutdown hook. Idempotent — both bus
+	 * methods are optional on the duck-typed transport.
 	 */
 	async shutdown(): Promise<void> {
 		// Cleared first, and unconditionally: upstream clears its ping interval
@@ -1200,8 +1236,22 @@ export class Relay {
 		// what makes the relay restartable and a restart replaces it.
 		const handler = this.#transportHandler;
 		this.#stopTransport();
+		// The streams end whether or not there is a bus. Left open, a client
+		// kept a connection to an instance that had stopped serving it, and
+		// one arriving afterwards was still accepted.
+		this.#closed = true;
+		for (const uid of [...this.#clients.keys()]) this.#dropClient(uid);
+		// Started now, awaited last: the bus teardown below has to be in place
+		// before this call first yields, so a start that lands meanwhile finds
+		// it and waits for it.
+		const closingHubs = Promise.all(
+			[...this.#hubTransports].map((hub) => hub.close().catch(() => {})),
+		);
 		const transport = this.#transport;
-		if (!transport) return;
+		if (!transport) {
+			await closingHubs;
+			return;
+		}
 		const generation = this.#transportGeneration;
 
 		const teardown = (async (): Promise<void> => {
@@ -1245,7 +1295,11 @@ export class Relay {
 			}
 		})();
 		this.#teardown = teardown;
-		await teardown;
+		try {
+			await teardown;
+		} finally {
+			await closingHubs;
+		}
 		// KEPT on failure, deliberately: a start has to see that the bus was
 		// not released. A later shutdown installs its own, which is how the
 		// state clears once the connection recovers.
