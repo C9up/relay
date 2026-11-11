@@ -37,6 +37,34 @@ import { randomUUID } from "node:crypto";
  */
 export const PING_CHANNEL = "$$relay/ping";
 
+/**
+ * Event names the stream itself sends on. A channel is written as the SSE
+ * `event:` line of its frames, so a subscription to one of these would hand
+ * the client a protocol frame under a name it trusts.
+ */
+const RESERVED_CHANNELS: ReadonlySet<string> = new Set([
+	"connected",
+	"error",
+	PING_CHANNEL,
+]);
+
+/**
+ * What makes `name` unusable as a channel, or null. Refused, never escaped: a
+ * channel is the SSE `event:` line, where a CR or LF starts a new field, and it
+ * reaches stderr in warnings, where it would forge a log line. Escaping would
+ * deliver the frames under a name the client never subscribed to.
+ */
+function channelNameProblem(name: string): string | null {
+	for (let index = 0; index < name.length; index++) {
+		const code = name.charCodeAt(index);
+		if (code < 0x20 || code === 0x7f) return "it holds a control character";
+	}
+	if (RESERVED_CHANNELS.has(name)) {
+		return `'${name}' is an event name of the protocol itself`;
+	}
+	return null;
+}
+
 /** Slim shape of the per-client SSE transport. Matches `SseStream`. */
 export interface RelaySseStream {
 	id: string;
@@ -1107,6 +1135,9 @@ export class Relay {
 		if (channel.length > 256) {
 			return { ok: false, status: 400, code: "E_RELAY_CHANNEL_TOO_LONG" };
 		}
+		if (channelNameProblem(channel) !== null) {
+			return { ok: false, status: 400, code: "E_RELAY_BAD_REQUEST" };
+		}
 		const client = this.#clients.get(uid);
 		if (!client) {
 			return { ok: false, status: 400, code: "E_RELAY_NOT_CONNECTED" };
@@ -1667,6 +1698,8 @@ function parseChannelPattern(pattern: string): PatternSegment[] {
 		throw new Error(`[relay] invalid channel pattern '${pattern}': ${why}`);
 	};
 	if (splitChannel(pattern).join("") === "") fail("it is empty");
+	const problem = channelNameProblem(pattern);
+	if (problem !== null) fail(problem);
 	const segments: PatternSegment[] = [];
 	const names = new Set<string>();
 	for (const raw of splitChannel(pattern)) {

@@ -365,3 +365,61 @@ describe("relay-security > a subscription outliving its client", () => {
 		expect(seen).toEqual([{ pattern: "users/me" }]);
 	});
 });
+
+describe("relay-security > a channel name is an SSE event name", () => {
+	async function subscribed(channel: string) {
+		const r = new Relay();
+		r.authorize("rooms/:slug", () => true);
+		r.authorize("open/*", () => true);
+		const c = r.connect(fakeSse(), { auth: { isAuthenticated: false } });
+		if (c.outcome !== "ok") throw new Error("unreachable");
+		return r.subscribe(c.uid, channel, {});
+	}
+
+	it.each([
+		["a CR/LF that would start a new SSE field", "rooms/a\r\nevent: error"],
+		["a bare LF", "rooms/a\nb"],
+		["a NUL", "rooms/a\u0000"],
+		["a tab", "rooms/a\tb"],
+		["a DEL", "rooms/a\u007f"],
+	])("refuses %s", async (_label, channel) => {
+		expect(await subscribed(channel)).toEqual({
+			ok: false,
+			status: 400,
+			code: "E_RELAY_BAD_REQUEST",
+		});
+	});
+
+	it.each(["connected", "error", "$$relay/ping"])(
+		"refuses the protocol's own frame name %s",
+		async (reserved) => {
+			const r = new Relay();
+			r.authorize("*", () => true);
+			const c = r.connect(fakeSse(), { auth: { isAuthenticated: false } });
+			if (c.outcome !== "ok") throw new Error("unreachable");
+
+			expect(await r.subscribe(c.uid, reserved, {})).toEqual({
+				ok: false,
+				status: 400,
+				code: "E_RELAY_BAD_REQUEST",
+			});
+		},
+	);
+
+	it("still takes an ordinary channel, unicode included", async () => {
+		expect(await subscribed("rooms/café-42")).toEqual({ ok: true });
+	});
+
+	it.each([
+		"rooms\n/:slug",
+		"rooms/a\u0000",
+		"connected",
+		"error",
+		"$$relay/ping",
+	])("refuses to authorize the pattern %j", (pattern) => {
+		const r = new Relay();
+		expect(() => r.authorize(pattern, () => true)).toThrow(
+			/invalid channel pattern/,
+		);
+	});
+});

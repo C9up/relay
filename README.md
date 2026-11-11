@@ -83,6 +83,14 @@ add a listener for that name.
 `allowUnauthorizedChannels` is `false`, so a channel with no `authorize(...)`
 covering it refuses subscribers. Set it to `true` to serve them instead.
 
+### Channel names
+
+A channel is the SSE `event:` name its frames arrive under, so a subscribe is
+refused with `400 E_RELAY_BAD_REQUEST` when the name holds a control character
+(CR, LF, NUL, tab, DEL…) or is one of the stream's own event names —
+`connected`, `error` and `$$relay/ping` — and `authorize()` throws on such a
+pattern. A name longer than 256 characters answers `E_RELAY_CHANNEL_TOO_LONG`.
+
 ## Entry points
 
 - `@c9up/relay` — main API
