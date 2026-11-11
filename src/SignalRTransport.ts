@@ -113,15 +113,37 @@ function hubAuth(ctx: HubHttpContext): {
 	};
 }
 
-/** The user id an auth slice identifies, when it identifies one. */
-function userIdOf(
+/**
+ * Who an auth slice identifies.
+ *
+ * `unusable` is an authenticated request whose user carries no id this can
+ * compare: it is somebody, so it must not pass as anonymous — that made every
+ * logged-in user of an application with numeric keys (the atlas default) match
+ * every other one.
+ */
+type Identity =
+	| { kind: "anonymous" }
+	| { kind: "user"; id: string }
+	| { kind: "unusable" };
+
+/**
+ * The identity of an auth slice. A string id is taken as given; a number or a
+ * bigint — an auto-increment primary key — as its decimal text, so `1` and the
+ * same user on the next request compare equal.
+ */
+function identityOf(
 	auth:
 		| { isAuthenticated?: boolean; user?: Record<string, unknown> }
 		| undefined,
-): string | undefined {
-	if (auth?.isAuthenticated !== true) return undefined;
+): Identity {
+	if (auth?.isAuthenticated !== true) return { kind: "anonymous" };
 	const id = auth.user?.id;
-	return typeof id === "string" ? id : undefined;
+	if (typeof id === "string" && id !== "") return { kind: "user", id };
+	if (typeof id === "number" && Number.isSafeInteger(id)) {
+		return { kind: "user", id: String(id) };
+	}
+	if (typeof id === "bigint") return { kind: "user", id: String(id) };
+	return { kind: "unusable" };
 }
 
 /**
@@ -134,6 +156,7 @@ function userIdOf(
  * from that user only, and one opened anonymously takes anonymous requests
  * only — the replies go down a stream someone else may hold, so a victim's
  * credentials on the POST (a cross-site form) must not pass the guards for it.
+ * An identity that cannot be compared matches nothing: fail closed.
  * No connection registered yet (the first GET) has nobody to match.
  */
 function mayActAs(
@@ -141,16 +164,21 @@ function mayActAs(
 	ctx: HubHttpContext,
 ): boolean {
 	if (registered === undefined) return true;
-	return userIdOf(ctx.auth) === userIdOf(registered);
+	const requester = identityOf(ctx.auth);
+	const owner = identityOf(registered);
+	if (requester.kind === "user" && owner.kind === "user") {
+		return requester.id === owner.id;
+	}
+	return requester.kind === "anonymous" && owner.kind === "anonymous";
 }
 
 /**
  * What a request counts against for the per-owner caps: the user when it is
- * authenticated, the client address otherwise, nothing when neither is known.
+ * identified, the client address otherwise, nothing when neither is known.
  */
 function ownerOf(ctx: HubHttpContext): string | undefined {
-	const user = userIdOf(ctx.auth);
-	if (user !== undefined) return `user:${user}`;
+	const identity = identityOf(ctx.auth);
+	if (identity.kind === "user") return `user:${identity.id}`;
 	const ip = ctx.request.ip?.();
 	return typeof ip === "string" && ip !== "" ? `ip:${ip}` : undefined;
 }

@@ -223,6 +223,31 @@ describe("hub > streams are capped per owner", () => {
 	});
 });
 
+describe("hub > a numeric user id is a user, not an anonymous client", () => {
+	it("keys the stream cap on the user across addresses", async () => {
+		const { open } = mountedHub({ maxConnectionsPerOwner: 1 });
+		const auth = { isAuthenticated: true, user: { id: 1 } };
+
+		expect((await open("203.0.113.1", auth)).status()).toBe(200);
+		expect((await open("203.0.113.2", auth)).status()).toBe(503);
+	});
+
+	it("does not share the cap between two numeric users on one address", async () => {
+		const { open } = mountedHub({ maxConnectionsPerOwner: 1 });
+
+		const first = await open("203.0.113.1", {
+			isAuthenticated: true,
+			user: { id: 1 },
+		});
+		const second = await open("203.0.113.1", {
+			isAuthenticated: true,
+			user: { id: 2 },
+		});
+
+		expect([first.status(), second.status()]).toEqual([200, 200]);
+	});
+});
+
 describe("hub > a negotiate flood cannot evict another client's token", () => {
 	it("keeps a pending token valid through a flood from one address", async () => {
 		const { adapter, negotiate, tokenOf } = mountedHub({});

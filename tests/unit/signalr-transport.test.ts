@@ -299,6 +299,78 @@ describe("relay > SignalR transport ownership", () => {
 	});
 });
 
+describe("relay > SignalR transport ownership with numeric user ids", () => {
+	/** A connection negotiated and opened by user `id`, numeric as atlas keys are. */
+	async function openedBy(id: unknown) {
+		const hub = new ChatHub();
+		const { router } = mount(hub);
+		const neg = context("/hubs/chat/negotiate");
+		neg.auth = { isAuthenticated: true, user: { id } };
+		await router.routes.get("POST /hubs/chat/negotiate")?.(neg);
+		const connectionToken = String(
+			Reflect.get(Object(neg.body), "connectionToken"),
+		);
+		const stream = context(`/hubs/chat?id=${connectionToken}`);
+		stream.auth = { isAuthenticated: true, user: { id } };
+		await router.routes.get("GET /hubs/chat")?.(stream);
+		return { hub, router, connectionToken, stream };
+	}
+
+	const invoke = `${HANDSHAKE}${JSON.stringify({
+		type: 1,
+		target: "sendMessage",
+		arguments: [{ text: "hi" }],
+	})}${RS}`;
+
+	it("refuses another numeric user posting on the victim's token", async () => {
+		const { hub, router, connectionToken, stream } = await openedBy(1);
+		const before = stream.sse.frames.length;
+
+		const attacker = context(`/hubs/chat?id=${connectionToken}`, invoke);
+		attacker.auth = { isAuthenticated: true, user: { id: 2 } };
+		await router.routes.get("POST /hubs/chat")?.(attacker);
+
+		expect(attacker.code).toBe(403);
+		expect(attacker.body).toMatchObject({
+			error: { code: "E_RELAY_NOT_OWNER" },
+		});
+		expect(hub.seen).toEqual([]);
+		expect(stream.sse.frames).toHaveLength(before);
+	});
+
+	it("lets the numeric owner post on their own connection", async () => {
+		const { hub, router, connectionToken } = await openedBy(1);
+
+		const own = context(`/hubs/chat?id=${connectionToken}`, invoke);
+		own.auth = { isAuthenticated: true, user: { id: 1 } };
+		await router.routes.get("POST /hubs/chat")?.(own);
+
+		expect(own.code).toBe(200);
+		expect(hub.seen).toEqual([JSON.stringify({ text: "hi" })]);
+	});
+
+	it("refuses an authenticated request with no usable id rather than treating it as anonymous", async () => {
+		const hub = new ChatHub();
+		const { router } = mount(hub);
+		const neg = context("/hubs/chat/negotiate");
+		neg.auth = { isAuthenticated: false };
+		await router.routes.get("POST /hubs/chat/negotiate")?.(neg);
+		const connectionToken = String(
+			Reflect.get(Object(neg.body), "connectionToken"),
+		);
+		const stream = context(`/hubs/chat?id=${connectionToken}`);
+		stream.auth = { isAuthenticated: false };
+		await router.routes.get("GET /hubs/chat")?.(stream);
+
+		const idless = context(`/hubs/chat?id=${connectionToken}`, invoke);
+		idless.auth = { isAuthenticated: true, user: { id: { nested: 1 } } };
+		await router.routes.get("POST /hubs/chat")?.(idless);
+
+		expect(idless.code).toBe(403);
+		expect(hub.seen).toEqual([]);
+	});
+});
+
 describe("relay > SignalR transport connection lifecycle", () => {
 	it("does not let a stale stream's close tear down the one that replaced it", async () => {
 		const hub = new ChatHub();
