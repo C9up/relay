@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm_overwrite:
-        description: 'Type YES to override the drift gate (force-publish even if registry version >= package.json version). Use only for rollback scenarios.'
+        description: 'Type YES to publish a version LOWER than the one on npm (a backport to an older line). It goes out under the backport dist-tag, so latest does not move. A version npm already holds can never be published again: bump it instead.'
         required: false
         default: 'no'
 
@@ -17,19 +17,24 @@ permissions:
 
 concurrency:
   # Differentiated by event_name so a workflow_dispatch publish run is not
-  # cancelled by a subsequent push to main mid-flight.
+  # cancelled by a subsequent push to main mid-flight. And a dispatch never
+  # cancels another one: a second "Run workflow" on the same ref used to stop
+  # the first wherever it was, between `npm publish` and the release included,
+  # leaving a version on npm that no rerun could finish (the drift gate then
+  # refuses it as already published). Dispatch runs queue; pushes and pull
+  # requests still supersede each other.
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   build-and-test:
     name: Build & test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with: { version: 9 }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '24'
       - run: pnpm install
@@ -46,24 +51,32 @@ jobs:
 
   # Publish job — gated on workflow_dispatch (manual maintainer trigger).
   # Requires NPM_TOKEN secret + a v<MAJOR>.<MINOR>.<PATCH> tag at HEAD matching
-  # package.json. Drift gate refuses to overwrite a published version (or roll
-  # back to an older one) without `confirm_overwrite=YES`.
+  # package.json. Drift gate refuses a version npm already holds, and an older
+  # one unless `confirm_overwrite=YES` (it then goes out as `backport`).
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
     permissions:
       # Creating the release needs write; the workflow default is read.
       contents: write
+      # The OIDC token npm signs the provenance with (and trusted publishing
+      # authenticates with).
+      id-token: write
     timeout-minutes: 15
     needs: [build-and-test]
     if: github.event_name == 'workflow_dispatch'
+    # A publish is a deployment to npm. The environment's protection rules
+    # (required reviewer, deployments from v* tags only) are what stands
+    # between one write-access account and a release, and npm trusted
+    # publishing is bound to this name.
+    environment: npm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with: { version: 9 }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
@@ -75,6 +88,7 @@ jobs:
           fi
 
       - name: Tag-vs-package.json gate
+        id: tag
         run: |
           tag=$(git tag --points-at HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
           if [ -z "$tag" ]; then
@@ -87,9 +101,11 @@ jobs:
             echo "::error::Tag $tag does not match package.json $pkg_tag — refuse to publish from a drifted tag"
             exit 1
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Tag gate passed: $tag == $pkg_tag"
 
       - name: Drift fail-closed gate
+        id: drift
         env:
           CONFIRM_OVERWRITE: ${{ inputs.confirm_overwrite }}
         run: |
@@ -113,41 +129,67 @@ jobs:
               exit 1
             fi
           fi
-          if [ -z "$npm_v" ]; then exit 0; fi
+          if [ -z "$npm_v" ]; then echo "dist_tag=latest" >> "$GITHUB_OUTPUT"; exit 0; fi
           highest=$(printf '%s\n%s\n' "$npm_v" "$local_v" | sort -V | tail -1)
           if [ "$local_v" = "$npm_v" ]; then
-            if [ "$CONFIRM_OVERWRITE" != "YES" ]; then
-              echo "::error::Local version $local_v already published — bump package.json or re-run with confirm_overwrite=YES"
-              exit 1
-            fi
+            # npm refuses a version it already holds (and one unpublished less than
+            # 24 h ago), whatever this gate says, so no input can make this path
+            # publish: it used to be let through on confirm_overwrite=YES and failed
+            # one step later with E403.
+            echo "::error::Local version $local_v is already on npm, which never accepts a version twice — bump package.json"
+            exit 1
           elif [ "$highest" = "$npm_v" ]; then
             if [ "$CONFIRM_OVERWRITE" != "YES" ]; then
-              echo "::error::Registry version $npm_v is newer than local $local_v — refuse to roll back without confirm_overwrite=YES"
+              echo "::error::Registry version $npm_v is newer than local $local_v — refuse to publish an older version without confirm_overwrite=YES"
               exit 1
             fi
+            # An older number published as `latest` would move every fresh install
+            # back to it; a backport goes out under its own dist-tag instead.
+            echo "Override accepted: publishing $local_v under the 'backport' dist-tag; latest stays $npm_v"
+            echo "dist_tag=backport" >> "$GITHUB_OUTPUT"
           else
             echo "Drift gate passed: local $local_v > registry $npm_v"
+            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
           fi
 
       - run: pnpm install
       # Fail the publish on a broken build — the published package points to
       # `dist` (publishConfig), so a failed `tsc` must NOT be ignored.
       - run: pnpm build
-      - run: pnpm publish --access public --no-git-checks
+      # --provenance signs the tarball with this run's OIDC identity, so every
+      # version can be traced to the commit and the workflow run that built it,
+      # and the same files published from a laptop are told apart. --tag is the
+      # drift gate's answer: `latest`, or `backport` for an older line.
+      - name: Publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DIST_TAG: ${{ steps.drift.outputs.dist_tag }}
+        run: |
+          if [ -z "$DIST_TAG" ]; then
+            echo "::error::the drift gate produced no dist-tag — refuse to publish"
+            exit 1
+          fi
+          pnpm publish --access public --no-git-checks --provenance --tag "$DIST_TAG"
       - name: Create the GitHub release
         # Notes from the commits this tag contains. Without it a published
         # version arrives with no explanation of what changed, and the only way
         # to find out is to read a diff.
         env:
           GH_TOKEN: ${{ github.token }}
+          # The tag the gate read off HEAD. `GITHUB_REF_NAME` is the branch on a
+          # dispatch from main, so the `refs/tags/main` lookup failed and the
+          # step exited 0 having created nothing: a version on npm, no notes.
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${TAG}"
+          if [ -z "$tag" ]; then
+            echo "::error::the tag gate produced no tag — cannot create a release"
+            exit 1
+          fi
           if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-            echo "::notice::not built from a tag - no release to create"
-            exit 0
+            echo "::error::${tag} is not in this checkout - refusing to guess the notes range"
+            exit 1
           fi
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "::notice::release $tag already exists - leaving it alone"
