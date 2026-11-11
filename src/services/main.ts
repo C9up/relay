@@ -57,7 +57,17 @@ export function clearRelay(): void {
 	instanceIsLazyDefault = false;
 }
 
-const relay: Relay = new Proxy({} as Relay, {
+/**
+ * The Proxy's target, never read through — every trap forwards to `instance`.
+ * A `Relay`-shaped object without running the constructor, proven one by the
+ * guard rather than asserted.
+ */
+const target: unknown = Object.create(Relay.prototype);
+if (!(target instanceof Relay)) {
+	throw new Error("[relay] the service accessor's target is not a Relay");
+}
+
+const relay: Relay = new Proxy(target, {
 	get(_target, prop) {
 		if (!instance) {
 			// Lazy default — apps that never registered the provider get a

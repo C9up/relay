@@ -291,6 +291,34 @@ type LifecycleListener<E extends LifecycleEventName> = (
 ) => void;
 
 /**
+ * One listener set per event, every one present. Indexed by a generic event
+ * name, this mapped type reads back as `Set<LifecycleListener<E>>` itself, so
+ * registering and emitting need no assertion; an optional entry is what used
+ * to force one.
+ */
+type ListenerTable = {
+	[E in LifecycleEventName]: Set<LifecycleListener<E>>;
+};
+
+const LIFECYCLE_EVENTS = [
+	"connect",
+	"disconnect",
+	"subscribe",
+	"unsubscribe",
+	"broadcast",
+] as const satisfies readonly LifecycleEventName[];
+
+function emptyListenerTable(): ListenerTable {
+	return {
+		connect: new Set(),
+		disconnect: new Set(),
+		subscribe: new Set(),
+		unsubscribe: new Set(),
+		broadcast: new Set(),
+	};
+}
+
+/**
  * Slim, duck-typed contract for the route-builder object the host
  * router hands back from `router.get(path, …)` / `router.post(…)`.
  * Matches the surface of `@c9up/ream`'s `Route` class — `middleware`,
@@ -366,7 +394,7 @@ export class Relay {
 	#channelIndex = new Map<string, Set<string>>();
 	/** Pattern → its authorizer, in registration order (the match order). */
 	#authorizers = new Map<string, RegisteredAuthorizer>();
-	#listeners: { [E in LifecycleEventName]?: Set<LifecycleListener<E>> } = {};
+	#listeners: ListenerTable = emptyListenerTable();
 	#routeCustomizer?: RelayRouteCustomizer;
 	/**
 	 * How a declaration reaches the router, installed by `RelayProvider` in
@@ -692,15 +720,8 @@ export class Relay {
 		for (const [path, mounted] of previous.#hubs) {
 			if (!this.#hubs.has(path)) this.#hubs.set(path, mounted);
 		}
-		for (const [event, listeners] of Object.entries(previous.#listeners)) {
-			if (listeners === undefined) continue;
-			const name = event as LifecycleEventName;
-			// Same mapped-type dance as `on()`: TS cannot propagate the event
-			// name from the index expression to the assignment target, so the
-			// entry is added through a spread.
-			const existing = this.#listeners[name] ?? new Set();
-			for (const listener of listeners) existing.add(listener);
-			this.#listeners = { ...this.#listeners, [name]: existing };
+		for (const event of LIFECYCLE_EVENTS) {
+			this.#adoptListeners(event, previous.#listeners);
 		}
 	}
 
@@ -1029,15 +1050,8 @@ export class Relay {
 		event: E,
 		listener: LifecycleListener<E>,
 	): () => void {
-		const set = (this.#listeners[event] ?? new Set()) as Set<
-			LifecycleListener<E>
-		>;
+		const set = this.#listeners[event];
 		set.add(listener);
-		// Mapped-type narrowing limitation: TS can't propagate `E` from the
-		// index expression to the assignment target. Object spread sidesteps
-		// the assignability check by re-typing the whole structure with the
-		// added entry (the same variance dance as the upstream read cast).
-		this.#listeners = { ...this.#listeners, [event]: set };
 		return () => {
 			set.delete(listener);
 		};
@@ -1481,12 +1495,20 @@ export class Relay {
 		return undefined;
 	}
 
+	/** Add `from`'s listeners for `event` to this instance's. */
+	#adoptListeners<E extends LifecycleEventName>(
+		event: E,
+		from: ListenerTable,
+	): void {
+		const into = this.#listeners[event];
+		for (const listener of from[event]) into.add(listener);
+	}
+
 	#emit<E extends LifecycleEventName>(
 		event: E,
 		evt: RelayLifecycleEvents[E],
 	): void {
 		const listeners = this.#listeners[event];
-		if (!listeners) return;
 		for (const cb of listeners) {
 			try {
 				const result: unknown = cb(evt);
