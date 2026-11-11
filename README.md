@@ -41,6 +41,21 @@ providers: [
 
 ## Usage
 
+`POST /__relay/subscribe` and `POST /__relay/unsubscribe` read `{ uid, channel }`
+from a JSON body, and ream parses one only where its body parser runs. Keep it in
+the router middleware of `start/kernel.ts`, as the web starter kit does, and send
+`content-type: application/json`:
+
+```ts
+router.use([
+  () => import('@c9up/ream/bodyparser_middleware'),
+  // ...
+])
+```
+
+Without it the body reads as `{}` and every subscribe answers
+`400 E_RELAY_BAD_REQUEST`. The hub routes read the raw body and need nothing.
+
 Running more than one instance? A broadcast only reaches the SSE clients of the
 instance that made it, unless you give relay a bus:
 
