@@ -21,7 +21,7 @@ needs a socket you supply and drive yourself — `SignalRAdapter` is written for
 that, parsing an inbound frame and handing back the frames to send without
 owning a socket of its own.
 
-Part of **[Ream](https://github.com/C9up/ream)** — a Rust-powered, AdonisJS-compatible Node.js framework. Independent, publishable package.
+Part of **[Ream](https://github.com/C9up/ream)** — a Rust-powered Node.js framework. Independent, publishable package.
 
 ## Installation
 
