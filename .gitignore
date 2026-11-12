@@ -8,3 +8,5 @@ coverage/
 .DS_Store
 *.log
 .turbo/
+# Workstream: the maintainer's local tracking, never published
+.workstream/
