@@ -86,6 +86,27 @@ export function hasCommands(
 	return missingCommands(value, commands).length === 0;
 }
 
+/**
+ * Whether a client resolved earlier has ended for good, and must be resolved
+ * again rather than used.
+ *
+ * ioredis reaches `end` once its retry strategy gives up (quasar's generated
+ * config gives up after ten attempts, about three seconds of outage), or after
+ * `quit()`/`disconnect()`. From there every command rejects with "Connection is
+ * closed." and the client never comes back. Quasar drops such a connection and
+ * hands out a fresh one on the next `connection(name)`, so a store that kept
+ * the first answer of its resolver stayed on the dead client until the process
+ * restarted, even once Redis was back.
+ *
+ * `close` is NOT terminal: ioredis reconnects from it by itself, and throwing
+ * that client away would leak its socket. A client with no `status` (a test
+ * double, another library) never counts as ended. Only meaningful for a
+ * resolver: a client handed in directly is the caller's to replace.
+ */
+export function hasEnded(client: unknown): boolean {
+	return memberValue(readMember(client, "status")) === "end";
+}
+
 export interface QuasarConnectionRequest<T> {
 	/** The package asking. It prefixes every message this can raise. */
 	pkg: string;

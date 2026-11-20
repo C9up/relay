@@ -13,6 +13,7 @@
  */
 
 import type { RelayTransport } from "./Relay.js";
+import { hasEnded } from "./vendor/quasarConnection.js";
 
 /** The pub/sub commands this issues. Any client answering them will do. */
 export interface RelayPubSubClient {
@@ -88,6 +89,18 @@ export class RedisRelayTransport implements RelayTransport {
 	 */
 	readonly #ownsConnection: boolean;
 	#resolved: Promise<RelayPubSubClient> | undefined;
+	/** What {@link #resolved} settled to, so its state can be read. */
+	#settled: RelayPubSubClient | undefined;
+	/**
+	 * The subscriptions to carry over from a client that ended, taken when the
+	 * end was noticed, until a new client has them all.
+	 */
+	#moving:
+		| {
+				from: RelayPubSubClient;
+				wrappers: Array<[string, (message: string, channel: string) => void]>;
+		  }
+		| undefined;
 
 	/**
 	 * @param ownsConnection Whether closing the sockets is relay's business.
@@ -108,20 +121,103 @@ export class RedisRelayTransport implements RelayTransport {
 	 * error, long after Redis came back. The in-flight promise is still shared,
 	 * so concurrent callers do not each open a connection; only the failure is
 	 * forgotten, so the next call gets to try again.
+	 *
+	 * A client that has ended for good is not kept either. Quasar retires a
+	 * connection whose retry strategy gave up and hands out a fresh one; kept,
+	 * the dead one failed every broadcast, and the bus subscription — which
+	 * lived on its subscriber socket, whose handlers quasar drops on `end` — was
+	 * never made again, so the instance stopped hearing the others for good,
+	 * silently. The next call resolves again and subscribes every recorded
+	 * wrapper on the new client. NAMED DEVIATION, better than upstream, whose
+	 * bus keeps the client it was built with. A client handed in directly is
+	 * kept whatever its state.
 	 */
 	#client(): Promise<RelayPubSubClient> {
+		if (this.#hasEnded()) {
+			const from = this.#settled;
+			if (from !== undefined) {
+				this.#moving ??= { from, wrappers: this.#recorded() };
+			}
+			this.#settled = undefined;
+			this.#resolved = undefined;
+		}
 		if (!this.#resolved) {
 			const attempt = Promise.resolve(
 				typeof this.#source === "function" ? this.#source() : this.#source,
-			).catch((err: unknown) => {
-				// Forget it only while it is still the current attempt, so a
-				// retry already under way is not cleared out from under itself.
-				if (this.#resolved === attempt) this.#resolved = undefined;
-				throw err;
-			});
+			)
+				.then(async (client) => {
+					// A move that fails rejects this attempt, which is then
+					// forgotten below; `#moving` stays, so the next call retries it.
+					const moving = this.#moving;
+					if (moving !== undefined && moving.from !== client) {
+						await this.#move(moving.from, client, moving.wrappers);
+					}
+					if (this.#resolved === attempt) {
+						this.#moving = undefined;
+						this.#settled = client;
+					}
+					return client;
+				})
+				.catch((err: unknown) => {
+					// Forget it only while it is still the current attempt, so a
+					// retry already under way is not cleared out from under itself.
+					if (this.#resolved === attempt) this.#resolved = undefined;
+					throw err;
+				});
 			this.#resolved = attempt;
 		}
 		return this.#resolved;
+	}
+
+	/** Whether the client kept so far came from a resolver and has ended. */
+	#hasEnded(): boolean {
+		return typeof this.#source === "function" && hasEnded(this.#settled);
+	}
+
+	/** Every wrapper registered with the client, with its channel. */
+	#recorded(): Array<[string, (message: string, channel: string) => void]> {
+		return [...this.#handlers].flatMap(([channel, owners]) =>
+			[...owners.values()].flatMap((list) =>
+				list.map(
+					(wrapper): [string, (message: string, channel: string) => void] => [
+						channel,
+						wrapper,
+					],
+				),
+			),
+		);
+	}
+
+	/** Whether `wrapper` is still recorded on `channel`. */
+	#isRecorded(
+		channel: string,
+		wrapper: (message: string, channel: string) => void,
+	): boolean {
+		for (const list of this.#handlers.get(channel)?.values() ?? []) {
+			if (list.includes(wrapper)) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Subscribe on the client that replaced an ended one every wrapper that
+	 * lived on the old one, and take each off the old one by name.
+	 */
+	async #move(
+		from: RelayPubSubClient,
+		to: RelayPubSubClient,
+		wrappers: Array<[string, (message: string, channel: string) => void]>,
+	): Promise<void> {
+		for (const [channel, wrapper] of wrappers) {
+			// Unsubscribed meanwhile: nothing to carry over.
+			if (!this.#isRecorded(channel, wrapper)) continue;
+			await this.#listen(to, channel, wrapper);
+			try {
+				await from.unsubscribe(channel, wrapper);
+			} catch {
+				// The ended socket refuses; nothing listens on it any more anyway.
+			}
+		}
 	}
 
 	async publish(channel: string, message: unknown): Promise<void> {
@@ -156,52 +252,62 @@ export class RedisRelayTransport implements RelayTransport {
 		wrappers.set(handler, [...(wrappers.get(handler) ?? []), wrapper]);
 		this.#handlers.set(channel, wrappers);
 		try {
-			// Waited on through the callbacks, not the call's return value:
-			// quasar reports a failure rather than rejecting, and newer versions
-			// declare `subscribe` itself `void`. This shape is correct on both.
-			await new Promise<void>((resolve, reject) => {
-				let settled = false;
-				const succeed = (): void => {
-					if (!settled) {
-						settled = true;
-						resolve();
-					}
-				};
-				const fail = (error: unknown): void => {
-					if (!settled) {
-						settled = true;
-						reject(error);
-					}
-				};
-				// A callback fired during the call itself is held until the call
-				// RETURNS, so a client that registers the handler and then throws
-				// synchronously counts as the failure it is — announcing success
-				// on the way to throwing must not win.
-				let synchronous = true;
-				let pending: (() => void) | undefined;
-				try {
-					client.subscribe(channel, wrapper, {
-						onSubscription: () => {
-							if (synchronous) pending ??= succeed;
-							else succeed();
-						},
-						onError: (error) => {
-							if (synchronous) pending = () => fail(error);
-							else fail(error);
-						},
-					});
-				} catch (error) {
-					synchronous = false;
-					fail(error);
-					return;
-				}
-				synchronous = false;
-				pending?.();
-			});
+			await this.#listen(client, channel, wrapper);
 		} catch (error) {
 			await this.#rollback(client, channel, handler, wrapper);
 			throw error instanceof Error ? error : new Error(String(error));
 		}
+	}
+
+	/**
+	 * Subscribe `wrapper`, waited on through the callbacks, not the call's
+	 * return value: quasar reports a failure rather than rejecting, and newer
+	 * versions declare `subscribe` itself `void`. This shape is correct on both.
+	 */
+	#listen(
+		client: RelayPubSubClient,
+		channel: string,
+		wrapper: (message: string, channel: string) => void,
+	): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			let settled = false;
+			const succeed = (): void => {
+				if (!settled) {
+					settled = true;
+					resolve();
+				}
+			};
+			const fail = (error: unknown): void => {
+				if (!settled) {
+					settled = true;
+					reject(error);
+				}
+			};
+			// A callback fired during the call itself is held until the call
+			// RETURNS, so a client that registers the handler and then throws
+			// synchronously counts as the failure it is — announcing success
+			// on the way to throwing must not win.
+			let synchronous = true;
+			let pending: (() => void) | undefined;
+			try {
+				client.subscribe(channel, wrapper, {
+					onSubscription: () => {
+						if (synchronous) pending ??= succeed;
+						else succeed();
+					},
+					onError: (error) => {
+						if (synchronous) pending = () => fail(error);
+						else fail(error);
+					},
+				});
+			} catch (error) {
+				synchronous = false;
+				fail(error);
+				return;
+			}
+			synchronous = false;
+			pending?.();
+		});
 	}
 
 	/**
@@ -263,6 +369,16 @@ export class RedisRelayTransport implements RelayTransport {
 			}
 		}
 		if (doomed.length === 0) return;
+
+		// The client ended for good: its subscriptions died with its socket.
+		// Resolving a new one only to unsubscribe from it would open a
+		// connection — at shutdown, after quasar has closed its own.
+		if (this.#hasEnded()) {
+			for (const [owner, wrapper] of doomed) {
+				this.#forget(channel, owner, wrapper);
+			}
+			return;
+		}
 
 		const client = await this.#client();
 		for (const [owner, wrapper] of doomed) {

@@ -528,3 +528,96 @@ describe("relay > unsubscribing what was never subscribed", () => {
 		expect(client.quits).toBe(0);
 	});
 });
+
+/**
+ * Quasar retires a connection whose retry strategy gave up and hands out a
+ * fresh one. The transport kept the first: every broadcast failed, and the bus
+ * subscription — which lived on the dead subscriber socket — was never made
+ * again, so the instance stopped hearing the others for good, silently.
+ */
+describe("relay > a connection that ended for good", () => {
+	function ending() {
+		const redis = fakeRedis();
+		return {
+			...redis,
+			client: Object.assign(redis.client, { status: "ready" }),
+		};
+	}
+
+	it("publishes on the fresh client and subscribes the bus on it again", async () => {
+		const first = ending();
+		const second = ending();
+		const resolver = vi
+			.fn<() => RelayPubSubClient>()
+			.mockReturnValueOnce(first.client)
+			.mockReturnValueOnce(second.client);
+		const transport = new RedisRelayTransport(resolver);
+		const seen: unknown[] = [];
+		await transport.subscribe("relay::broadcast", (m) => seen.push(m));
+		const [wrapper] = first.handlers.get("relay::broadcast") ?? [];
+
+		first.client.status = "end";
+		await transport.publish("relay::broadcast", { n: 1 });
+
+		expect(resolver).toHaveBeenCalledTimes(2);
+		expect(seen).toEqual([{ n: 1 }]);
+		expect([...(second.handlers.get("relay::broadcast") ?? [])]).toEqual([
+			wrapper,
+		]);
+		expect(first.client.unsubscribed).toEqual([["relay::broadcast", wrapper]]);
+	});
+
+	it("tries the move again when the new client refused it", async () => {
+		const first = ending();
+		const refusing = ending();
+		refusing.client.subscribe = (_channel, _handler, options) => {
+			options?.onError?.(new Error("still down"));
+		};
+		const third = ending();
+		const resolver = vi
+			.fn<() => RelayPubSubClient>()
+			.mockReturnValueOnce(first.client)
+			.mockReturnValueOnce(refusing.client)
+			.mockReturnValueOnce(third.client);
+		const transport = new RedisRelayTransport(resolver);
+		await transport.subscribe("relay::broadcast", () => {});
+
+		first.client.status = "end";
+		await expect(transport.publish("relay::broadcast", {})).rejects.toThrow(
+			"still down",
+		);
+		await transport.publish("relay::broadcast", {});
+
+		expect(third.handlers.get("relay::broadcast")?.size).toBe(1);
+	});
+
+	it("does not open a connection just to unsubscribe from a dead one", async () => {
+		const first = ending();
+		const resolver = vi.fn(() => first.client);
+		const transport = new RedisRelayTransport(resolver);
+		await transport.subscribe("relay::broadcast", () => {});
+
+		first.client.status = "end";
+		await transport.disconnect();
+
+		expect(resolver).toHaveBeenCalledOnce();
+		expect(first.client.unsubscribed).toEqual([]);
+	});
+
+	it("keeps a client that closed but reconnects, and one handed in directly", async () => {
+		const resolved = ending();
+		const resolver = vi.fn(() => resolved.client);
+		const transport = new RedisRelayTransport(resolver);
+		await transport.publish("relay::broadcast", {});
+		resolved.client.status = "close";
+		await transport.publish("relay::broadcast", {});
+		expect(resolver).toHaveBeenCalledOnce();
+
+		const direct = ending();
+		direct.client.status = "end";
+		const fixed = new RedisRelayTransport(direct.client);
+		await fixed.subscribe("relay::broadcast", () => {});
+		await fixed.disconnect();
+		expect(direct.client.unsubscribed).toHaveLength(1);
+	});
+});
