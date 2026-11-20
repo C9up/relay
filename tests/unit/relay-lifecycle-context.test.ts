@@ -55,7 +55,7 @@ describe("relay > lifecycle events carry the request context", () => {
 		const connected = relay.connect(sse, connectCtx);
 		if (connected.outcome !== "ok") throw new Error("capped");
 		await relay.subscribe(connected.uid, "news", subscribeCtx);
-		relay.unsubscribe(connected.uid, "news", unsubscribeCtx);
+		await relay.unsubscribe(connected.uid, "news", unsubscribeCtx);
 		await sse.end();
 
 		expect(seen.map((s) => s.event)).toEqual([

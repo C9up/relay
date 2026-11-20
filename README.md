@@ -74,6 +74,12 @@ it is `relay::broadcast`. Passing the driver on its own
 (`transport: transports.redis(…)`, with `transportChannel` beside it) is the
 form this config had before and still resolves.
 
+With a bus, a `subscribe` or `unsubscribe` may land on any instance: the one it
+reaches authorizes it, then relays it to the instance holding the stream, which
+applies it only if the requester is the user and session that opened the stream
+and the stream is under `maxChannelsPerClient`. Hubs are not relayed — route a
+client's hub requests to one instance (sticky sessions on the hub paths).
+
 ### Keeping a stream alive
 
 An SSE connection carrying no traffic is indistinguishable from a hung one to

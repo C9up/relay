@@ -134,11 +134,13 @@ describe("relay > subscriptions are bound to the session that opened the stream"
 		if (c.outcome !== "ok") throw new Error("capped");
 		await relay.subscribe(c.uid, "carts/s1", established("s1"));
 
-		expect(relay.unsubscribe(c.uid, "carts/s1", established("s2"))).toBe(
+		expect(await relay.unsubscribe(c.uid, "carts/s1", established("s2"))).toBe(
 			"forbidden",
 		);
 		expect(relay.channelSubscribers("carts/s1")).toBe(1);
-		expect(relay.unsubscribe(c.uid, "carts/s1", established("s1"))).toBe("ok");
+		expect(await relay.unsubscribe(c.uid, "carts/s1", established("s1"))).toBe(
+			"ok",
+		);
 		expect(relay.channelSubscribers("carts/s1")).toBe(0);
 	});
 });

@@ -318,7 +318,7 @@ function registerRelayRoutes(router: ReamRouter, relay: Relay): void {
 
 	const unsubscribe = router.post("/__relay/unsubscribe", async (ctx) => {
 		const body = await ctx.request.body();
-		const r = relay.unsubscribe(
+		const r = await relay.unsubscribe(
 			field(body, "uid"),
 			field(body, "channel"),
 			ctx,

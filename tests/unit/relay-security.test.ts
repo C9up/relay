@@ -193,7 +193,7 @@ describe("relay-security > subscribe() ownership", () => {
 		if (anon.outcome !== "ok") throw new Error("unreachable");
 		await r.subscribe(anon.uid, "public/feed", {});
 
-		const result = r.unsubscribe(anon.uid, "public/feed", {
+		const result = await r.unsubscribe(anon.uid, "public/feed", {
 			auth: { isAuthenticated: true, user: { id: "someone" } },
 		});
 
@@ -244,7 +244,7 @@ describe("relay-security > unsubscribe() ownership", () => {
 			auth: { isAuthenticated: true, user: { id: "user-42" } },
 		});
 		// Attacker can no longer silently DoS by mass-unsubscribing victims.
-		const r2 = r.unsubscribe(owner.uid, "feed", {
+		const r2 = await r.unsubscribe(owner.uid, "feed", {
 			auth: { isAuthenticated: true, user: { id: "attacker-1" } },
 		});
 		expect(r2).toBe("forbidden");
@@ -261,16 +261,16 @@ describe("relay-security > unsubscribe() ownership", () => {
 		await r.subscribe(owner.uid, "feed", {
 			auth: { isAuthenticated: true, user: { id: "user-42" } },
 		});
-		const r2 = r.unsubscribe(owner.uid, "feed", {
+		const r2 = await r.unsubscribe(owner.uid, "feed", {
 			auth: { isAuthenticated: true, user: { id: "user-42" } },
 		});
 		expect(r2).toBe("ok");
 		expect(r.channelSubscribers("feed")).toBe(0);
 	});
 
-	it("is a no-op (returns 'ok') for a uid that was never connected", () => {
+	it("is a no-op (returns 'ok') for a uid that was never connected", async () => {
 		const r = new Relay();
-		const result = r.unsubscribe("ghost-uid", "feed", {
+		const result = await r.unsubscribe("ghost-uid", "feed", {
 			auth: { isAuthenticated: false },
 		});
 		expect(result).toBe("ok");
@@ -306,9 +306,9 @@ describe("relay-security > a body is not a shape just because the type says so",
 		});
 	});
 
-	it("treats a non-string unsubscribe as the no-op it is", () => {
+	it("treats a non-string unsubscribe as the no-op it is", async () => {
 		const r = new Relay();
-		expect(r.unsubscribe(7, "feed", {})).toBe("ok");
+		expect(await r.unsubscribe(7, "feed", {})).toBe("ok");
 	});
 });
 

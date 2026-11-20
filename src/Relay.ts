@@ -272,6 +272,36 @@ interface RelayTransportMessage {
 }
 
 /**
+ * A subscription change relayed to the instance holding the stream.
+ *
+ * Behind a balancer, the POST that subscribes a stream reaches any instance,
+ * usually not the one holding it. The instance it lands on authorizes it with
+ * the request it has, then publishes this; the instance that holds `uid`
+ * applies it — Transmit's `TransportMessageType.Subscribe` / `Unsubscribe`.
+ *
+ * `user` and `session` are the REQUESTER's identity, as the receiving instance
+ * read it off the request: only the holder knows who opened the stream, so the
+ * ownership check upstream does not have runs there, against them.
+ *
+ * NAMED DEVIATION: it travels on the broadcast channel, told apart by its
+ * `type`, rather than on a second `<channel>::subscriptions` channel as
+ * Transmit's does. One subscription is what `startTransport()` / `shutdown()`
+ * own and release through their generation guard; a second one would double
+ * every failure path there. The channel is internal — these envelopes carry
+ * relay's `origin` and identity fields and are not Transmit's on the wire
+ * anyway — and an older relay on the same bus ignores them (its guard only
+ * accepts `broadcast`).
+ */
+interface RelaySubscriptionMessage {
+	type: "subscribe" | "unsubscribe";
+	uid: string;
+	channel: string;
+	user?: string;
+	session?: string;
+	origin?: string;
+}
+
+/**
  * What each lifecycle listener receives. `context` is the request's, as
  * Transmit's hooks carry it: the connect request's for `connect` and
  * `disconnect` (a disconnect has no request of its own), the subscribe or
@@ -562,6 +592,11 @@ export class Relay {
 				message.origin !== this.#instanceId
 			) {
 				this.#redeliver(message);
+			} else if (
+				isRelaySubscriptionMessage(message) &&
+				message.origin !== this.#instanceId
+			) {
+				this.#applyRelayedSubscription(message);
 			}
 		};
 		const teardown = this.#teardown;
@@ -1154,7 +1189,15 @@ export class Relay {
 		}
 		const client = this.#clients.get(uid);
 		if (!client) {
-			return { ok: false, status: 400, code: "E_RELAY_NOT_CONNECTED" };
+			// Another instance may hold the stream: behind a balancer the POST
+			// lands anywhere. Authorized HERE, with the request this instance
+			// has, then relayed — Transmit's `subscribe` with a transport.
+			if (this.#transport === undefined) {
+				return { ok: false, status: 400, code: "E_RELAY_NOT_CONNECTED" };
+			}
+			const refused = await this.#authorizeChannel(channel, ctx);
+			if (refused !== null) return refused;
+			return this.#relaySubscription("subscribe", uid, channel, ctx);
 		}
 		// Ownership: reject subscribe attempts from a request whose auth
 		// identity doesn't match the identity recorded at connect-time.
@@ -1174,20 +1217,8 @@ export class Relay {
 		if (client.channels.size >= this.#config.maxChannelsPerClient) {
 			return { ok: false, status: 429, code: "E_RELAY_MAX_CHANNELS" };
 		}
-		const match = this.#findAuthorizer(channel);
-		if (match) {
-			let allowed: boolean;
-			try {
-				allowed = await match.authorize(ctx, match.params);
-			} catch {
-				return { ok: false, status: 403, code: "E_RELAY_CHANNEL_FORBIDDEN" };
-			}
-			if (!allowed) {
-				return { ok: false, status: 403, code: "E_RELAY_CHANNEL_FORBIDDEN" };
-			}
-		} else if (!this.#config.allowUnauthorizedChannels) {
-			return { ok: false, status: 403, code: "E_RELAY_CHANNEL_NO_AUTHORIZER" };
-		}
+		const refused = await this.#authorizeChannel(channel, ctx);
+		if (refused !== null) return refused;
 		// An authorizer may await — a database lookup is the usual one — and the
 		// socket can close in that window. Writing the subscription then put the
 		// uid back into the channel index for a client that no longer exists,
@@ -1220,18 +1251,32 @@ export class Relay {
 	 * Returns `'ok'` on success (including no-op when channel wasn't
 	 * subscribed — keeps the wire idempotent), `'forbidden'` when the
 	 * requester doesn't own the uid.
+	 *
+	 * With a bus, a uid this instance does not hold is relayed to the one that
+	 * does, which checks ownership before applying it; the answer is then
+	 * `'ok'` once the bus has the message, as Transmit's.
 	 */
-	unsubscribe(
+	async unsubscribe(
 		uid: unknown,
 		channel: unknown,
 		ctx: RelayContext,
-	): "ok" | "forbidden" {
+	): Promise<"ok" | "forbidden"> {
 		// Same untrusted body as `subscribe`. Nothing here would throw on a
 		// non-string, but a `Set.delete` that silently misses is how a client
 		// believes it has stopped listening while the frames keep arriving.
 		if (!isNonEmptyString(uid) || !isNonEmptyString(channel)) return "ok";
 		const client = this.#clients.get(uid);
-		if (!client) return "ok";
+		if (!client) {
+			// A malformed channel cannot be held by anyone: nothing to relay.
+			if (
+				this.#transport !== undefined &&
+				channel.length <= 256 &&
+				channelNameProblem(channel) === null
+			) {
+				await this.#relaySubscription("unsubscribe", uid, channel, ctx);
+			}
+			return "ok";
+		}
 		// Same ownership check as subscribe — without it, any party who
 		// knows a uid can silently terminate that client's channel
 		// subscriptions, denying service.
@@ -1424,6 +1469,110 @@ export class Relay {
 			return { ok: false, status: 403, code: "E_RELAY_NOT_OWNER" };
 		}
 		return null;
+	}
+
+	/**
+	 * Run the channel's authorizer with the request's context. `null` when the
+	 * request may subscribe, the refusal otherwise.
+	 */
+	async #authorizeChannel(
+		channel: string,
+		ctx: RelayContext,
+	): Promise<SubscribeFailure | null> {
+		const match = this.#findAuthorizer(channel);
+		if (match) {
+			let allowed: boolean;
+			try {
+				allowed = await match.authorize(ctx, match.params);
+			} catch {
+				return { ok: false, status: 403, code: "E_RELAY_CHANNEL_FORBIDDEN" };
+			}
+			if (!allowed) {
+				return { ok: false, status: 403, code: "E_RELAY_CHANNEL_FORBIDDEN" };
+			}
+		} else if (!this.#config.allowUnauthorizedChannels) {
+			return { ok: false, status: 403, code: "E_RELAY_CHANNEL_NO_AUTHORIZER" };
+		}
+		return null;
+	}
+
+	/**
+	 * Hand a subscription change to the instance holding `uid`, and wait until
+	 * the bus has it — so a client that waits for the response before its next
+	 * request gets its changes applied in order, whichever instance each lands
+	 * on (Transmit's `#relaySubscription`).
+	 *
+	 * Answers `ok` without knowing whether any instance holds the stream, as
+	 * upstream does: the holder's refusals (not the owner, channel cap) are
+	 * applied there and not reported back.
+	 */
+	async #relaySubscription(
+		type: "subscribe" | "unsubscribe",
+		uid: string,
+		channel: string,
+		ctx: RelayContext,
+	): Promise<SubscribeResult> {
+		const transport = this.#transport;
+		if (transport === undefined) {
+			return { ok: false, status: 400, code: "E_RELAY_NOT_CONNECTED" };
+		}
+		const user = userIdOf(ctx.auth);
+		const session = sessionOf(ctx);
+		const message: RelaySubscriptionMessage = {
+			type,
+			uid,
+			channel,
+			...(user === undefined ? {} : { user }),
+			...(session === undefined ? {} : { session }),
+			origin: this.#instanceId,
+		};
+		try {
+			await transport.publish(this.#transportChannel, message);
+		} catch (error) {
+			this.#warn(`relaying a ${type} on '${channel}' to the bus failed`, error);
+			return { ok: false, status: 503, code: "E_RELAY_BUS_UNAVAILABLE" };
+		}
+		return { ok: true };
+	}
+
+	/**
+	 * Apply a subscription change another instance authorized, if this instance
+	 * holds the stream.
+	 *
+	 * NAMED DEVIATION (safety): Transmit applies it with no further check. The
+	 * holder is the only instance that knows who opened the stream, so it runs
+	 * the ownership check here — against the requester's identity the receiving
+	 * instance put in the message — and the per-client channel cap, which only
+	 * it can count. A refused change is dropped silently: the requester's
+	 * response is already gone, and a log line per refusal would let anyone
+	 * who learns a uid write to this instance's stderr at will.
+	 *
+	 * The `subscribe` / `unsubscribe` events fire HERE, once applied, with the
+	 * stream's own (connect) context — not on the receiving instance as
+	 * upstream does, because a refusal on the holder would otherwise have been
+	 * reported as a subscription.
+	 */
+	#applyRelayedSubscription(message: RelaySubscriptionMessage): void {
+		const client = this.#clients.get(message.uid);
+		if (client === undefined) return;
+		if (
+			userIdOf(client.auth) !== message.user ||
+			client.session !== message.session
+		) {
+			return;
+		}
+		const { uid, channel } = message;
+		if (message.type === "unsubscribe") {
+			if (!client.channels.delete(channel)) return;
+			this.#indexRemove(channel, uid);
+			this.#emit("unsubscribe", { uid, channel, context: client.context });
+			return;
+		}
+		if (client.channels.has(channel)) return;
+		if (client.channels.size >= this.#config.maxChannelsPerClient) return;
+		client.channels.add(channel);
+		this.#indexAdd(channel, uid);
+		this.#emit("subscribe", { uid, channel, context: client.context });
 	}
 
 	#dropClient(uid: string): void {
@@ -1680,6 +1829,39 @@ function isRelayTransportMessage(
 		typeof except === "string" ||
 		(Array.isArray(except) &&
 			except.every((uid: unknown) => typeof uid === "string"))
+	);
+}
+
+/**
+ * Type guard for a relayed subscription change. Validated like the subscribe
+ * route validates its body: the bus is shared, and what reaches the channel
+ * index must be what a direct subscribe would have accepted.
+ */
+function isRelaySubscriptionMessage(
+	value: unknown,
+): value is RelaySubscriptionMessage {
+	if (typeof value !== "object" || value === null) return false;
+	if (!("type" in value) || !("uid" in value) || !("channel" in value)) {
+		return false;
+	}
+	if (value.type !== "subscribe" && value.type !== "unsubscribe") return false;
+	if (!isNonEmptyString(value.uid) || !isNonEmptyString(value.channel)) {
+		return false;
+	}
+	if (
+		value.channel.length > 256 ||
+		channelNameProblem(value.channel) !== null
+	) {
+		return false;
+	}
+	const optionalString = (key: "user" | "session" | "origin"): boolean =>
+		!(key in value) ||
+		Reflect.get(value, key) === undefined ||
+		typeof Reflect.get(value, key) === "string";
+	return (
+		optionalString("user") &&
+		optionalString("session") &&
+		optionalString("origin")
 	);
 }
 
