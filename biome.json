@@ -1,6 +1,6 @@
 {
 	"root": true,
-	"$schema": "https://biomejs.dev/schemas/2.4.10/schema.json",
+	"$schema": "https://biomejs.dev/schemas/2.6.8/schema.json",
 	"assist": {
 		"actions": {
 			"source": {
@@ -11,10 +11,13 @@
 	"linter": {
 		"enabled": true,
 		"rules": {
+			"suspicious": {
+				"noExplicitAny": "error"
+			},
 			"style": {
 				"noNonNullAssertion": "error"
 			},
-			"recommended": true,
+			"preset": "recommended",
 			"nursery": {},
 			"correctness": {
 				"noUnusedImports": "error"

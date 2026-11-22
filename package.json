@@ -40,7 +40,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.12",
+    "@biomejs/biome": "^2.6.8",
     "@c9up/ream": "^0.2.32",
     "@microsoft/signalr": "11.0.0",
     "@types/node": "^22.20.1",
