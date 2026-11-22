@@ -49,11 +49,18 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with: { version: 9 }
+        with: { version: 12.21.0 }
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '24'
+      # pnpm reads its settings (seven-day release age, allowed install
+      # scripts) from pnpm-workspace.yaml; .github/pnpm-ci.yaml says why it
+      # is kept there.
+      - run: cp .github/pnpm-ci.yaml pnpm-workspace.yaml
       - run: pnpm install
+      # What this install put on the runner, devDependencies included,
+      # carries no high, critical or unpatched advisory.
+      - run: node .github/scripts/npm-audit.mjs --installed
       - run: pnpm exec tsc -p tsconfig.build.json --noEmit
       # And the tests: `tsconfig.build.json` leaves them out, so every type a
       # test relies on went ungated until this step ran the project's own
@@ -113,7 +120,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with: { version: 9 }
+        with: { version: 12.21.0 }
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '24'
@@ -190,7 +197,14 @@ jobs:
             echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
           fi
 
+      # pnpm reads its settings (seven-day release age, allowed install
+      # scripts) from pnpm-workspace.yaml; .github/pnpm-ci.yaml says why it
+      # is kept there.
+      - run: cp .github/pnpm-ci.yaml pnpm-workspace.yaml
       - run: pnpm install
+      # What this install put on the runner, devDependencies included,
+      # carries no high, critical or unpatched advisory.
+      - run: node .github/scripts/npm-audit.mjs --installed
       # Fail the publish on a broken build — the published package points to
       # `dist` (publishConfig), so a failed `tsc` must NOT be ignored.
       - run: pnpm build
