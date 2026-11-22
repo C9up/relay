@@ -76,8 +76,13 @@ form this config had before and still resolves.
 With a bus, a `subscribe` or `unsubscribe` may land on any instance: the one it
 reaches authorizes it, then relays it to the instance holding the stream, which
 applies it only if the requester is the user and session that opened the stream
-and the stream is under `maxChannelsPerClient`. Hubs are not relayed — route a
-client's hub requests to one instance (sticky sessions on the hub paths).
+and the stream is under `maxChannelsPerClient`.
+
+A hub connection lives on the instance that negotiated it, so route a client's
+hub requests to one instance (sticky sessions on the hub paths: the negotiate,
+then the socket, or the stream and its posts). What a hub sends to a group or
+to everyone crosses the bus: every instance delivers it to the members it
+holds, as SignalR's Redis backplane does.
 
 ### Keeping a stream alive
 

@@ -29,6 +29,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { HubFanOut } from "./Hub.js";
 
 /**
  * Event name the keep-alive goes out under. Prefixed so it cannot collide with
@@ -299,6 +300,42 @@ interface RelaySubscriptionMessage {
 	user?: string;
 	session?: string;
 	origin?: string;
+}
+
+/**
+ * A hub's group send or broadcast, relayed to the other instances.
+ *
+ * A hub keeps its groups per instance — a member is a connection, and a
+ * connection lives where it was opened — so the instance that made the send
+ * delivers to its own members and publishes this; every other instance
+ * delivers it to the members it holds. ASP.NET Core SignalR's Redis backplane
+ * does the same with its own channels.
+ *
+ * NAMED DEVIATION from Transmit, which has no hubs: it travels on the
+ * broadcast channel, told apart by its `type`, for the reason the
+ * subscription messages do (one subscription for `startTransport()` and
+ * `shutdown()` to own). An older relay on the same bus ignores it.
+ */
+interface RelayHubMessage extends HubFanOut {
+	type: "hub";
+	/** The path the hub is mounted at, the same on every instance. */
+	hub: string;
+	origin?: string;
+}
+
+/** What a hub needs to answer for its sends to cross instances. */
+interface FanOutHub {
+	attachFanOut(publish: (message: HubFanOut) => void): void;
+	receiveFanOut(message: HubFanOut): void;
+}
+
+function isFanOutHub(hub: object): hub is FanOutHub {
+	return (
+		"attachFanOut" in hub &&
+		typeof hub.attachFanOut === "function" &&
+		"receiveFanOut" in hub &&
+		typeof hub.receiveFanOut === "function"
+	);
 }
 
 /**
@@ -597,6 +634,11 @@ export class Relay {
 				message.origin !== this.#instanceId
 			) {
 				this.#applyRelayedSubscription(message);
+			} else if (
+				isRelayHubMessage(message) &&
+				message.origin !== this.#instanceId
+			) {
+				this.#redeliverToHub(message);
 			}
 		};
 		const teardown = this.#teardown;
@@ -857,6 +899,11 @@ export class Relay {
 			);
 		}
 		this.#hubs.set(path, { path, hub, adapter });
+		if (isFanOutHub(hub)) {
+			hub.attachFanOut((message) => {
+				this.#publishHubToBus(path, message);
+			});
+		}
 		this.#mounter?.mountHub(this, { path, hub, adapter });
 	}
 
@@ -1037,6 +1084,40 @@ export class Relay {
 			return;
 		}
 		this.#deliver(message.channel, data, message.exceptUids);
+	}
+
+	/** A hub send another instance made, delivered to this one's members. */
+	#redeliverToHub(message: RelayHubMessage): void {
+		const mounted = this.#hubs.get(message.hub);
+		if (mounted === undefined || !isFanOutHub(mounted.hub)) return;
+		mounted.hub.receiveFanOut({
+			target: message.target,
+			event: message.event,
+			data: message.data,
+		});
+	}
+
+	/** Hand a hub's group send or broadcast to the other instances. */
+	#publishHubToBus(hub: string, fanOut: HubFanOut): void {
+		if (!this.#transport) return;
+		const message: RelayHubMessage = {
+			type: "hub",
+			hub,
+			target: fanOut.target,
+			event: fanOut.event,
+			data: fanOut.data,
+			origin: this.#instanceId,
+		};
+		const transport = this.#transport;
+		void (async () =>
+			transport.publish(this.#transportChannel, message))().catch(
+			(error: unknown) => {
+				this.#warn(
+					`publishing a send of hub '${hub}' to the bus failed — clients on other instances will not see it`,
+					error,
+				);
+			},
+		);
 	}
 
 	#publishToBus(
@@ -1290,17 +1371,23 @@ export class Relay {
 
 	// ─── Stats ────────────────────────────────────────────────
 
+	/**
+	 * The SSE clients connected to THIS instance. With a bus, the others hold
+	 * their own and are not counted — as Transmit's own counts.
+	 */
 	clientCount(): number {
 		return this.#clients.size;
 	}
 
+	/** The subscribers of `channel` on THIS instance; see {@link clientCount}. */
 	channelSubscribers(channel: string): number {
 		return this.#channelIndex.get(channel)?.size ?? 0;
 	}
 
 	/**
-	 * List the uids currently subscribed to `channel`. Adonis Transmit
-	 * parity (`getSubscribersFor`). Returns a fresh array snapshot.
+	 * List the uids subscribed to `channel` on THIS instance — Transmit's
+	 * `getSubscribersFor`, which is per instance too. Returns a fresh array
+	 * snapshot.
 	 */
 	getSubscribersFor(channel: string): string[] {
 		const set = this.#channelIndex.get(channel);
@@ -1829,6 +1916,42 @@ function isRelayTransportMessage(
 		typeof except === "string" ||
 		(Array.isArray(except) &&
 			except.every((uid: unknown) => typeof uid === "string"))
+	);
+}
+
+/**
+ * Type guard for a relayed hub send. The bus is shared, so the shape is
+ * checked before anything reaches a hub: a target that names nobody, or an
+ * event that is not a name, is dropped.
+ */
+function isRelayHubMessage(value: unknown): value is RelayHubMessage {
+	if (typeof value !== "object" || value === null) return false;
+	if (
+		!("type" in value) ||
+		value.type !== "hub" ||
+		!("hub" in value) ||
+		!isNonEmptyString(value.hub) ||
+		!("event" in value) ||
+		!isNonEmptyString(value.event) ||
+		!("data" in value) ||
+		!("target" in value)
+	) {
+		return false;
+	}
+	const target = value.target;
+	if (typeof target !== "object" || target === null || !("kind" in target)) {
+		return false;
+	}
+	const targetOk =
+		target.kind === "all" ||
+		(target.kind === "group" &&
+			"group" in target &&
+			isNonEmptyString(target.group));
+	if (!targetOk) return false;
+	return (
+		!("origin" in value) ||
+		value.origin === undefined ||
+		typeof value.origin === "string"
 	);
 }
 

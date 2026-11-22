@@ -59,6 +59,20 @@ export interface HubGuardOptions {
 	permissions?: string[];
 }
 
+/**
+ * A group send or a broadcast, as it crosses to the other instances.
+ *
+ * Group memberships live on the instance the client is connected to, so a
+ * send made on one instance has to be heard by every other one, which then
+ * delivers it to ITS members. `target` names who: a group, or every client of
+ * the hub.
+ */
+export interface HubFanOut {
+	target: { kind: "group"; group: string } | { kind: "all" };
+	event: string;
+	data: unknown;
+}
+
 interface ConnectedHubClient {
 	id: string;
 	groups: Set<string>;
@@ -78,6 +92,13 @@ interface ConnectedHubClient {
 export abstract class Hub {
 	#clients: Map<string, ConnectedHubClient> = new Map();
 	#groupIndex: Map<string, Set<string>> = new Map();
+	/**
+	 * Where a group send or a broadcast goes after the local delivery: the
+	 * relay's bus, once the hub is mounted on a relay that has one. Without it
+	 * a hub behind a load balancer reached only the clients of the instance
+	 * that made the send, which looks right until the second replica.
+	 */
+	#fanOut: ((message: HubFanOut) => void) | undefined;
 	#guards: HubGuardOptions = {};
 	/**
 	 * Allowlist of dispatchable handler methods (populated at construction),
@@ -398,8 +419,46 @@ export abstract class Hub {
 		return null;
 	}
 
-	/** Send to all clients in a group. */
+	/**
+	 * @internal Hand every group send and broadcast to `publish` as well, so
+	 * the other instances deliver it to their clients. The relay a hub is
+	 * mounted on calls this; one hub carries one publisher.
+	 */
+	attachFanOut(publish: (message: HubFanOut) => void): void {
+		if (this.#fanOut !== undefined && this.#fanOut !== publish) {
+			throw new Error(
+				"This hub instance is already mounted: give each mount its own instance, so a send crosses instances under one path.",
+			);
+		}
+		this.#fanOut = publish;
+	}
+
+	/**
+	 * @internal A send another instance made, delivered to this instance's
+	 * clients only: it is never handed back to the bus.
+	 */
+	receiveFanOut(message: HubFanOut): void {
+		if (message.target.kind === "group") {
+			this.#deliverToGroup(message.target.group, message.event, message.data);
+		} else {
+			this.#deliverToAll(message.event, message.data);
+		}
+	}
+
+	/** Send to all clients in a group, on this instance and the others. */
 	#sendToGroup(group: string, event: string, data: unknown): void {
+		this.#deliverToGroup(group, event, data);
+		this.#fanOut?.({ target: { kind: "group", group }, event, data });
+	}
+
+	/** Broadcast to all connected clients, on this instance and the others. */
+	#broadcastAll(event: string, data: unknown): void {
+		this.#deliverToAll(event, data);
+		this.#fanOut?.({ target: { kind: "all" }, event, data });
+	}
+
+	/** The members of `group` connected to this instance. */
+	#deliverToGroup(group: string, event: string, data: unknown): void {
 		const members = this.#groupIndex.get(group);
 		if (!members) return;
 		const dead: string[] = [];
@@ -414,14 +473,18 @@ export abstract class Hub {
 		for (const id of dead) members.delete(id);
 	}
 
-	/** Broadcast to all connected clients. */
-	#broadcastAll(event: string, data: unknown): void {
+	/** Every client connected to this instance. */
+	#deliverToAll(event: string, data: unknown): void {
 		for (const client of this.#clients.values()) {
 			deliver(client, event, data);
 		}
 	}
 
-	/** Get stats. */
+	/**
+	 * The clients and groups held on THIS instance. Sends cross instances
+	 * through the relay's bus; memberships do not, so the others are not
+	 * counted.
+	 */
 	stats(): { clients: number; groups: number } {
 		return { clients: this.#clients.size, groups: this.#groupIndex.size };
 	}
