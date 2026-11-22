@@ -38,9 +38,12 @@ export class FakeRelay {
 	/** Mirrors the real `Relay.broadcast` signature — captures the
 	 *  call and returns 0 (no real clients in fake mode).
 	 *
-	 *  `data` is deep-cloned via `structuredClone` so a caller mutating
-	 *  the original object after broadcasting cannot retroactively
-	 *  alter the captured snapshot. */
+	 *  `data` is captured as the real relay sends it: through JSON, which
+	 *  also makes it a copy a caller mutating the original cannot alter.
+	 *  A payload JSON cannot carry (a cycle, a BigInt) throws here, as it
+	 *  throws at the real `broadcast()`; a function field is dropped, as it
+	 *  is on the wire. `structuredClone` accepted the first and threw on the
+	 *  second — the reverse of the relay it stands in for. */
 	broadcast(channel: string, data: unknown): number {
 		// `undefined` becomes null on the real relay, because that is what JSON
 		// can carry. A fake that captured it verbatim would let an assertion
@@ -63,7 +66,7 @@ export class FakeRelay {
 	#capture(channel: string, data: unknown): number {
 		this.#captured.push({
 			channel,
-			data: data === undefined ? undefined : deepClone(data),
+			data: data === undefined ? undefined : onTheWire(data),
 			clients: 0,
 		});
 		return 0;
@@ -134,21 +137,34 @@ function describeCaptured(captured: CapturedBroadcast[]): string {
 	return `Captured (${captured.length}):\n${lines.join("\n")}`;
 }
 
-/** `JSON.stringify` with circular-ref + function-field handling.
- *  Functions render as `<function>`, circular refs as `<circular>`,
- *  unstringifiable values as `<unstringifiable>` — so an assertion
- *  failure message never gets eaten by a JSON throw. */
+/**
+ * `JSON.stringify` for an assertion message: a function renders as
+ * `<function>`, a BigInt as `<digits>n`, a cycle as `<circular>`, and a value
+ * that still cannot be written as `<unstringifiable>` — so a failure message
+ * is never eaten by a JSON throw.
+ *
+ * Only a cycle is cut. `path` holds the objects from the root to the value
+ * being written, so a value reached through two keys is written under both, as
+ * `JSON.stringify` writes it; remembering every object seen dropped the second
+ * one. The same rule as `@c9up/ream`'s `src/utils/safeStringify.ts`, kept as a
+ * local copy because this message format differs from a response body's.
+ */
 function safeStringify(value: unknown): string {
-	const seen = new WeakSet<object>();
+	const path: object[] = [];
 	try {
-		return JSON.stringify(value, (_key, v: unknown) => {
-			if (typeof v === "function") return "<function>";
-			if (typeof v === "object" && v !== null) {
-				if (seen.has(v)) return "<circular>";
-				seen.add(v);
-			}
-			return v;
-		});
+		const out: string | undefined = JSON.stringify(
+			value,
+			function replace(this: unknown, _key: string, v: unknown) {
+				if (typeof v === "function") return "<function>";
+				if (typeof v === "bigint") return `${v}n`;
+				if (typeof v !== "object" || v === null) return v;
+				while (path.length > 0 && path[path.length - 1] !== this) path.pop();
+				if (path.includes(v)) return "<circular>";
+				path.push(v);
+				return v;
+			},
+		);
+		return out ?? "undefined";
 	} catch {
 		return "<unstringifiable>";
 	}
@@ -156,4 +172,10 @@ function safeStringify(value: unknown): string {
 
 function deepClone<T>(value: T): T {
 	return structuredClone(value);
+}
+
+/** What the real relay's `encodePayload` puts in a frame, read back. */
+function onTheWire(value: unknown): unknown {
+	const encoded: string | undefined = JSON.stringify(value);
+	return JSON.parse(encoded ?? "null");
 }

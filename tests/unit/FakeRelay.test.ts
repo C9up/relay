@@ -65,6 +65,34 @@ describe("FakeRelay — assertSent", () => {
 		).toThrow(/no captured broadcast matches/);
 	});
 
+	it("prints a value shared by two keys under both", () => {
+		const r = new FakeRelay();
+		const shared = { id: 7 };
+		r.broadcast("alerts", { a: shared, b: shared, list: [shared, shared] });
+		let message = "";
+		try {
+			r.assertSent("missing");
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toContain(
+			'data={"a":{"id":7},"b":{"id":7},"list":[{"id":7},{"id":7}]}',
+		);
+	});
+
+	it("captures what the real relay sends: no cycle, no BigInt, no function", () => {
+		const r = new FakeRelay();
+		const looped: Record<string, unknown> = { name: "loop" };
+		looped.self = looped;
+		// The real broadcast() throws on both, at the caller; so does the fake.
+		expect(() => r.broadcast("a", looped)).toThrow(TypeError);
+		expect(() => r.broadcast("a", { size: 10n })).toThrow(TypeError);
+		expect(r.getSent()).toHaveLength(0);
+		// A function field never reaches the wire.
+		r.broadcast("a", { n: 1, cb: () => 1 });
+		expect(r.getSent()[0]?.data).toEqual({ n: 1 });
+	});
+
 	it("function predicate gives full event access", () => {
 		const r = new FakeRelay();
 		r.broadcast("alerts", "high-priority");
