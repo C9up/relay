@@ -60,6 +60,11 @@ interface IssuedToken {
 	claimed: boolean;
 	/** Who negotiated it, for the per-owner share of the table. */
 	owner?: string;
+	/**
+	 * The identity that negotiated it, for the transport to check on the
+	 * token's first use — see {@link SignalRAdapter.negotiatorOf}.
+	 */
+	negotiator?: string;
 }
 
 export type SignalRMessageType = 1 | 2 | 3 | 4 | 5 | 6 | 7;
@@ -251,14 +256,16 @@ export class SignalRAdapter {
 	 * first-class SignalR transport — announcing WebSockets when nothing can
 	 * upgrade would send every client down a road that dead-ends.
 	 *
-	 * `owner` is who asked (see {@link admits}). Throws when the table, or
-	 * the owner's share of it, is full — check {@link admits} first to answer
-	 * with a status instead.
+	 * `owner` is who asked (see {@link admits}). `negotiator` is the identity
+	 * the request carried, kept with the token so its first use can be held to
+	 * it. Throws when the table, or the owner's share of it, is full — check
+	 * {@link admits} first to answer with a status instead.
 	 */
 	negotiate(
 		connectionId: string,
 		transports: readonly string[] = ["ServerSentEvents"],
 		owner?: string,
+		negotiator?: string,
 	): NegotiateResponse {
 		if (!this.admits(owner)) {
 			throw new Error(
@@ -271,6 +278,7 @@ export class SignalRAdapter {
 			issuedAt: Date.now(),
 			claimed: false,
 			...(owner === undefined ? {} : { owner }),
+			...(negotiator === undefined ? {} : { negotiator }),
 		});
 		return {
 			connectionId,
@@ -281,6 +289,14 @@ export class SignalRAdapter {
 				transferFormats: ["Text"],
 			})),
 		};
+	}
+
+	/**
+	 * The identity that negotiated `connectionToken`, as handed to
+	 * {@link negotiate}; `undefined` when none was given or the token is gone.
+	 */
+	negotiatorOf(connectionToken: string): string | undefined {
+		return this.#tokenToId.get(connectionToken)?.negotiator;
 	}
 
 	/** Resolve a connectionId from a connectionToken. Returns undefined if invalid. */

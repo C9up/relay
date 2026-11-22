@@ -1,25 +1,24 @@
 # @c9up/relay
 
 > Realtime client transport for the Ream framework — SSE event streams and
-> SignalR hubs.
+> SignalR hubs over WebSockets or SSE.
 
 ### Which transports run
 
-Both of them run over Server-Sent Events, which is what Ream's HTTP server
-serves and a first-class SignalR transport besides:
-
-- the **event stream** — `authorize` / `broadcast` / `on`, on the three routes
-  the provider registers;
+- the **event stream** — `authorize` / `broadcast` / `on`, over Server-Sent
+  Events, on the three routes the provider registers;
 - **hubs** — `relay.hub('/hubs/chat', new ChatHub())` registers SignalR's
-  negotiate, downstream and upstream routes, and a stock `@microsoft/signalr`
-  client configured with `HttpTransportType.ServerSentEvents` speaks to it
-  unchanged.
+  negotiate, WebSocket, downstream and upstream routes. A stock
+  `@microsoft/signalr` client speaks to it unchanged, over
+  `HttpTransportType.WebSockets` or `HttpTransportType.ServerSentEvents`.
 
-**WebSockets are the transport that is missing.** Ream's Rust HTTP server
-exposes no upgrade point, so a hub reached over `HttpTransportType.WebSockets`
-needs a socket you supply and drive yourself — `SignalRAdapter` is written for
-that, parsing an inbound frame and handing back the frames to send without
-owning a socket of its own.
+`negotiate` announces WebSockets only when the server under the application
+can upgrade — ream's `server.supportsWebSockets()`, true once its native
+server listens (ream 0.2.32 or later) — and Server-Sent Events always. On an
+older ream, or another host, hubs run over SSE alone. The socket and the SSE
+stream share the hub's path. Over a socket, every invocation is checked
+against the handshake's auth (the only request a socket has); over SSE,
+against the POST that carries it.
 
 Part of **[Ream](https://github.com/C9up/ream)** — a Rust-powered Node.js framework. Independent, publishable package.
 

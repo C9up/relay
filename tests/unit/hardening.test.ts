@@ -20,6 +20,8 @@ import {
 const RS = "\x1e";
 const HANDSHAKE = `${JSON.stringify({ protocol: "json", version: 1 })}${RS}`;
 const AUTH = { isAuthenticated: true, user: { id: "alice" } };
+/** The identity a token negotiated as AUTH is held to on its first use. */
+const ALICE = "user:alice";
 
 afterEach(() => {
 	vi.useRealTimers();
@@ -96,7 +98,12 @@ function hubContext(
 describe("relay > SignalR with Ream's own Request (045)", () => {
 	it("finds the connection token although url() leaves the query out", async () => {
 		const { routes, adapter } = hubRoutes(new (class extends Hub {})());
-		const { connectionToken } = adapter.negotiate("c");
+		const { connectionToken } = adapter.negotiate(
+			"c",
+			undefined,
+			undefined,
+			ALICE,
+		);
 		const request = new Request({
 			method: "GET",
 			path: "/hub",
@@ -219,7 +226,12 @@ describe("relay > SignalR hubs (051, 053, results)", () => {
 		const hub = new Guarded();
 		hub.useGuards({ guards: ["web"] });
 		const { routes, adapter } = hubRoutes(hub);
-		const { connectionToken } = adapter.negotiate("c");
+		const { connectionToken } = adapter.negotiate(
+			"c",
+			undefined,
+			undefined,
+			ALICE,
+		);
 		await routes.get("GET /hub")?.(
 			hubContext(connectionToken, stream(), {
 				auth: { ...AUTH, authenticatedViaGuard: "web" },
@@ -235,7 +247,12 @@ describe("relay > SignalR hubs (051, 053, results)", () => {
 
 	it("closes the older stream when the same token is opened again", async () => {
 		const { routes, adapter } = hubRoutes(new (class extends Hub {})());
-		const { connectionToken } = adapter.negotiate("c");
+		const { connectionToken } = adapter.negotiate(
+			"c",
+			undefined,
+			undefined,
+			ALICE,
+		);
 		const first = stream("first");
 		const second = stream("second");
 		await routes.get("GET /hub")?.(hubContext(connectionToken, first));
@@ -249,7 +266,12 @@ describe("relay > SignalR hubs (051, 053, results)", () => {
 		const hub = new (class extends Hub {})();
 		const adapter = new SignalRAdapter(hub, { handshakeTimeoutMs: 1000 });
 		const { routes } = hubRoutes(hub, adapter);
-		const { connectionToken } = adapter.negotiate("c");
+		const { connectionToken } = adapter.negotiate(
+			"c",
+			undefined,
+			undefined,
+			ALICE,
+		);
 		const sse = stream();
 		await routes.get("GET /hub")?.(hubContext(connectionToken, sse));
 		vi.advanceTimersByTime(1001);
@@ -260,8 +282,18 @@ describe("relay > SignalR hubs (051, 053, results)", () => {
 		const hub = new (class extends Hub {})();
 		const adapter = new SignalRAdapter(hub, { maxConnections: 1 });
 		const { routes } = hubRoutes(hub, adapter);
-		const one = adapter.negotiate("one").connectionToken;
-		const two = adapter.negotiate("two").connectionToken;
+		const one = adapter.negotiate(
+			"one",
+			undefined,
+			undefined,
+			ALICE,
+		).connectionToken;
+		const two = adapter.negotiate(
+			"two",
+			undefined,
+			undefined,
+			ALICE,
+		).connectionToken;
 		await routes.get("GET /hub")?.(hubContext(one, stream()));
 		const refused = hubContext(two, stream());
 		await routes.get("GET /hub")?.(refused);
@@ -276,7 +308,12 @@ describe("relay > SignalR hubs (051, 053, results)", () => {
 		}
 		const hub = new Maths();
 		const { routes, adapter } = hubRoutes(hub);
-		const { connectionToken } = adapter.negotiate("c");
+		const { connectionToken } = adapter.negotiate(
+			"c",
+			undefined,
+			undefined,
+			ALICE,
+		);
 		await routes.get("GET /hub")?.(hubContext(connectionToken, stream()));
 		await adapter.handleFrame("c", HANDSHAKE);
 		const [completion] = await adapter.handleFrame(

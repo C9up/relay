@@ -51,7 +51,9 @@ export {
 } from "./SignalRAdapter.js";
 export {
 	type HubHttpContext,
+	type HubRouteOptions,
 	type HubRouter,
+	type HubSocket,
 	type HubSseStream,
 	type MountedHub,
 	registerHubRoutes,

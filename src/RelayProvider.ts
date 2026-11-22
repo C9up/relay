@@ -2,7 +2,7 @@ import "./augmentations.js";
 import { Hub } from "./Hub.js";
 import { Relay, type RelayConfig, type RelayRouteBuilder } from "./Relay.js";
 import { SignalRAdapter } from "./SignalRAdapter.js";
-import { registerHubRoutes } from "./SignalRTransport.js";
+import { type HubSocket, registerHubRoutes } from "./SignalRTransport.js";
 import { clearRelay, getRelay, setRelay } from "./services/main.js";
 
 interface RelayContainer {
@@ -90,10 +90,16 @@ export default class RelayProvider {
 		// work through the singleton and the user wires their own SSE routes.
 		if (!this.app.container.has("router")) return;
 		const router = await this.app.container.resolve<ReamRouter>("router");
+		// Whether the server can upgrade is only known once it listens, after
+		// the hubs are declared, so the hubs ask it on every negotiate.
+		const server = this.app.container.has("server")
+			? await this.app.container.resolve<unknown>("server")
+			: undefined;
+		const webSockets = (): boolean => supportsWebSockets(server);
 		relay.useMounter({
 			mountEndpoints: (target) => registerRelayRoutes(router, target),
 			mountHub: (target, mounted) =>
-				registerMountedHub(router, target, mounted),
+				registerMountedHub(router, target, mounted, webSockets),
 		});
 	}
 
@@ -199,19 +205,38 @@ interface ReamRouter {
 		path: string,
 		handler: (ctx: ReamHttpContext) => Promise<void> | void,
 	): RelayRouteBuilder;
+	/** ream's `router.ws()`; an older ream without it serves hubs over SSE. */
+	ws?(
+		path: string,
+		handler: (
+			ctx: ReamHttpContext & { socket: HubSocket },
+		) => Promise<void> | void,
+	): RelayRouteBuilder;
+}
+
+/**
+ * ream's `server.supportsWebSockets()`, read structurally: a host without it
+ * (another framework, an older ream) has no WebSocket to offer.
+ */
+function supportsWebSockets(server: unknown): boolean {
+	if (typeof server !== "object" || server === null) return false;
+	const ask = Reflect.get(server, "supportsWebSockets");
+	return typeof ask === "function" && Reflect.apply(ask, server, []) === true;
 }
 
 /**
  * Mount every hub recorded with `relay.hub(path, hub)`.
  *
- * Each gets the three routes SignalR's SSE transport needs, and the same route
- * customizer the relay's own routes get — a hub is as much in need of `auth`
- * middleware as the event stream is.
+ * Each gets the routes SignalR's transports need — negotiate, the SSE stream
+ * and its upstream POST, and the WebSocket route on a router that has one —
+ * and the same route customizer the relay's own routes get: a hub is as much
+ * in need of `auth` middleware as the event stream is.
  */
 function registerMountedHub(
 	router: ReamRouter,
 	relay: Relay,
 	mounted: { path: string; hub: unknown; adapter?: unknown },
+	webSockets: () => boolean,
 ): void {
 	{
 		// `relay.hub()` takes its hub structurally — the relay records it and
@@ -234,12 +259,23 @@ function registerMountedHub(
 				`The adapter given for the hub at "${mounted.path}" is not a SignalRAdapter.`,
 			);
 		}
-		const routes = registerHubRoutes(router, {
-			path: mounted.path,
-			hub,
-			adapter: adapter ?? new SignalRAdapter(hub),
-		});
-		for (const route of [routes.negotiate, routes.stream, routes.send]) {
+		const routes = registerHubRoutes(
+			router,
+			{
+				path: mounted.path,
+				hub,
+				adapter: adapter ?? new SignalRAdapter(hub),
+			},
+			{ webSockets },
+		);
+		// The socket route takes the same middleware as the others: an `auth`
+		// customization guards the handshake before any socket opens.
+		for (const route of [
+			routes.negotiate,
+			routes.stream,
+			routes.send,
+			...(routes.socket === undefined ? [] : [routes.socket]),
+		]) {
 			relay.applyRouteCustomization(route);
 		}
 		// The relay's shutdown ends the hub's streams too, and its next start

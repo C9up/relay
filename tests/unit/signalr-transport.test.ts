@@ -299,6 +299,83 @@ describe("relay > SignalR transport ownership", () => {
 	});
 });
 
+describe("relay > a token's first use is held to whoever negotiated it", () => {
+	/**
+	 * Before any connection exists there was nobody to compare with, so the
+	 * first request presenting a token owned it: a token read between the
+	 * victim's negotiate and its connect opened the connection as the
+	 * attacker, and the victim's own connect was then the one refused.
+	 */
+	async function negotiated(auth: HubHttpContext["auth"]) {
+		const hub = new ChatHub();
+		const { router } = mount(hub);
+		const neg = context("/hubs/chat/negotiate");
+		neg.auth = auth;
+		await router.routes.get("POST /hubs/chat/negotiate")?.(neg);
+		const token = Reflect.get(Object(neg.body), "connectionToken");
+		if (typeof token !== "string") throw new Error("no token");
+		return { hub, router, token };
+	}
+
+	it("refuses another user's first stream on the token", async () => {
+		const { hub, router, token } = await negotiated({
+			isAuthenticated: true,
+			user: { id: "u1" },
+		});
+		const attacker = context(`/hubs/chat?id=${token}`);
+		attacker.auth = { isAuthenticated: true, user: { id: "mallory" } };
+		await router.routes.get("GET /hubs/chat")?.(attacker);
+		expect(attacker.code).toBe(403);
+		expect(hub.stats().clients).toBe(0);
+
+		const owner = context(`/hubs/chat?id=${token}`);
+		await router.routes.get("GET /hubs/chat")?.(owner);
+		expect(owner.code).toBe(200);
+		expect(hub.stats().clients).toBe(1);
+	});
+
+	it("refuses an anonymous first stream on a user's token, and the reverse", async () => {
+		const users = await negotiated({
+			isAuthenticated: true,
+			user: { id: "u1" },
+		});
+		const anonymous = context(`/hubs/chat?id=${users.token}`);
+		anonymous.auth = { isAuthenticated: false };
+		await users.router.routes.get("GET /hubs/chat")?.(anonymous);
+		expect(anonymous.code).toBe(403);
+
+		const guests = await negotiated({ isAuthenticated: false });
+		const signedIn = context(`/hubs/chat?id=${guests.token}`);
+		await guests.router.routes.get("GET /hubs/chat")?.(signedIn);
+		expect(signedIn.code).toBe(403);
+		const guest = context(`/hubs/chat?id=${guests.token}`);
+		guest.auth = { isAuthenticated: false };
+		await guests.router.routes.get("GET /hubs/chat")?.(guest);
+		expect(guest.code).toBe(200);
+	});
+
+	it("refuses another user's upstream POST before any stream is open", async () => {
+		const { hub, router, token } = await negotiated({
+			isAuthenticated: true,
+			user: { id: "u1" },
+		});
+		const attacker = context(`/hubs/chat?id=${token}`, HANDSHAKE);
+		attacker.auth = { isAuthenticated: true, user: { id: "mallory" } };
+		await router.routes.get("POST /hubs/chat")?.(attacker);
+		expect(attacker.code).toBe(403);
+		expect(hub.seen).toEqual([]);
+	});
+
+	it("refuses a token negotiated with no identity on record: fail closed", async () => {
+		const hub = new ChatHub();
+		const { router, adapter } = mount(hub);
+		const { connectionToken } = adapter.negotiate("direct");
+		const ctx = context(`/hubs/chat?id=${connectionToken}`);
+		await router.routes.get("GET /hubs/chat")?.(ctx);
+		expect(ctx.code).toBe(403);
+	});
+});
+
 describe("relay > SignalR transport ownership with numeric user ids", () => {
 	/** A connection negotiated and opened by user `id`, numeric as atlas keys are. */
 	async function openedBy(id: unknown) {

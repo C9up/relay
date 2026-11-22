@@ -6,17 +6,24 @@
  * could not run on anything: there was no negotiate endpoint, no downstream
  * channel and no way to post a frame up.
  *
- * The transport is Server-Sent Events, which is what `@c9up/relay` already
- * serves and what AdonisJS's own real-time package (`transmit`) uses. It is
- * also a first-class SignalR transport, so a stock `@microsoft/signalr` client
- * configured with `HttpTransportType.ServerSentEvents` speaks it unchanged:
+ * Two SignalR transports, both first-class, so a stock `@microsoft/signalr`
+ * client speaks to a hub unchanged:
  *
- *   POST <path>/negotiate      → connectionId + connectionToken
- *   GET  <path>?id=<token>     → the SSE stream, server → client
+ *   POST <path>/negotiate      → connectionId + connectionToken, and the
+ *                                transports this server can serve
+ *   WS   <path>?id=<token>     → WebSockets: one socket, frames both ways
+ *   GET  <path>?id=<token>     → Server-Sent Events, server → client
  *   POST <path>?id=<token>     → one or more framed messages, client → server
  *
- * Every server → client message goes out as an SSE event with NO name, so the
- * browser delivers it through `onmessage` — the shape the SignalR client reads.
+ * WebSockets are announced only when the host router has WebSocket routes and
+ * the server under it can upgrade (`server.supportsWebSockets()` in ream):
+ * announcing them when nothing can upgrade sends every client down a road
+ * that dead-ends. The socket and the SSE stream share the hub's path — ream
+ * hands a handshake to the WebSocket route and a plain GET to the stream.
+ *
+ * Over SSE, every server → client message goes out as an event with NO name,
+ * so the browser delivers it through `onmessage` — the shape the SignalR
+ * client reads. Over a socket, each is one text message.
  */
 
 import type { Hub, HubContext } from "./Hub.js";
@@ -86,6 +93,83 @@ export interface HubRouter<
 > {
 	get(path: string, handler: (ctx: Ctx) => Promise<void> | void): Route;
 	post(path: string, handler: (ctx: Ctx) => Promise<void> | void): Route;
+	/**
+	 * A WebSocket route, as ream's `router.ws()`: the handler runs on the
+	 * handshake, after the route middleware, with the socket on the context.
+	 * A router without it serves the hub over Server-Sent Events only.
+	 */
+	ws?(
+		path: string,
+		handler: (ctx: Ctx & { socket: HubSocket }) => Promise<void> | void,
+	): Route;
+}
+
+/** What a hub needs of the host's WebSocket. Matches ream's `ServerWebSocket`. */
+export interface HubSocket {
+	readonly readyState: "open" | "closing" | "closed";
+	/** `false` when the socket is closing, or its backlog is full. */
+	send(data: string): boolean;
+	close(code?: number, reason?: string): void;
+	on(
+		event: "message",
+		listener: (data: string | Uint8Array, isBinary: boolean) => void,
+	): unknown;
+	on(event: "close", listener: (code: number, reason: string) => void): unknown;
+}
+
+/** How {@link registerHubRoutes} learns what the server can serve. */
+export interface HubRouteOptions {
+	/**
+	 * Whether the server under the router accepts WebSocket connections now —
+	 * ream's `server.supportsWebSockets()`. Asked on every negotiate, since the
+	 * server starts after the routes are declared. Absent: Server-Sent Events
+	 * only.
+	 */
+	webSockets?: () => boolean;
+}
+
+/**
+ * Where a connection's server → client frames go: the SSE stream or the
+ * socket. One shape for both, so the hub, the caps and the handshake rules
+ * are the same whichever transport the client picked.
+ */
+interface Downstream {
+	isOpen(): boolean;
+	/** Write one framed message; a closed downstream drops it. */
+	send(frame: string): Promise<void>;
+	/** End the connection; `goingAway` when the server is shutting down. */
+	end(goingAway?: boolean): Promise<void>;
+}
+
+function sseDownstream(sse: HubSseStream): Downstream {
+	return {
+		isOpen: () => sse.isOpen(),
+		send: async (frame) => {
+			await sse.send("", frame);
+		},
+		end: () => sse.end(),
+	};
+}
+
+/** WebSocket close codes this transport sends (RFC 6455 §7.4.1). */
+const WS_NORMAL = 1000;
+const WS_GOING_AWAY = 1001;
+const WS_UNSUPPORTED_DATA = 1003;
+const WS_INTERNAL_ERROR = 1011;
+
+function socketDownstream(socket: HubSocket): Downstream {
+	return {
+		isOpen: () => socket.readyState === "open",
+		send: async (frame) => {
+			// `false` is a socket already closing, or a client so far behind that
+			// the server closes it (1013): either way its close event releases
+			// the connection, so there is nothing to retry here.
+			socket.send(frame);
+		},
+		end: async (goingAway) => {
+			socket.close(goingAway === true ? WS_GOING_AWAY : WS_NORMAL);
+		},
+	};
 }
 
 /** The `id` query parameter — SignalR's connection token. */
@@ -157,19 +241,32 @@ function identityOf(
  * only — the replies go down a stream someone else may hold, so a victim's
  * credentials on the POST (a cross-site form) must not pass the guards for it.
  * An identity that cannot be compared matches nothing: fail closed.
- * No connection registered yet (the first GET) has nobody to match.
+ *
+ * Before any connection is registered — the token's first use — the request
+ * is held to the identity that NEGOTIATED the token instead. Letting anyone
+ * through then meant the first to present a token owned it: a token read
+ * between the victim's negotiate and its connect opened the connection as
+ * the attacker, and the victim's own connect was then the one refused.
  */
 function mayActAs(
 	registered: HubContext["auth"] | undefined,
+	negotiator: string | undefined,
 	ctx: HubHttpContext,
 ): boolean {
-	if (registered === undefined) return true;
-	const requester = identityOf(ctx.auth);
-	const owner = identityOf(registered);
-	if (requester.kind === "user" && owner.kind === "user") {
-		return requester.id === owner.id;
-	}
-	return requester.kind === "anonymous" && owner.kind === "anonymous";
+	const requester = identityKey(identityOf(ctx.auth));
+	if (requester === undefined) return false;
+	if (registered === undefined) return requester === negotiator;
+	return requester === identityKey(identityOf(registered));
+}
+
+/**
+ * An identity as one comparable string: `user:<id>` or `anonymous`;
+ * `undefined` for one that cannot be compared, which matches nothing.
+ */
+function identityKey(identity: Identity): string | undefined {
+	if (identity.kind === "user") return `user:${identity.id}`;
+	if (identity.kind === "anonymous") return "anonymous";
+	return undefined;
 }
 
 /**
@@ -199,7 +296,8 @@ export function splitFrames(body: string): string[] {
 }
 
 /**
- * Register the three routes one hub needs.
+ * Register the routes one hub needs: negotiate, the SSE stream and its
+ * upstream POST, and — on a router that has them — the WebSocket route.
  *
  * Returns the route objects so a caller can apply middleware to them the way
  * `relay.registerRoutes()` customizes the relay's own.
@@ -207,12 +305,15 @@ export function splitFrames(body: string): string[] {
 export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 	router: HubRouter<Ctx, Route>,
 	mounted: MountedHub,
+	options: HubRouteOptions = {},
 ): {
 	negotiate: Route;
 	stream: Route;
 	send: Route;
+	/** The WebSocket route; absent on a router without `ws()`. */
+	socket?: Route;
 	/**
-	 * End every open stream and refuse the three routes with 503 until
+	 * End every open connection and refuse the routes with 503 until
 	 * {@link reopen} — what a shutdown does, as Transmit's `closeAllStreams`.
 	 */
 	close(): Promise<void>;
@@ -232,17 +333,23 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		});
 		return true;
 	};
-	/** Live streams by connectionId, so an upstream POST can answer downstream. */
-	const streams = new Map<string, HubSseStream>();
+	/** Live connections by connectionId, so an upstream frame can answer downstream. */
+	const connections = new Map<string, Downstream>();
 	/**
-	 * Hub contexts of streams whose handshake is still pending: `onConnect`
+	 * Hub contexts of connections whose handshake is still pending: `onConnect`
 	 * runs once the handshake is answered, never before — a frame sent ahead of
 	 * the handshake reply makes the SignalR client refuse the connection.
 	 */
 	const awaitingHandshake = new Map<string, HubContext>();
-	/** Open streams per owner, and the owner each client id counts against. */
+	/** Open connections per owner, and the owner each client id counts against. */
 	const perOwner = new Map<string, number>();
 	const ownerOfClient = new Map<string, string>();
+
+	/** The transports to announce: WebSockets first, as SignalR tries them in order. */
+	const transports = (): string[] =>
+		router.ws !== undefined && options.webSockets?.() === true
+			? ["WebSockets", "ServerSentEvents"]
+			: ["ServerSentEvents"];
 
 	const negotiate = router.post(`${path}/negotiate`, async (ctx) => {
 		if (refuseWhileClosed(ctx)) return;
@@ -257,37 +364,52 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 			return;
 		}
 		// The connectionId is the hub's client id; the token is what the client
-		// echoes back on the two data routes.
-		ctx.response.json(adapter.negotiate(crypto.randomUUID(), undefined, owner));
+		// echoes back on the data routes.
+		ctx.response.json(
+			adapter.negotiate(
+				crypto.randomUUID(),
+				transports(),
+				owner,
+				identityKey(identityOf(ctx.auth)),
+			),
+		);
 	});
 
-	const stream = router.get(path, async (ctx) => {
-		if (refuseWhileClosed(ctx)) return;
+	/**
+	 * Whether a downstream may open for this request, answering the refusal
+	 * itself when not. Both transports answer it BEFORE anything opens: a 400
+	 * written after an SSE upgrade reaches the client as a half-open
+	 * connection, and a refused WebSocket handshake gets plain HTTP, no socket.
+	 */
+	function admit(ctx: Ctx):
+		| {
+				clientId: string;
+				token: string;
+				owner: string | undefined;
+				previous: Downstream | undefined;
+		  }
+		| undefined {
 		const token = readConnectionToken(ctx.request.url(true));
 		const clientId = token ? adapter.resolveToken(token) : undefined;
-		if (clientId === undefined) {
-			// Answered BEFORE opening a stream: a 400 written after the upgrade
-			// would reach the client as a half-open connection instead.
+		if (token === undefined || clientId === undefined) {
 			ctx.response.status(400).json({
 				error: {
 					code: "E_RELAY_UNKNOWN_CONNECTION",
 					message: "Unknown or missing connection id — call /negotiate first.",
 				},
 			});
-			return;
+			return undefined;
 		}
-
-		if (!mayActAs(hub.authFor(clientId), ctx)) {
+		if (!mayActAs(hub.authFor(clientId), adapter.negotiatorOf(token), ctx)) {
 			ctx.response.status(403).json({
 				error: {
 					code: "E_RELAY_NOT_OWNER",
 					message: "This connection belongs to another user.",
 				},
 			});
-			return;
+			return undefined;
 		}
-
-		const previous = streams.get(clientId);
+		const previous = connections.get(clientId);
 		const owner = ownerOf(ctx);
 		const ownerCap = adapter.maxConnectionsPerOwner;
 		if (
@@ -302,51 +424,60 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 					message: "Too many open connections from this client.",
 				},
 			});
-			return;
+			return undefined;
 		}
-		if (previous === undefined && streams.size >= adapter.maxConnections) {
+		if (previous === undefined && connections.size >= adapter.maxConnections) {
 			ctx.response.status(503).json({
 				error: {
 					code: "E_RELAY_MAX_CONNECTIONS",
 					message: "Too many open connections — try again later.",
 				},
 			});
-			return;
+			return undefined;
 		}
+		return { clientId, token, owner, previous };
+	}
 
-		const sse = await ctx.response.sse();
+	/**
+	 * Register an admitted connection on the hub. Returns the function its
+	 * close must call.
+	 */
+	function attach(
+		ctx: Ctx,
+		admitted: NonNullable<ReturnType<typeof admit>>,
+		downstream: Downstream,
+	): () => void {
+		const { clientId, token, owner, previous } = admitted;
 		// The token is in use now, so it stops counting against the unclaimed
 		// budget and stops expiring.
-		if (token !== undefined) adapter.claimToken(token);
-		streams.set(clientId, sse);
-		// A reopened stream for the same client id takes over its slot.
+		adapter.claimToken(token);
+		connections.set(clientId, downstream);
+		// A reopened connection for the same client id takes over its slot.
 		if (previous === undefined && owner !== undefined) {
 			perOwner.set(owner, (perOwner.get(owner) ?? 0) + 1);
 			ownerOfClient.set(clientId, owner);
 		}
-		// The same token opened again: the older stream would stay open and
+		// The same token opened again: the older connection would stay open and
 		// unused. Its close is ignored below, since it is no longer the one
 		// registered.
 		if (previous?.isOpen()) void previous.end().catch(() => {});
-		// A stream that never completes the handshake is closed: its token no
-		// longer expires, so nothing else would ever end it.
+		// A connection that never completes the handshake is closed: its token
+		// no longer expires, so nothing else would ever end it.
 		const handshakeTimer = setTimeout(() => {
 			if (
 				!adapter.hasCompletedHandshake(clientId) &&
-				streams.get(clientId) === sse
+				connections.get(clientId) === downstream
 			) {
-				void sse.end().catch(() => {});
+				void downstream.end().catch(() => {});
 			}
 		}, adapter.handshakeTimeoutMs);
 		handshakeTimer.unref?.();
-		// An SSE event with NO name arrives as `onmessage`, which is where the
-		// SignalR client reads its frames.
 		const send = (event: string, data: unknown): void => {
 			// A hub send is fire-and-forget by contract — the caller returns
 			// nothing — so a rejection here had nobody to reject to and took the
 			// process down over one client's socket.
-			void sse
-				.send("", adapter.encodeInvocation(event, [data]))
+			downstream
+				.send(adapter.encodeInvocation(event, [data]))
 				.catch((error: unknown) => {
 					process.stderr.write(
 						`[relay/signalr] send to ${clientId} failed: ${
@@ -361,11 +492,58 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 			auth: hubAuth(ctx),
 			send,
 		});
-		sse.onClose(() => {
-			clearTimeout(handshakeTimer);
-			release(clientId, sse);
-		});
 		awaitingHandshake.set(clientId, context);
+		return () => {
+			clearTimeout(handshakeTimer);
+			release(clientId, downstream);
+		};
+	}
+
+	/**
+	 * Hand one request's or one message's frames to the hub, in order, and
+	 * write what it answers down the connection's downstream.
+	 */
+	async function deliver(
+		clientId: string,
+		body: string,
+		auth: HubContext["auth"],
+	): Promise<void> {
+		const downstream = connections.get(clientId);
+		for (const frame of splitFrames(body)) {
+			// A Close from the CLIENT is the client saying it is done. The
+			// adapter answers it with nothing — correctly, the protocol asks for
+			// no reply — so watching only the outbound frames meant a graceful
+			// disconnect left the connection open until the socket happened to
+			// drop.
+			const clientClosed = SignalRAdapter.containsClose([frame]);
+			const outbound = await adapter.handleFrame(clientId, frame, auth);
+			for (const out of outbound) {
+				// No downstream yet means the client posted before opening the
+				// GET. The frames are dropped rather than queued: SignalR's own
+				// client opens the stream first, and buffering for a connection
+				// that may never arrive is how a hub leaks memory.
+				if (downstream?.isOpen()) await downstream.send(out);
+			}
+			// The handshake reply is out: the hub may speak now.
+			const pending = awaitingHandshake.get(clientId);
+			if (pending !== undefined && adapter.hasCompletedHandshake(clientId)) {
+				awaitingHandshake.delete(clientId);
+				await hub.onConnect(pending);
+			}
+			if (clientClosed || SignalRAdapter.containsClose(outbound)) {
+				await downstream?.end();
+				break;
+			}
+		}
+	}
+
+	const stream = router.get(path, async (ctx) => {
+		if (refuseWhileClosed(ctx)) return;
+		const admitted = admit(ctx);
+		if (admitted === undefined) return;
+		const sse = await ctx.response.sse();
+		const released = attach(ctx, admitted, sseDownstream(sse));
+		sse.onClose(released);
 	});
 
 	const send = router.post(path, async (ctx) => {
@@ -382,7 +560,10 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 			return;
 		}
 
-		if (!mayActAs(hub.authFor(clientId), ctx)) {
+		if (
+			token === undefined ||
+			!mayActAs(hub.authFor(clientId), adapter.negotiatorOf(token), ctx)
+		) {
 			ctx.response.status(403).json({
 				error: {
 					code: "E_RELAY_NOT_OWNER",
@@ -392,51 +573,69 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 			return;
 		}
 
-		const sse = streams.get(clientId);
-		for (const frame of splitFrames(ctx.request.raw())) {
-			// A Close from the CLIENT is the client saying it is done. The
-			// adapter answers it with nothing — correctly, the protocol asks for
-			// no reply — so watching only the outbound frames meant a graceful
-			// disconnect left the stream open until the socket happened to drop.
-			const clientClosed = SignalRAdapter.containsClose([frame]);
-			// Authorized against THIS request, not the one that opened the
-			// stream: a role revoked since then stops working now.
-			const outbound = await adapter.handleFrame(clientId, frame, hubAuth(ctx));
-			for (const out of outbound) {
-				// No stream yet means the client posted before opening the GET.
-				// The frames are dropped rather than queued: SignalR's own client
-				// opens the stream first, and buffering for a connection that may
-				// never arrive is how a hub leaks memory.
-				if (sse?.isOpen()) await sse.send("", out);
-			}
-			// The handshake reply is out: the hub may speak now.
-			const pending = awaitingHandshake.get(clientId);
-			if (pending !== undefined && adapter.hasCompletedHandshake(clientId)) {
-				awaitingHandshake.delete(clientId);
-				await hub.onConnect(pending);
-			}
-			if (clientClosed || SignalRAdapter.containsClose(outbound)) {
-				await sse?.end();
-				break;
-			}
-		}
+		// Authorized against THIS request, not the one that opened the stream:
+		// a role revoked since then stops working now.
+		await deliver(clientId, ctx.request.raw(), hubAuth(ctx));
 		// SignalR expects an empty 200 for an accepted upstream batch.
 		ctx.response.status(200).json({});
 	});
 
 	/**
-	 * Forget a stream that has closed.
+	 * The WebSocket transport: the same admission and the same hub as the
+	 * stream, with both directions on the one socket.
 	 *
-	 * Identity-guarded: a client id can carry a second stream — a reconnect
-	 * that opens before the old socket has finished closing — and the old
-	 * one's close must not tear down the live connection that replaced it.
+	 * A socket has one request, its handshake, so every frame on it is
+	 * authorized against the handshake's auth — where an SSE upstream POST is
+	 * authorized against its own. A role revoked mid-connection therefore
+	 * takes effect on the next connection, as in ASP.NET Core SignalR, whose
+	 * WebSocket transport authenticates once too.
+	 */
+	const socket = router.ws?.(path, async (ctx) => {
+		if (refuseWhileClosed(ctx)) return;
+		const admitted = admit(ctx);
+		if (admitted === undefined) return;
+		const { clientId } = admitted;
+		const ws = ctx.socket;
+		const downstream = socketDownstream(ws);
+		const released = attach(ctx, admitted, downstream);
+		const auth = hubAuth(ctx);
+		// Messages are handled one after another, as SSE posts are: an
+		// invocation's answer must not overtake the handshake reply.
+		let queue: Promise<void> = Promise.resolve();
+		ws.on("message", (data, isBinary) => {
+			if (isBinary || typeof data !== "string") {
+				// The JSON protocol is text; a binary message is a client
+				// speaking something else (MessagePack), refused as such.
+				ws.close(WS_UNSUPPORTED_DATA, "text frames only");
+				return;
+			}
+			queue = queue.then(() =>
+				deliver(clientId, data, auth).catch((error: unknown) => {
+					process.stderr.write(
+						`[relay/signalr] frame from ${clientId} failed: ${
+							error instanceof Error ? error.message : String(error)
+						}\n`,
+					);
+					ws.close(WS_INTERNAL_ERROR);
+				}),
+			);
+		});
+		ws.on("close", released);
+	});
+
+	/**
+	 * Forget a connection that has closed.
+	 *
+	 * Identity-guarded: a client id can carry a second connection — a
+	 * reconnect that opens before the old one has finished closing — and the
+	 * old one's close must not tear down the live connection that replaced it.
 	 * Unguarded, the stale close unregistered the new client from the hub and
 	 * dropped its tokens, leaving a socket that was open and could no longer
 	 * receive anything.
 	 */
-	function release(clientId: string, sse: HubSseStream): void {
-		if (streams.get(clientId) !== sse) return;
-		streams.delete(clientId);
+	function release(clientId: string, downstream: Downstream): void {
+		if (connections.get(clientId) !== downstream) return;
+		connections.delete(clientId);
 		awaitingHandshake.delete(clientId);
 		const owner = ownerOfClient.get(clientId);
 		if (owner !== undefined) {
@@ -454,11 +653,11 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 	const close = async (): Promise<void> => {
 		closed = true;
 		await Promise.all(
-			[...streams].map(async ([clientId, sse]) => {
-				await sse.end().catch(() => {});
-				// A stream whose end did not report its close is released
+			[...connections].map(async ([clientId, downstream]) => {
+				await downstream.end(true).catch(() => {});
+				// A connection whose end did not report its close is released
 				// here, or its client stays registered on the hub.
-				release(clientId, sse);
+				release(clientId, downstream);
 			}),
 		);
 	};
@@ -466,5 +665,12 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		closed = false;
 	};
 
-	return { negotiate, stream, send, close, reopen };
+	return {
+		negotiate,
+		stream,
+		send,
+		...(socket === undefined ? {} : { socket }),
+		close,
+		reopen,
+	};
 }
