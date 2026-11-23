@@ -6,7 +6,8 @@
 ### Which transports run
 
 - the **event stream** — `authorize` / `broadcast` / `on`, over Server-Sent
-  Events, on the three routes the provider registers;
+  Events, on the three routes `relay.registerRoutes()` declares (call it from a
+  preload such as `start/routes.ts`; the provider declares no route itself);
 - **hubs** — `relay.hub('/hubs/chat', new ChatHub())` registers SignalR's
   negotiate, WebSocket, downstream and upstream routes. A stock
   `@microsoft/signalr` client speaks to it unchanged, over
