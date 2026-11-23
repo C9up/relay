@@ -21,6 +21,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { E_RELAY_MAX_PENDING } from "./errors.js";
 import type { DispatchResult, Hub, HubContext } from "./Hub.js";
 
 /** SignalR record separator — every JSON message ends with this byte. */
@@ -268,9 +269,7 @@ export class SignalRAdapter {
 		negotiator?: string,
 	): NegotiateResponse {
 		if (!this.admits(owner)) {
-			throw new Error(
-				"Too many pending SignalR connections — the negotiate was refused.",
-			);
+			throw new E_RELAY_MAX_PENDING();
 		}
 		const connectionToken = randomUUID();
 		this.#tokenToId.set(connectionToken, {

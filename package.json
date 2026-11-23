@@ -39,6 +39,9 @@
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@c9up/flare": "^0.1.0"
+  },
   "devDependencies": {
     "@biomejs/biome": "^2.6.8",
     "@c9up/quasar": "^0.2.3",

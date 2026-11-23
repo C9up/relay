@@ -799,6 +799,9 @@ describe("relay > recovering from a failed or stopped transport", () => {
 		await expect(relay.whenTransportReady()).rejects.toThrow(
 			/before startTransport/,
 		);
+		await expect(relay.whenTransportReady()).rejects.toMatchObject({
+			code: "E_RELAY_TRANSPORT_NOT_STARTED",
+		});
 	});
 
 	it("is ready immediately with no transport at all", async () => {

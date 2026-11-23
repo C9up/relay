@@ -23,6 +23,11 @@
  * @implements MISS-20 (Epic 23)
  */
 
+import {
+	E_RELAY_DUPLICATE_HANDLER,
+	E_RELAY_HUB_ALREADY_MOUNTED,
+} from "./errors.js";
+
 /** What {@link Hub.dispatch} reports: the handler's result, or a failure. */
 export type DispatchResult = { ok: true; result: unknown } | { ok: false };
 
@@ -144,9 +149,7 @@ export abstract class Hub {
 					if (claimant === name) continue;
 					// Two spellings of one event would leave the invocation to
 					// whichever happened to be walked first.
-					throw new Error(
-						`Hub handlers '${claimant}' and '${name}' answer the same invocation — method names are matched case-insensitively. Rename one.`,
-					);
+					throw new E_RELAY_DUPLICATE_HANDLER([claimant, name]);
 				}
 				// Read the descriptor rather than the property: a getter would
 				// otherwise be invoked here, during construction, just to find out
@@ -426,9 +429,7 @@ export abstract class Hub {
 	 */
 	attachFanOut(publish: (message: HubFanOut) => void): void {
 		if (this.#fanOut !== undefined && this.#fanOut !== publish) {
-			throw new Error(
-				"This hub instance is already mounted: give each mount its own instance, so a send crosses instances under one path.",
-			);
+			throw new E_RELAY_HUB_ALREADY_MOUNTED();
 		}
 		this.#fanOut = publish;
 	}

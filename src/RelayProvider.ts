@@ -1,4 +1,5 @@
 import "./augmentations.js";
+import { E_RELAY_INVALID_ADAPTER, E_RELAY_INVALID_HUB } from "./errors.js";
 import { Hub } from "./Hub.js";
 import { Relay, type RelayConfig, type RelayRouteBuilder } from "./Relay.js";
 import { SignalRAdapter } from "./SignalRAdapter.js";
@@ -246,18 +247,14 @@ function registerMountedHub(
 		// `relay.hub(...)` line that passed it.
 		const hub = mounted.hub;
 		if (typeof hub !== "object" || hub === null || !isHub(hub)) {
-			throw new TypeError(
-				`The object mounted at "${mounted.path}" is not a Hub — it must extend Hub from @c9up/relay.`,
-			);
+			throw new E_RELAY_INVALID_HUB([mounted.path]);
 		}
 		const adapter = mounted.adapter;
 		if (
 			adapter !== undefined &&
 			(typeof adapter !== "object" || adapter === null || !isAdapter(adapter))
 		) {
-			throw new TypeError(
-				`The adapter given for the hub at "${mounted.path}" is not a SignalRAdapter.`,
-			);
+			throw new E_RELAY_INVALID_ADAPTER([mounted.path]);
 		}
 		const routes = registerHubRoutes(
 			router,

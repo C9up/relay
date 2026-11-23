@@ -29,6 +29,14 @@
  */
 
 import { randomUUID } from "node:crypto";
+import {
+	E_RELAY_HUB_PATH_TAKEN,
+	E_RELAY_INVALID_CHANNEL_PATTERN,
+	E_RELAY_INVALID_PING_INTERVAL,
+	E_RELAY_TRANSPORT_NOT_STARTED,
+	E_RELAY_TRANSPORT_SUPERSEDED,
+	E_RELAY_TRANSPORT_UNRELEASED,
+} from "./errors.js";
 import type { HubFanOut } from "./Hub.js";
 
 /**
@@ -664,16 +672,14 @@ export class Relay {
 					if (this.#unreleased === unreleased) this.#unreleased = undefined;
 				} catch (error) {
 					this.#stopTransport({ keepOutcome: true });
-					throw new Error(
-						`Relay.startTransport(): the previous subscription could not be released, so starting again would leave two handlers on the bus. Cause: ${error instanceof Error ? error.message : String(error)}`,
+					throw new E_RELAY_TRANSPORT_UNRELEASED(
+						[error instanceof Error ? error.message : String(error)],
 						{ cause: error },
 					);
 				}
 			}
 			if (this.#transportGeneration !== generation) {
-				throw new Error(
-					"Relay.startTransport() was superseded before it could subscribe.",
-				);
+				throw new E_RELAY_TRANSPORT_SUPERSEDED(["before it could subscribe."]);
 			}
 			try {
 				await this.#transport?.subscribe(channel, handler);
@@ -716,9 +722,9 @@ export class Relay {
 				// attempt's job, and it can, because it removes ITS OWN handler
 				// by name: a newer generation's subscription is untouched.
 				await this.#transport?.unsubscribe?.(channel, handler);
-				throw new Error(
-					"Relay.startTransport() was superseded by a shutdown before the subscription completed. The subscription it opened has been taken back down.",
-				);
+				throw new E_RELAY_TRANSPORT_SUPERSEDED([
+					"by a shutdown before the subscription completed. The subscription it opened has been taken back down.",
+				]);
 			}
 			this.#transportHandler = handler;
 		})();
@@ -894,9 +900,7 @@ export class Relay {
 	 */
 	hub(path: string, hub: HubLike, adapter?: SignalRAdapterLike): void {
 		if (this.#hubs.has(path)) {
-			throw new Error(
-				`A hub is already mounted at "${path}" — unmount it or pick another path.`,
-			);
+			throw new E_RELAY_HUB_PATH_TAKEN([path]);
 		}
 		this.#hubs.set(path, { path, hub, adapter });
 		if (isFanOutHub(hub)) {
@@ -1412,9 +1416,7 @@ export class Relay {
 			!this.#transportStarted &&
 			!this.#transportAttempted
 		) {
-			throw new Error(
-				"Relay.whenTransportReady() was called before startTransport(). The bus opens in the provider's ready() phase — nothing has subscribed yet.",
-			);
+			throw new E_RELAY_TRANSPORT_NOT_STARTED();
 		}
 		await this.#transportReady;
 	}
@@ -1835,9 +1837,7 @@ function toMilliseconds(
 	const match = /^\s*(\d+(?:\.\d+)?)\s*([a-z]*)\s*$/i.exec(value);
 	const factor = DURATION_UNITS_MS[(match?.[2] ?? "").toLowerCase() || "ms"];
 	if (match === null || factor === undefined) {
-		throw new Error(
-			`[relay] pingInterval must be milliseconds or a duration like '30s', got '${value}'`,
-		);
+		throw new E_RELAY_INVALID_PING_INTERVAL([value]);
 	}
 	return Number(match[1]) * factor;
 }
@@ -2022,7 +2022,7 @@ function splitChannel(value: string): string[] {
  */
 function parseChannelPattern(pattern: string): PatternSegment[] {
 	const fail = (why: string): never => {
-		throw new Error(`[relay] invalid channel pattern '${pattern}': ${why}`);
+		throw new E_RELAY_INVALID_CHANNEL_PATTERN([pattern, why]);
 	};
 	if (splitChannel(pattern).join("") === "") fail("it is empty");
 	const problem = channelNameProblem(pattern);

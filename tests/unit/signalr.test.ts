@@ -410,6 +410,14 @@ describe("relay > SignalRAdapter unsupported message types", () => {
 });
 
 describe("relay > SignalRAdapter negotiate is an unauthenticated write", () => {
+	it("refuses a negotiate past the pending-token cap", () => {
+		const adapter = new SignalRAdapter(new TestHub(), { maxPendingTokens: 1 });
+		adapter.negotiate("c1");
+		expect(() => adapter.negotiate("c2")).toThrow(
+			expect.objectContaining({ code: "E_RELAY_MAX_PENDING" }),
+		);
+	});
+
 	/**
 	 * A SignalR connection is negotiated first and connected second, so a token
 	 * always exists for a moment before anything uses it. Nothing ever closed

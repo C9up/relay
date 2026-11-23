@@ -12,6 +12,7 @@
  * without relay depending on quasar, which is an optional peer.
  */
 
+import { E_RELAY_SUBSCRIBE_FAILED } from "./errors.js";
 import type { RelayTransport } from "./Relay.js";
 import { hasEnded } from "./vendor/quasarConnection.js";
 
@@ -255,7 +256,11 @@ export class RedisRelayTransport implements RelayTransport {
 			await this.#listen(client, channel, wrapper);
 		} catch (error) {
 			await this.#rollback(client, channel, handler, wrapper);
-			throw error instanceof Error ? error : new Error(String(error));
+			// The client's own error goes through as it is; a non-Error it threw is
+			// given a code, so a caller can still branch on it.
+			throw error instanceof Error
+				? error
+				: new E_RELAY_SUBSCRIBE_FAILED([String(error)], { cause: error });
 		}
 	}
 

@@ -14,6 +14,8 @@
  * `@c9up/relay/testing`.
  */
 
+import { E_RELAY_ASSERTION_FAILED } from "../errors.js";
+
 export interface CapturedBroadcast {
 	channel: string;
 	data: unknown;
@@ -87,17 +89,21 @@ export class FakeRelay {
 	assertSent(channel: string, predicate?: FakeRelayPredicateArg): void {
 		const match = makeMatcher(channel, predicate);
 		if (this.#captured.some(match)) return;
-		throw new Error(
-			`relay.assertSent('${channel}'${describePredicate(predicate)}) failed — no captured broadcast matches.\n${describeCaptured(this.#captured)}`,
-		);
+		throw new E_RELAY_ASSERTION_FAILED([
+			"assertSent",
+			`'${channel}'${describePredicate(predicate)}`,
+			`no captured broadcast matches.\n${describeCaptured(this.#captured)}`,
+		]);
 	}
 
 	assertNotSent(channel: string, predicate?: FakeRelayPredicateArg): void {
 		const match = makeMatcher(channel, predicate);
 		if (!this.#captured.some(match)) return;
-		throw new Error(
-			`relay.assertNotSent('${channel}'${describePredicate(predicate)}) failed — at least one captured broadcast matches.\n${describeCaptured(this.#captured)}`,
-		);
+		throw new E_RELAY_ASSERTION_FAILED([
+			"assertNotSent",
+			`'${channel}'${describePredicate(predicate)}`,
+			`at least one captured broadcast matches.\n${describeCaptured(this.#captured)}`,
+		]);
 	}
 }
 

@@ -421,5 +421,8 @@ describe("relay-security > a channel name is an SSE event name", () => {
 		expect(() => r.authorize(pattern, () => true)).toThrow(
 			/invalid channel pattern/,
 		);
+		expect(() => r.authorize(pattern, () => true)).toThrow(
+			expect.objectContaining({ code: "E_RELAY_INVALID_CHANNEL_PATTERN" }),
+		);
 	});
 });

@@ -340,5 +340,8 @@ describe("relay > pingInterval takes a duration", () => {
 		expect(sse.frames.map((frame) => frame.event)).toContain("$$relay/ping");
 		await relay.shutdown();
 		expect(() => new Relay({ pingInterval: "soon" })).toThrow(/pingInterval/);
+		expect(() => new Relay({ pingInterval: "soon" })).toThrow(
+			expect.objectContaining({ code: "E_RELAY_INVALID_PING_INTERVAL" }),
+		);
 	});
 });

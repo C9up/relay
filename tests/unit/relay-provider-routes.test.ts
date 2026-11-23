@@ -7,6 +7,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { Hub } from "../../src/Hub.js";
+import { errors } from "../../src/index.js";
 import {
 	Relay,
 	type RelayConfig,
@@ -249,6 +250,38 @@ describe("relay > provider > the routes", () => {
 		});
 
 		expect(response.sseOpened).toBe(true);
+	});
+});
+
+describe("relay > provider > mounting a hub", () => {
+	async function booted() {
+		const { app } = fakeApp({ withRouter: true });
+		const provider = new RelayProvider(app);
+		provider.register();
+		await provider.boot();
+		const relay = getRelay();
+		if (relay === undefined) throw new Error("no relay");
+		return relay;
+	}
+
+	it("refuses an object that is not a Hub", async () => {
+		const relay = await booted();
+		let caught: unknown;
+		try {
+			relay.hub("/hubs/fake", { name: "fake" });
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(errors.E_RELAY_INVALID_HUB);
+		expect(caught).toMatchObject({ code: "E_RELAY_INVALID_HUB" });
+	});
+
+	it("refuses an adapter that is not a SignalRAdapter", async () => {
+		class ChatHub extends Hub {}
+		const relay = await booted();
+		expect(() => relay.hub("/hubs/chat", new ChatHub(), {})).toThrow(
+			expect.objectContaining({ code: "E_RELAY_INVALID_ADAPTER" }),
+		);
 	});
 });
 

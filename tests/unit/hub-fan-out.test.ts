@@ -238,6 +238,17 @@ describe("hub sends across instances", () => {
 		expect(() =>
 			new Relay({ transport: sharedBus() }).hub("/hubs/rooms", hub),
 		).toThrow(/already mounted/);
+		expect(() =>
+			new Relay({ transport: sharedBus() }).hub("/hubs/rooms", hub),
+		).toThrow(expect.objectContaining({ code: "E_RELAY_HUB_ALREADY_MOUNTED" }));
+	});
+
+	it("refuses a second hub at a path already mounted", () => {
+		const relay = new Relay({ transport: sharedBus() });
+		relay.hub("/hubs/rooms", new RoomHub());
+		expect(() => relay.hub("/hubs/rooms", new RoomHub())).toThrow(
+			expect.objectContaining({ code: "E_RELAY_HUB_PATH_TAKEN" }),
+		);
 	});
 
 	it("stays local without a bus", async () => {

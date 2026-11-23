@@ -205,6 +205,9 @@ describe("relay > redis transport", () => {
 		await expect(
 			transport.publish("relay::broadcast", { type: "broadcast" }),
 		).rejects.toThrow(/quasar|redis/i);
+		await expect(
+			transport.publish("relay::broadcast", { type: "broadcast" }),
+		).rejects.toMatchObject({ code: "E_RELAY_QUASAR_MISSING" });
 	});
 });
 
@@ -292,6 +295,27 @@ describe("relay > unsubscribing what was never subscribed", () => {
 		await transport.unsubscribe("relay::broadcast");
 
 		expect(client.unsubscribed).toHaveLength(1);
+	});
+
+	it("gives a code to a subscribe failure that is not an Error", async () => {
+		const { client } = fakeRedis();
+		const failing = {
+			...client,
+			subscribe(
+				_c: string,
+				_h: unknown,
+				options?: { onError?: (e: unknown) => void },
+			) {
+				options?.onError?.("no route to the bus");
+			},
+		};
+		const transport = new RedisRelayTransport(() => failing);
+		await expect(
+			transport.subscribe("relay::broadcast", () => {}),
+		).rejects.toMatchObject({
+			code: "E_RELAY_SUBSCRIBE_FAILED",
+			message: "no route to the bus",
+		});
 	});
 
 	it("removes nothing MORE after a subscribe that failed", async () => {

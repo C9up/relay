@@ -211,9 +211,10 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 		const stopping = relay.shutdown();
 		const second = relay.startTransport();
 		held.resolve();
-		await first.catch(() => {});
+		const superseded = await first.catch((error: unknown) => error);
 		await second.catch(() => {});
 		await stopping;
+		expect(superseded).toMatchObject({ code: "E_RELAY_TRANSPORT_SUPERSEDED" });
 		await relay.startTransport();
 
 		// Subscribed after the restart: a shutdown ends the streams it finds.
@@ -394,9 +395,11 @@ describe("relay > one live subscription, whatever the restart looked like", () =
 		await expect(relay.startTransport()).rejects.toThrow("no route to the bus");
 
 		failSubscribe = false;
-		await expect(relay.startTransport()).rejects.toThrow(
-			/could not be released/,
-		);
+		const unreleased = await relay
+			.startTransport()
+			.catch((error: unknown) => error);
+		expect(String(unreleased)).toMatch(/could not be released/);
+		expect(unreleased).toMatchObject({ code: "E_RELAY_TRANSPORT_UNRELEASED" });
 
 		// Once the bus recovers, the obligation clears and a start delivers ONCE.
 		refuseUnsubscribe = false;

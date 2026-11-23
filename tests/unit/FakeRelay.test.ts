@@ -47,6 +47,9 @@ describe("FakeRelay — assertSent", () => {
 		expect(() => r.assertSent("comments")).toThrow(
 			/no captured broadcast matches/,
 		);
+		expect(() => r.assertSent("comments")).toThrow(
+			expect.objectContaining({ code: "E_RELAY_ASSERTION_FAILED" }),
+		);
 	});
 
 	it("dataMatches narrows the assertion", () => {
@@ -127,6 +130,9 @@ describe("FakeRelay — assertNotSent", () => {
 		r.broadcast("a", null);
 		expect(() => r.assertNotSent("a")).toThrow(
 			/at least one captured broadcast matches/,
+		);
+		expect(() => r.assertNotSent("a")).toThrow(
+			expect.objectContaining({ code: "E_RELAY_ASSERTION_FAILED" }),
 		);
 	});
 });

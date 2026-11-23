@@ -133,6 +133,9 @@ describe("relay > Hub > method names are matched case-insensitively", () => {
 			async onfoo() {}
 		}
 		expect(() => new Ambiguous()).toThrow(/onFoo.*onfoo|onfoo.*onFoo/);
+		expect(() => new Ambiguous()).toThrow(
+			expect.objectContaining({ code: "E_RELAY_DUPLICATE_HANDLER" }),
+		);
 	});
 
 	it("refuses a subclass handler that shadows a base one under another case", () => {

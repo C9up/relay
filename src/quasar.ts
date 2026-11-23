@@ -8,6 +8,7 @@
  * them — stays here, because that is the part a reader needs.
  */
 
+import { E_RELAY_QUASAR_MISSING, E_RELAY_REDIS_INCOMPLETE } from "./errors.js";
 import type { RelayPubSubClient } from "./RedisRelayTransport.js";
 import {
 	hasCommands,
@@ -34,6 +35,9 @@ export async function quasarConnection(
 		required: REQUIRED,
 		isConnection: isRelayPubSubClient,
 		what: "the relay transport",
-		raise: (_reason, message, cause) => new Error(message, { cause }),
+		raise: (reason, message, cause) =>
+			reason === "quasar-missing"
+				? new E_RELAY_QUASAR_MISSING([message], { cause })
+				: new E_RELAY_REDIS_INCOMPLETE([message], { cause }),
 	});
 }

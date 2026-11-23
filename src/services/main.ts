@@ -9,6 +9,7 @@
  * always meet on the same map.
  */
 
+import { E_RELAY_INTERNAL } from "../errors.js";
 import { Relay } from "../Relay.js";
 
 let instance: Relay | undefined;
@@ -64,7 +65,7 @@ export function clearRelay(): void {
  */
 const target: unknown = Object.create(Relay.prototype);
 if (!(target instanceof Relay)) {
-	throw new Error("[relay] the service accessor's target is not a Relay");
+	throw new E_RELAY_INTERNAL(["the service accessor's target is not a Relay"]);
 }
 
 const relay: Relay = new Proxy(target, {
