@@ -4,8 +4,14 @@
  * (auth + role + permission + strategy gates) / groups (join/leave/send)
  * / broadcast / stats and the auto-allowlist of `on*` methods.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import { Hub, type HubContext } from "../../src/Hub.js";
+import type {
+	ConnectedHubClient,
+	DispatchResult,
+	Relay,
+	SignalRAdapter,
+} from "../../src/index.js";
 
 interface SentMessage {
 	event: string;
@@ -69,6 +75,31 @@ class TestHub extends Hub {
 		throw new Error("intentional");
 	}
 }
+
+describe("relay > Hub > public signature types", () => {
+	it("types hub(), registerClient() and dispatch() with types the entry exports", async () => {
+		expectTypeOf<Parameters<Relay["hub"]>[1]>().toEqualTypeOf<Hub>();
+		expectTypeOf<Parameters<Relay["hub"]>[2]>().toEqualTypeOf<
+			SignalRAdapter | undefined
+		>();
+		expectTypeOf<
+			Parameters<Hub["registerClient"]>[0]
+		>().toEqualTypeOf<ConnectedHubClient>();
+
+		const hub = new TestHub();
+		const sent: unknown[] = [];
+		const client: ConnectedHubClient = {
+			id: "typed",
+			groups: new Set(),
+			auth: { isAuthenticated: true },
+			send: (event, data) => sent.push({ event, data }),
+		};
+		hub.registerClient(client);
+		const result: DispatchResult = await hub.dispatch("typed", "ping", 1);
+		expect(result).toEqual({ ok: true, result: undefined });
+		expect(sent).toEqual([{ event: "pong", data: 1 }]);
+	});
+});
 
 describe("relay > Hub > construction + allowlist", () => {
 	it("auto-registers on*-prefixed methods (excluding onConnect/onDisconnect)", () => {
@@ -485,7 +516,14 @@ describe("Hub > the singular guard reaches the check", () => {
 
 		// `useGuards` folds the singular into `guards`, and the check reads that
 		// one list. It used to read a `guard` key nothing ever wrote as well.
-		expect(await hub.dispatch("c1", "ping")).toEqual({ ok: false });
+		expect(await hub.dispatch("c1", "ping")).toEqual({
+			ok: false,
+			denial: {
+				status: 401,
+				code: "E_RELAY_UNAUTHORIZED",
+				message: "Not authenticated through a guard this hub accepts",
+			},
+		});
 		expect(sent[0]?.data).toMatchObject({ code: "E_RELAY_UNAUTHORIZED" });
 		expect(hub.ran).toBe(0);
 	});
@@ -521,7 +559,14 @@ describe("Hub > the singular guard reaches the check", () => {
 
 		// Roles are any-of, permissions are all-of — the rule every other entry
 		// point in the framework applies.
-		expect(await hub.dispatch("c1", "ping")).toEqual({ ok: false });
+		expect(await hub.dispatch("c1", "ping")).toEqual({
+			ok: false,
+			denial: {
+				status: 403,
+				code: "E_RELAY_FORBIDDEN",
+				message: "Insufficient permissions",
+			},
+		});
 		expect(sent[0]?.data).toMatchObject({
 			message: "Insufficient permissions",
 		});

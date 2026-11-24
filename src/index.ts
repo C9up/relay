@@ -22,7 +22,15 @@ export function defineConfig<T extends RelayConfig>(config: T): T {
 }
 
 export * as errors from "./errors.js";
-export { Hub, type HubContext, type HubGuardOptions } from "./Hub.js";
+export {
+	type ConnectedHubClient,
+	type DispatchResult,
+	Hub,
+	type HubAuth,
+	type HubContext,
+	type HubDenial,
+	type HubGuardOptions,
+} from "./Hub.js";
 export {
 	RedisRelayTransport,
 	type RelayPubSubClient,

@@ -108,7 +108,9 @@ describe("relay > registrations made before the provider bound its instance", ()
 
 	it("keeps a hub mounted through the accessor", async () => {
 		const g = await freshGraph();
-		g.relay.hub("/hubs/chat", { name: "chat" } as never);
+		const { Hub } = await import("../../src/Hub.js");
+		class ChatHub extends Hub {}
+		g.relay.hub("/hubs/chat", new ChatHub());
 
 		const instance = await served(g);
 		expect(instance.mountedHubs().map((m) => m.path)).toContain("/hubs/chat");

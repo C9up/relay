@@ -264,11 +264,13 @@ describe("relay > provider > mounting a hub", () => {
 		return relay;
 	}
 
+	// The signature takes a Hub; a JavaScript caller is not held to it, so the
+	// mount still checks what it was given.
 	it("refuses an object that is not a Hub", async () => {
 		const relay = await booted();
 		let caught: unknown;
 		try {
-			relay.hub("/hubs/fake", { name: "fake" });
+			Reflect.apply(relay.hub, relay, ["/hubs/fake", { name: "fake" }]);
 		} catch (error) {
 			caught = error;
 		}
@@ -279,9 +281,9 @@ describe("relay > provider > mounting a hub", () => {
 	it("refuses an adapter that is not a SignalRAdapter", async () => {
 		class ChatHub extends Hub {}
 		const relay = await booted();
-		expect(() => relay.hub("/hubs/chat", new ChatHub(), {})).toThrow(
-			expect.objectContaining({ code: "E_RELAY_INVALID_ADAPTER" }),
-		);
+		expect(() =>
+			Reflect.apply(relay.hub, relay, ["/hubs/chat", new ChatHub(), {}]),
+		).toThrow(expect.objectContaining({ code: "E_RELAY_INVALID_ADAPTER" }));
 	});
 });
 

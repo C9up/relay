@@ -230,8 +230,9 @@ function supportsWebSockets(server: unknown): boolean {
  *
  * Each gets the routes SignalR's transports need — negotiate, the SSE stream
  * and its upstream POST, and the WebSocket route on a router that has one —
- * and the same route customizer the relay's own routes get: a hub is as much
- * in need of `auth` middleware as the event stream is.
+ * and the same route customizer the relay's own routes get: the middleware
+ * that fills `ctx.auth` for the event stream fills it for a hub too. Who may
+ * connect to a hub is the hub's own `useGuards()`, asked by its routes.
  */
 function registerMountedHub(
 	router: ReamRouter,
@@ -240,9 +241,8 @@ function registerMountedHub(
 	webSockets: () => boolean,
 ): void {
 	{
-		// `relay.hub()` takes its hub structurally — the relay records it and
-		// never calls into it — so the concrete types only become knowable here,
-		// where they are used. Checked rather than asserted: a wrong object
+		// `relay.hub()` is typed `Hub` / `SignalRAdapter`, but a JavaScript
+		// caller is not held to it. Checked rather than trusted: a wrong object
 		// would otherwise fail on the first frame, three layers away from the
 		// `relay.hub(...)` line that passed it.
 		const hub = mounted.hub;
@@ -265,8 +265,10 @@ function registerMountedHub(
 			},
 			{ webSockets },
 		);
-		// The socket route takes the same middleware as the others: an `auth`
-		// customization guards the handshake before any socket opens.
+		// The socket route takes the same middleware as the others: what the
+		// customizer adds runs on the handshake, before any socket opens. The
+		// hub's own guards do not depend on it — the routes ask them
+		// themselves.
 		for (const route of [
 			routes.negotiate,
 			routes.stream,
@@ -287,6 +289,7 @@ function isHub(value: object): value is Hub {
 		(typeof Reflect.get(value, "dispatch") === "function" &&
 			typeof Reflect.get(value, "dispatchAs") === "function" &&
 			typeof Reflect.get(value, "registerClient") === "function" &&
+			typeof Reflect.get(value, "authorize") === "function" &&
 			typeof Reflect.get(value, "authFor") === "function")
 	);
 }

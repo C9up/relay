@@ -28,8 +28,52 @@ import {
 	E_RELAY_HUB_ALREADY_MOUNTED,
 } from "./errors.js";
 
-/** What {@link Hub.dispatch} reports: the handler's result, or a failure. */
-export type DispatchResult = { ok: true; result: unknown } | { ok: false };
+/**
+ * What {@link Hub.dispatch} reports: the handler's result, or a failure.
+ *
+ * A failure carrying `denial` is the hub's guards refusing the caller. The
+ * client is no longer registered on the hub by then, and the transport must
+ * close its connection: the guards are what it takes to be connected.
+ */
+export type DispatchResult =
+	| { ok: true; result: unknown }
+	| { ok: false; denial?: HubDenial };
+
+/**
+ * The auth state a hub reads: the request's, as the transport hands it over.
+ */
+export interface HubAuth {
+	isAuthenticated: boolean;
+	/** The guard that authenticated the request. */
+	strategy?: string;
+	user?: Record<string, unknown>;
+	roles?: string[];
+	/**
+	 * The permissions the user's payload carries. Informational when
+	 * {@link hasAllPermissions} is there: a `permissions` guard asks that.
+	 */
+	permissions?: string[];
+	/**
+	 * The auth layer's own answer to "does this user hold every one of these
+	 * permissions" — the request's `ctx.auth.hasAllPermissions`, when the auth
+	 * layer resolves permissions itself. Asked again on every check, so a
+	 * permission taken away is refused on the next one.
+	 */
+	hasAllPermissions?(permissions: readonly string[]): Promise<boolean>;
+}
+
+/**
+ * A refusal by a hub's guards: the HTTP status a connection attempt is
+ * answered with, and the code and message sent either way.
+ *
+ * `401` is a request that is not authenticated, or not through a guard the
+ * hub accepts; `403` one that is, without the role or the permissions.
+ */
+export interface HubDenial {
+	status: 401 | 403;
+	code: "E_RELAY_UNAUTHORIZED" | "E_RELAY_FORBIDDEN";
+	message: string;
+}
 
 export interface HubContext {
 	/** Client ID. */
@@ -38,13 +82,7 @@ export interface HubContext {
 	 * Auth state: the invoking request's in a handler dispatched with
 	 * {@link Hub.dispatchAs}, the connection's otherwise (and in `onConnect`).
 	 */
-	readonly auth: {
-		isAuthenticated: boolean;
-		strategy?: string;
-		user?: Record<string, unknown>;
-		roles?: string[];
-		permissions?: string[];
-	};
+	readonly auth: HubAuth;
 	/** Join a group. */
 	joinGroup(group: string): void;
 	/** Leave a group. */
@@ -55,6 +93,11 @@ export interface HubContext {
 	group(name: string): { send(event: string, data: unknown): void };
 	/** Send to all connected clients. */
 	broadcast(event: string, data: unknown): void;
+	/**
+	 * End this connection: it receives nothing further, and its stream or
+	 * socket is closed. See {@link Hub.disconnect}.
+	 */
+	disconnect(): void;
 }
 
 export interface HubGuardOptions {
@@ -78,11 +121,22 @@ export interface HubFanOut {
 	data: unknown;
 }
 
-interface ConnectedHubClient {
+/**
+ * A connection as a transport hands it to {@link Hub.registerClient}: its id,
+ * the groups it joined, the auth it connected with, how to push an event to
+ * it, and how to end it.
+ */
+export interface ConnectedHubClient {
 	id: string;
 	groups: Set<string>;
 	auth: HubContext["auth"];
 	send: (event: string, data: unknown) => void;
+	/**
+	 * Close the connection's stream or socket. {@link Hub.disconnect} calls it
+	 * after taking the client off the hub; without it, a disconnect only does
+	 * the latter and the transport is left holding an open, silent connection.
+	 */
+	close?: () => void;
 }
 
 /**
@@ -104,7 +158,11 @@ export abstract class Hub {
 	 * that made the send, which looks right until the second replica.
 	 */
 	#fanOut: ((message: HubFanOut) => void) | undefined;
-	#guards: HubGuardOptions = {};
+	#guards: { guards: string[]; roles: string[]; permissions: string[] } = {
+		guards: [],
+		roles: [],
+		permissions: [],
+	};
 	/**
 	 * Allowlist of dispatchable handler methods (populated at construction),
 	 * keyed by the lowercased event name.
@@ -165,7 +223,14 @@ export abstract class Hub {
 	}
 
 	/**
-	 * Set guard options for the entire hub. Normalizes singular guard/guards.
+	 * What it takes to CONNECT to this hub. Normalizes singular guard/guards.
+	 *
+	 * A transport asks {@link authorize} before it issues a connection token
+	 * and before it opens a stream or a socket: a client the guards refuse is
+	 * never registered, never reaches `onConnect` and receives nothing. They
+	 * are asked again on every invocation, so a connection that stops meeting
+	 * them is ended at its next call — as `[Authorize]` on a hub class does in
+	 * ASP.NET Core SignalR, the protocol's reference server.
 	 *
 	 * `roles` is satisfied by ANY of the names, `permissions` by ALL of them —
 	 * the same split every other entry point in the framework uses.
@@ -223,6 +288,9 @@ export abstract class Hub {
 			broadcast: (event: string, data: unknown) => {
 				this.#broadcastAll(event, data);
 			},
+			disconnect: () => {
+				this.#end(client);
+			},
 		};
 
 		return ctx;
@@ -239,11 +307,70 @@ export abstract class Hub {
 	 * never authorized for — and `removeClient` could not clean them up
 	 * afterwards, because it walks the client's own group set and the client
 	 * holding that set had been dropped.
+	 *
+	 * This does NOT ask the guards: it is the low-level half a transport calls
+	 * once {@link authorize} has let the connection in.
 	 */
 	registerClient(client: ConnectedHubClient): HubContext {
 		this.#forgetGroups(this.#clients.get(client.id));
 		this.#clients.set(client.id, client);
 		return this.#buildContext(client);
+	}
+
+	/**
+	 * End a connection held by this instance: the client is taken off the hub
+	 * at once — no broadcast or group send reaches it from here on — and its
+	 * stream or socket is closed. Returns whether there was such a client.
+	 *
+	 * The guards are asked when a client connects and when it invokes; nothing
+	 * asks them while it only listens. This is how an application ends a
+	 * connection whose user logged out or lost a role in between.
+	 */
+	disconnect(clientId: string): boolean {
+		const client = this.#clients.get(clientId);
+		if (client === undefined) return false;
+		this.#end(client);
+		return true;
+	}
+
+	/**
+	 * {@link disconnect} every connection this instance holds for the user with
+	 * that id — what a logout or a revoked role calls. Returns how many were
+	 * ended. Connections live on the instance that opened them, so each
+	 * instance ends its own.
+	 */
+	disconnectUser(userId: string | number | bigint): number {
+		const wanted = userIdKey(userId);
+		if (wanted === undefined) return 0;
+		let ended = 0;
+		// A copy: ending a client removes it from the map being walked.
+		for (const client of [...this.#clients.values()]) {
+			if (
+				client.auth.isAuthenticated &&
+				userIdKey(client.auth.user?.id) === wanted
+			) {
+				this.#end(client);
+				ended++;
+			}
+		}
+		return ended;
+	}
+
+	/**
+	 * Take a client off the hub, then close its transport. In that order: a
+	 * socket reports its close later, and the client must not be delivered to
+	 * in between.
+	 */
+	#end(client: ConnectedHubClient): void {
+		// Only the registration this client object holds: a newer connection
+		// under the same id is not this one's to end.
+		if (this.#clients.get(client.id) === client) this.removeClient(client.id);
+		try {
+			client.close?.();
+		} catch {
+			// The client is off the hub either way; its transport's own failure
+			// to close is not the caller's to handle.
+		}
 	}
 
 	/**
@@ -323,10 +450,18 @@ export abstract class Hub {
 		if (!client) return { ok: false };
 		const auth = requestAuth ?? client.auth;
 
-		const authError = this.#checkDispatchAuth(auth);
-		if (authError) {
-			client.send("error", authError);
-			return { ok: false };
+		const denial = await this.authorize(auth);
+		if (denial) {
+			deliver(client, "error", {
+				code: denial.code,
+				message: denial.message,
+			});
+			// The guards are what it takes to be connected, and this caller no
+			// longer meets them: it stops receiving now. Closing the stream or
+			// the socket is left to the transport, which still has the refusal
+			// to write down it.
+			if (this.#clients.get(clientId) === client) this.removeClient(clientId);
+			return { ok: false, denial };
 		}
 
 		// Find handler from allowlist (never dispatches to lifecycle hooks or inherited methods)
@@ -357,66 +492,78 @@ export abstract class Hub {
 	}
 
 	/**
-	 * Enforce the hub's guard / strategy / role / permission requirements against
-	 * an auth state. Returns the error envelope to send, or null when it is
-	 * authorised.
+	 * Whether `auth` meets the hub's guards: `null` when it does — always, on a
+	 * hub with none — or the refusal to answer with.
+	 *
+	 * A transport calls it where a connection is admitted (negotiate, the
+	 * stream, the socket's handshake) and {@link dispatch} on every invocation.
 	 *
 	 * Roles are ANY-of and permissions are ALL-of, and the asymmetry is
 	 * deliberate: a role names who someone is, and holding one of several
 	 * accepted roles is enough; a permission names one thing they may do, and a
-	 * handler asking for two of them needs both. It is the rule the rest of the
+	 * hub asking for two of them needs both. It is the rule the rest of the
 	 * framework applies at every other entry point — HTTP middleware, the RPC
 	 * router, the GraphQL resolver guard — so a hub agrees with the route next
 	 * to it. Written down here because reading `some` beside `every` otherwise
 	 * looks like one of them is a typo.
+	 *
+	 * An error raised by the auth layer while it answers the permission
+	 * question propagates: a resolver that cannot answer is never read as a
+	 * grant.
 	 */
-	#checkDispatchAuth(
-		auth: HubContext["auth"],
-	): { code: string; message: string } | null {
-		// `useGuards` already folded the singular `guard` into `guards`, so
-		// reading it again here answered undefined every time — a branch that
-		// could not fire, sitting next to the one that does. The normalisation
-		// has exactly one home now.
-		const requiredStrategies: string[] = this.#guards.guards ?? [];
-		const needsAuth =
-			requiredStrategies.length > 0 ||
-			(this.#guards.roles?.length ?? 0) > 0 ||
-			(this.#guards.permissions?.length ?? 0) > 0;
-
-		if (needsAuth && !auth.isAuthenticated) {
-			return { code: "E_RELAY_UNAUTHORIZED", message: "Not authenticated" };
+	async authorize(auth: HubAuth): Promise<HubDenial | null> {
+		// `useGuards` already folded the singular `guard` into `guards`: the
+		// normalisation has exactly one home.
+		const { guards, roles, permissions } = this.#guards;
+		if (guards.length === 0 && roles.length === 0 && permissions.length === 0) {
+			return null;
 		}
 
-		if (requiredStrategies.length > 0) {
-			const actualStrategy = auth.strategy;
-			if (!actualStrategy || !requiredStrategies.includes(actualStrategy)) {
+		if (!auth.isAuthenticated) {
+			return {
+				status: 401,
+				code: "E_RELAY_UNAUTHORIZED",
+				message: "Not authenticated",
+			};
+		}
+
+		// Still 401: the request is somebody, but no guard this hub accepts
+		// vouches for it — what a route's `.guard()` answers too. The message
+		// does not list the accepted guards: a refusal is not where a client
+		// learns how the application is wired.
+		if (
+			guards.length > 0 &&
+			(auth.strategy === undefined || !guards.includes(auth.strategy))
+		) {
+			return {
+				status: 401,
+				code: "E_RELAY_UNAUTHORIZED",
+				message: "Not authenticated through a guard this hub accepts",
+			};
+		}
+
+		if (roles.length > 0) {
+			// At the top level, or under the user, where an auth layer may keep
+			// them — the two places the route gate reads.
+			const held = auth.roles ?? stringList(auth.user?.roles);
+			if (!roles.some((role) => held.includes(role))) {
 				return {
-					code: "E_RELAY_UNAUTHORIZED",
-					message: `Authentication strategy mismatch (expected: ${requiredStrategies.join(", ")})`,
-				};
-			}
-		}
-
-		// Roles are ANY, permissions are ALL — deliberately asymmetric, and the
-		// same split the HTTP pipeline, the RPC router and the GraphQL engine
-		// use, so one contract holds across every entry point. A role names who
-		// someone is (an admin OR an owner may act), a permission names what an
-		// action needs (all of them, or it is not allowed).
-		if (this.#guards.roles && this.#guards.roles.length > 0) {
-			const userRoles = auth.roles ?? [];
-			if (!this.#guards.roles.some((r) => userRoles.includes(r))) {
-				return { code: "E_RELAY_FORBIDDEN", message: "Insufficient role" };
-			}
-		}
-
-		if (this.#guards.permissions && this.#guards.permissions.length > 0) {
-			const userPerms = auth.permissions ?? [];
-			if (!this.#guards.permissions.every((p) => userPerms.includes(p))) {
-				return {
+					status: 403,
 					code: "E_RELAY_FORBIDDEN",
-					message: "Insufficient permissions",
+					message: "Insufficient role",
 				};
 			}
+		}
+
+		if (
+			permissions.length > 0 &&
+			!(await holdsPermissions(auth, permissions))
+		) {
+			return {
+				status: 403,
+				code: "E_RELAY_FORBIDDEN",
+				message: "Insufficient permissions",
+			};
 		}
 
 		return null;
@@ -508,6 +655,65 @@ function deliver(
 	} catch {
 		// One client's transport is not the group's problem.
 	}
+}
+
+/**
+ * Whether the identity behind `auth` holds every permission in `required` —
+ * the rule the route, RPC and GraphQL `.permission()` gates apply, read off
+ * what the request's auth exposes.
+ *
+ * When the auth state can answer itself (`hasAllPermissions`: the auth layer
+ * resolves permissions, as a rights store does), its answer decides. Anything
+ * but `true` denies. The payload's list is only the fallback of an auth state
+ * that cannot: a permission left in a token's claims after it was revoked
+ * must not pass where the resolver says no.
+ *
+ * When the request was authenticated with an access token
+ * (`user.currentAccessToken`), each permission must ALSO be allowed by it: an
+ * intersection, never a union. A token limited to `profile` does not carry
+ * every permission of its user, and one whose `allows` cannot be called
+ * denies.
+ */
+async function holdsPermissions(
+	auth: HubAuth,
+	required: readonly string[],
+): Promise<boolean> {
+	if (typeof auth.hasAllPermissions === "function") {
+		if ((await auth.hasAllPermissions(required)) !== true) return false;
+	} else {
+		const granted = auth.permissions ?? stringList(auth.user?.permissions);
+		if (!required.every((permission) => granted.includes(permission))) {
+			return false;
+		}
+	}
+	const token: unknown = auth.user?.currentAccessToken;
+	if (token === undefined || token === null) return true;
+	if (typeof token !== "object") return false;
+	const allows: unknown = Reflect.get(token, "allows");
+	return required.every(
+		(permission) =>
+			typeof allows === "function" &&
+			Reflect.apply(allows, token, [permission]) === true,
+	);
+}
+
+/** A list of names as an auth payload carries it; anything else is none. */
+function stringList(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return value.filter((item): item is string => typeof item === "string");
+}
+
+/**
+ * A user id as one comparable string. A string is taken as given; a number or
+ * a bigint — an auto-increment primary key — as its decimal text, so `1` and
+ * the same user on the next request compare equal. Anything else cannot be
+ * compared, and matches nothing.
+ */
+export function userIdKey(id: unknown): string | undefined {
+	if (typeof id === "string" && id !== "") return id;
+	if (typeof id === "number" && Number.isSafeInteger(id)) return String(id);
+	if (typeof id === "bigint") return String(id);
+	return undefined;
 }
 
 /** What the allowlist accepts: a method taking a context and whatever follows. */

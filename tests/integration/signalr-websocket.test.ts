@@ -2,8 +2,8 @@
  * A stock `@microsoft/signalr` client against a hub mounted on a booted ream
  * application, on the native server: negotiate announces WebSockets, the
  * client takes them, invokes hub methods and receives group sends; hub guards
- * apply to what the handshake's auth carries; and the same path still serves
- * a client that asks for Server-Sent Events.
+ * decide who connects, from what the request's auth carries; and the same
+ * path still serves a client that asks for Server-Sent Events.
  */
 
 import { Ignitor, type MiddlewareFunction } from "@c9up/ream";
@@ -67,9 +67,6 @@ describe("relay > a stock SignalR client over ream's WebSockets", () => {
 
 	beforeAll(async () => {
 		const serverFactory = createHyperServerFactory();
-		if (serverFactory === undefined) {
-			throw new Error("no prebuilt HyperServer binary for this platform");
-		}
 		const webSockets = (): boolean => ignitor.getServer().supportsWebSockets();
 		ignitor = await new Ignitor({
 			port: 0,
@@ -194,12 +191,11 @@ describe("relay > a stock SignalR client over ream's WebSockets", () => {
 		);
 		expect(await member.invoke("whoami")).toBe("erin");
 
-		const visitor = await connect(
-			"/hubs/members",
-			HttpTransportType.WebSockets,
-			"frank:visitor",
-		);
-		await expect(visitor.invoke("whoami")).rejects.toThrow();
+		// Without the role there is no connection to invoke on: the negotiate
+		// is refused.
+		await expect(
+			connect("/hubs/members", HttpTransportType.WebSockets, "frank:visitor"),
+		).rejects.toThrow(/Status code '403'/);
 	});
 
 	it("refuses a socket opened on the token by anyone but its owner", async () => {

@@ -539,3 +539,120 @@ describe("relay > SignalRAdapter answers every invocation that asked", () => {
 		]);
 	});
 });
+
+describe("relay > SignalRAdapter > what the hub decides ends the connection", () => {
+	const HANDSHAKE = `{"protocol":"json","version":1}${RS}`;
+	const parsed = (frames: string[]): unknown[] =>
+		frames.map((frame) => JSON.parse(frame.slice(0, -1)));
+
+	class GuardedHub extends Hub {
+		ran = 0;
+		constructor() {
+			super();
+			this.useGuards({ permissions: ["chat.moderate"] });
+		}
+		async onPurge(): Promise<string> {
+			this.ran++;
+			return "purged";
+		}
+	}
+
+	function connected(auth: HubContext["auth"]) {
+		const hub = new GuardedHub();
+		const adapter = new SignalRAdapter(hub);
+		hub.registerClient({
+			id: "c1",
+			groups: new Set(),
+			auth,
+			send: () => {},
+		});
+		return { hub, adapter };
+	}
+
+	it("records no handshake for a client the hub does not hold", async () => {
+		const adapter = new SignalRAdapter(new TestHub());
+
+		const out = await adapter.handleFrame("never-connected", HANDSHAKE);
+
+		// Nothing closes a connection that never opened, so nothing would ever
+		// remove the record.
+		expect(adapter.hasCompletedHandshake("never-connected")).toBe(false);
+		expect(parsed(out)).toEqual([
+			{ error: "No open connection for this id" },
+			{ type: 7, error: "Handshake failed" },
+		]);
+		expect(SignalRAdapter.containsClose(out)).toBe(true);
+	});
+
+	it("answers a refused invocation with a Close, and runs nothing after it", async () => {
+		const { hub, adapter } = connected({
+			isAuthenticated: true,
+			permissions: [],
+		});
+		await adapter.handleFrame("c1", HANDSHAKE);
+		const purge = (id: string): string =>
+			`${JSON.stringify({ type: 1, invocationId: id, target: "purge", arguments: [] })}${RS}`;
+
+		const out = await adapter.handleFrame("c1", purge("1") + purge("2"));
+
+		expect(parsed(out)).toEqual([
+			{ type: 3, invocationId: "1", error: "Handler error" },
+			{ type: 7, error: "Insufficient permissions" },
+		]);
+		expect(hub.ran).toBe(0);
+		// The hub let go of the client; the handshake goes with it.
+		expect(hub.stats().clients).toBe(0);
+		expect(adapter.hasCompletedHandshake("c1")).toBe(false);
+	});
+
+	it("refuses the invocation, and says why on stderr, when the auth layer cannot answer", async () => {
+		const { hub, adapter } = connected({
+			isAuthenticated: true,
+			hasAllPermissions: async () => {
+				throw new Error("rights store unreachable");
+			},
+		});
+		await adapter.handleFrame("c1", HANDSHAKE);
+		const written = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+
+		const out = await adapter.handleFrame(
+			"c1",
+			`${JSON.stringify({ type: 1, invocationId: "1", target: "purge", arguments: [] })}${RS}`,
+		);
+
+		const logged = written.mock.calls.map((call) => String(call[0])).join("");
+		written.mockRestore();
+		// Not a grant, and not a verdict either: the connection stays.
+		expect(parsed(out)).toEqual([
+			{ type: 3, invocationId: "1", error: "Handler error" },
+		]);
+		expect(hub.ran).toBe(0);
+		expect(hub.stats().clients).toBe(1);
+		expect(logged).toContain("rights store unreachable");
+	});
+
+	it("encodes a Close, with or without a reason", () => {
+		const adapter = new SignalRAdapter(new TestHub());
+
+		expect(adapter.encodeClose()).toBe(`{"type":7}${RS}`);
+		expect(adapter.encodeClose("Going away")).toBe(
+			`{"type":7,"error":"Going away"}${RS}`,
+		);
+		expect(SignalRAdapter.containsClose([adapter.encodeClose()])).toBe(true);
+	});
+
+	it("drops a __proto__ key from an invocation's arguments", async () => {
+		const { hub, adapter, clientId } = makeAdapter();
+		await adapter.handleFrame(clientId, HANDSHAKE);
+
+		await adapter.handleFrame(
+			clientId,
+			`{"type":1,"target":"echo","arguments":[{"theme":"dark","__proto__":{"isAdmin":true}}]}${RS}`,
+		);
+
+		const data: unknown = hub.lastEcho?.data;
+		expect(Object.getOwnPropertyNames(data)).toEqual(["theme"]);
+	});
+});

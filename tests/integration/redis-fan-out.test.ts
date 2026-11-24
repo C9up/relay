@@ -74,9 +74,6 @@ if (url !== undefined) {
 
 		async function start(name: string): Promise<Instance> {
 			const serverFactory = createHyperServerFactory();
-			if (serverFactory === undefined) {
-				throw new Error("no prebuilt HyperServer binary for this platform");
-			}
 			const connection = new QuasarConnection(name, { url });
 			const relay = new Relay({
 				transport: new RedisRelayTransport(connection),

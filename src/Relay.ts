@@ -37,7 +37,8 @@ import {
 	E_RELAY_TRANSPORT_SUPERSEDED,
 	E_RELAY_TRANSPORT_UNRELEASED,
 } from "./errors.js";
-import type { HubFanOut } from "./Hub.js";
+import type { Hub, HubFanOut } from "./Hub.js";
+import type { SignalRAdapter } from "./SignalRAdapter.js";
 
 /**
  * Event name the keep-alive goes out under. Prefixed so it cannot collide with
@@ -82,15 +83,6 @@ export interface RelaySseStream {
 	onClose(cb: () => void): void;
 	end(): Promise<void>;
 }
-
-/**
- * What {@link Relay.hub} accepts. Structural on purpose: the relay records a
- * hub and hands it to the transport, and never calls into it itself.
- */
-export type HubLike = object;
-
-/** Likewise for an optional pre-built SignalR adapter. */
-export type SignalRAdapterLike = object;
 
 /** Auth state forwarded to authorize callbacks. */
 export interface RelayAuth {
@@ -489,7 +481,7 @@ export class Relay {
 	/** Hubs mounted with {@link hub}, keyed by path. */
 	readonly #hubs = new Map<
 		string,
-		{ path: string; hub: HubLike; adapter?: SignalRAdapterLike }
+		{ path: string; hub: Hub; adapter?: SignalRAdapter }
 	>();
 	readonly #config: Required<
 		Pick<
@@ -898,7 +890,7 @@ export class Relay {
 	 * a route silently shadowed is how half an application stops answering with
 	 * nothing in the log.
 	 */
-	hub(path: string, hub: HubLike, adapter?: SignalRAdapterLike): void {
+	hub(path: string, hub: Hub, adapter?: SignalRAdapter): void {
 		if (this.#hubs.has(path)) {
 			throw new E_RELAY_HUB_PATH_TAKEN([path]);
 		}
@@ -958,8 +950,8 @@ export class Relay {
 	/** @internal The hubs recorded so far. */
 	mountedHubs(): Array<{
 		path: string;
-		hub: HubLike;
-		adapter?: SignalRAdapterLike;
+		hub: Hub;
+		adapter?: SignalRAdapter;
 	}> {
 		return [...this.#hubs.values()];
 	}

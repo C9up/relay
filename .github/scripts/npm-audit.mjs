@@ -43,6 +43,7 @@ import { spawnSync } from "node:child_process";
 import {
 	existsSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
@@ -112,12 +113,30 @@ function run(command, commandArgs, cwd) {
 	});
 }
 
+/**
+ * The package's own platform packages (`npm/<suffix>/package.json`): binaries
+ * with no dependency of their own, published by this repository's publish job
+ * right before the package. Resolving them here would ask npm for a version
+ * that job has not published yet.
+ */
+function ownPlatformPackages() {
+	const dir = join(root, "npm");
+	if (!existsSync(dir)) return new Set();
+	const names = new Set();
+	for (const suffix of readdirSync(dir)) {
+		const path = join(dir, suffix, "package.json");
+		if (existsSync(path)) names.add(readJson(path).name);
+	}
+	return names;
+}
+
 function productionTree(manifest) {
 	const tree = {
 		...(manifest.peerDependencies ?? {}),
 		...(manifest.optionalDependencies ?? {}),
 		...(manifest.dependencies ?? {}),
 	};
+	for (const name of ownPlatformPackages()) delete tree[name];
 	for (const [name, spec] of Object.entries(tree)) {
 		if (/^(workspace|link|file|portal):/.test(spec)) {
 			fail(

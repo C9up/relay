@@ -23,6 +23,7 @@
 import { randomUUID } from "node:crypto";
 import { E_RELAY_MAX_PENDING } from "./errors.js";
 import type { DispatchResult, Hub, HubContext } from "./Hub.js";
+import { safeJsonParse } from "./safeJsonParse.js";
 
 /** SignalR record separator — every JSON message ends with this byte. */
 const RS = "\x1e";
@@ -52,6 +53,17 @@ const DEFAULT_MAX_CONNECTIONS_PER_OWNER = 20;
 /** The SignalR client's own default handshake timeout. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_CONNECTIONS = 10_000;
+/**
+ * Messages one connection may have received and not yet started.
+ *
+ * A connection's messages run one after another — an answer must not overtake
+ * the handshake reply, and a hub method may count on the order its client
+ * called in — so a client that sends faster than a hub method answers builds a
+ * backlog on the server. Bounded here, the backlog costs at most this many
+ * messages of `maxFrameSize` each; the transport closes a connection that
+ * goes past it. The figure is the one ream's JSON-RPC socket queues at.
+ */
+const DEFAULT_MAX_QUEUED_MESSAGES = 256;
 
 /** A token handed out by `negotiate`, before or after its stream attaches. */
 interface IssuedToken {
@@ -162,6 +174,7 @@ export class SignalRAdapter {
 	readonly #maxConnections: number;
 	readonly #maxPendingTokensPerOwner: number | false;
 	readonly #maxConnectionsPerOwner: number | false;
+	readonly #maxQueuedMessages: number;
 
 	constructor(
 		hub: Hub,
@@ -190,6 +203,14 @@ export class SignalRAdapter {
 			 * address is not the proxy's.
 			 */
 			maxConnectionsPerOwner?: number | false;
+			/**
+			 * How many messages one connection may have sent that the hub has
+			 * not started yet. Default 256. Past it a socket is closed with
+			 * `1013` and an upstream POST is refused with 429; what was waiting
+			 * is dropped. Every record counts, however many one WebSocket
+			 * message or one POST body packs together.
+			 */
+			maxQueuedMessages?: number;
 		},
 	) {
 		this.#hub = hub;
@@ -204,6 +225,18 @@ export class SignalRAdapter {
 			options?.maxPendingTokensPerOwner ?? DEFAULT_MAX_PENDING_TOKENS_PER_OWNER;
 		this.#maxConnectionsPerOwner =
 			options?.maxConnectionsPerOwner ?? DEFAULT_MAX_CONNECTIONS_PER_OWNER;
+		const maxQueued = options?.maxQueuedMessages;
+		// A bound that is not a positive integer would be no bound at all
+		// (`NaN` compares false with everything): the default stands instead.
+		this.#maxQueuedMessages =
+			maxQueued !== undefined && Number.isInteger(maxQueued) && maxQueued > 0
+				? maxQueued
+				: DEFAULT_MAX_QUEUED_MESSAGES;
+	}
+
+	/** How many messages one connection may have waiting for the hub. */
+	get maxQueuedMessages(): number {
+		return this.#maxQueuedMessages;
 	}
 
 	/** How many streams one owner may hold open, or `false` for no limit. */
@@ -368,6 +401,20 @@ export class SignalRAdapter {
 
 		for (const raw of messages) {
 			if (!this.#handshakes.has(clientId)) {
+				// A handshake is recorded for a connection the hub holds, and
+				// for nothing else: a record kept for an id that never opened a
+				// stream had nothing to remove it, since only a connection's
+				// close forgets one.
+				if (this.#hub.authFor(clientId) === undefined) {
+					out.push(this.#encode({ error: "No open connection for this id" }));
+					out.push(
+						this.#encode({
+							type: 7,
+							error: "Handshake failed",
+						} satisfies CloseMessage),
+					);
+					return out;
+				}
 				// Expecting handshake
 				if (!isHandshakeRequest(this.#tryParse(raw))) {
 					out.push(
@@ -433,10 +480,17 @@ export class SignalRAdapter {
 							auth === undefined
 								? await this.#hub.dispatch(clientId, inv.target, ...args)
 								: await this.#hub.dispatchAs(clientId, auth, inv.target, args);
-					} catch {
+					} catch (error) {
 						// dispatch() reports failures via its return; guard against an
 						// unexpected throw so one bad invocation can't abort the whole
-						// frame batch.
+						// frame batch. What reaches here is the auth layer failing to
+						// answer a guard: the invocation is refused, and the reason
+						// is said where an operator reads it.
+						process.stderr.write(
+							`[relay/signalr] invocation from ${clientId} failed: ${
+								error instanceof Error ? error.message : String(error)
+							}\n`,
+						);
 					}
 					// Only a request-style invocation (with an invocationId) expects
 					// a Completion. A failed handler MUST answer with an error
@@ -454,6 +508,20 @@ export class SignalRAdapter {
 										"Handler error",
 									),
 						);
+					}
+					// The hub's guards refused the caller: it no longer meets what
+					// it takes to be connected. The Close tells the client why and
+					// the transport to end the connection; nothing after it in the
+					// frame runs.
+					if (!dispatched.ok && dispatched.denial !== undefined) {
+						this.#handshakes.delete(clientId);
+						out.push(
+							this.#encode({
+								type: 7,
+								error: dispatched.denial.message,
+							} satisfies CloseMessage),
+						);
+						return out;
 					}
 					break;
 				}
@@ -537,6 +605,19 @@ export class SignalRAdapter {
 		} satisfies InvocationMessage);
 	}
 
+	/**
+	 * A Close frame, for a transport ending a connection from the server's
+	 * side: a client reads it and stops, instead of waiting on a stream that
+	 * went quiet. `error`, when given, is what the client reports.
+	 */
+	encodeClose(error?: string): string {
+		return this.#encode(
+			(error === undefined
+				? { type: 7 }
+				: { type: 7, error }) satisfies CloseMessage,
+		);
+	}
+
 	/** Forget a client's handshake state when it disconnects. */
 	forget(clientId: string): void {
 		this.#handshakes.delete(clientId);
@@ -559,10 +640,16 @@ export class SignalRAdapter {
 		return frame.split(RS).filter((s) => s.length > 0);
 	}
 
-	/** Parse a frame, or answer `undefined` when it is not JSON at all. */
+	/**
+	 * Parse a frame, or answer `undefined` when it is not JSON at all.
+	 *
+	 * Without prototype poisoning: an invocation's arguments go to the hub
+	 * method as they are, and a `__proto__` key in one would swap the
+	 * prototype of whatever the method `Object.assign`s it into.
+	 */
 	#tryParse(raw: string): unknown {
 		try {
-			return JSON.parse(raw);
+			return safeJsonParse(raw);
 		} catch {
 			return undefined;
 		}

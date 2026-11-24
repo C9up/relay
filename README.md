@@ -17,9 +17,14 @@
 can upgrade — ream's `server.supportsWebSockets()`, true once its native
 server listens (ream 0.2.32 or later) — and Server-Sent Events always. On an
 older ream, or another host, hubs run over SSE alone. The socket and the SSE
-stream share the hub's path. Over a socket, every invocation is checked
-against the handshake's auth (the only request a socket has); over SSE,
-against the POST that carries it.
+stream share the hub's path.
+
+A hub's `useGuards()` is what it takes to connect: negotiate, the stream and
+the socket's handshake answer a client the guards refuse with `401` or `403`,
+before anything opens. Every invocation is checked again — against the
+handshake's auth over a socket (the only request a socket has), against the
+POST that carries it over SSE — and one the guards refuse ends the connection.
+`hub.disconnectUser(id)` ends the connections of a user who logs out.
 
 Part of **[Ream](https://github.com/C9up/ream)** — a Rust-powered Node.js framework. Independent, publishable package.
 

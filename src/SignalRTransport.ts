@@ -26,7 +26,7 @@
  * client reads. Over a socket, each is one text message.
  */
 
-import type { Hub, HubContext } from "./Hub.js";
+import { type Hub, type HubAuth, type HubContext, userIdKey } from "./Hub.js";
 import { SignalRAdapter } from "./SignalRAdapter.js";
 
 /** SignalR record separator: every JSON message ends with it. */
@@ -68,6 +68,12 @@ export interface HubHttpContext {
 		user?: Record<string, unknown>;
 		roles?: string[];
 		permissions?: string[];
+		/**
+		 * The auth layer's own answer to a permission question (Warden's
+		 * Authenticator asks its rights resolver). A hub's `permissions` guard
+		 * asks it rather than reading the payload's list.
+		 */
+		hasAllPermissions?(permissions: readonly string[]): Promise<boolean>;
 	};
 }
 
@@ -156,6 +162,10 @@ const WS_NORMAL = 1000;
 const WS_GOING_AWAY = 1001;
 const WS_UNSUPPORTED_DATA = 1003;
 const WS_INTERNAL_ERROR = 1011;
+const WS_TRY_AGAIN_LATER = 1013;
+
+/** The longest delay a timer takes: 2^31 - 1 ms, a little under 25 days. */
+const MAX_TIMER_MS = 2_147_483_647;
 
 function socketDownstream(socket: HubSocket): Downstream {
 	return {
@@ -179,22 +189,45 @@ function readConnectionToken(url: string): string | undefined {
 	return new URLSearchParams(url.slice(q + 1)).get("id") ?? undefined;
 }
 
-/** Normalise the auth slice a Hub context expects. */
-function hubAuth(ctx: HubHttpContext): {
-	isAuthenticated: boolean;
-	strategy?: string;
-	user?: Record<string, unknown>;
-	roles?: string[];
-	permissions?: string[];
-} {
+/**
+ * The request's auth as a hub reads it.
+ *
+ * `hasAllPermissions` stays bound to the request's own auth object, so a
+ * `permissions` guard asks the auth layer — and asks it again on every
+ * invocation — instead of reading a list copied when the request arrived.
+ */
+function hubAuth(ctx: HubHttpContext): HubAuth {
+	const auth = ctx.auth;
+	const ask = auth?.hasAllPermissions;
 	return {
-		isAuthenticated: ctx.auth?.isAuthenticated === true,
+		isAuthenticated: auth?.isAuthenticated === true,
 		// The hub's guard check compares its `guards` with this.
-		strategy: ctx.auth?.authenticatedViaGuard,
-		user: ctx.auth?.user,
-		roles: ctx.auth?.roles,
-		permissions: ctx.auth?.permissions,
+		strategy: auth?.authenticatedViaGuard,
+		user: auth?.user,
+		roles: auth?.roles,
+		permissions: auth?.permissions,
+		...(auth !== undefined && typeof ask === "function"
+			? {
+					hasAllPermissions: (required: readonly string[]) =>
+						ask.call(auth, required),
+				}
+			: {}),
 	};
+}
+
+/**
+ * When the access token a request authenticated with stops being valid, in
+ * epoch milliseconds — `user.currentAccessToken.expiresAt`, where a token
+ * guard puts it. `undefined` for a request without a token, or with one that
+ * does not expire.
+ */
+function accessTokenExpiry(auth: HubAuth): number | undefined {
+	const token: unknown = auth.user?.currentAccessToken;
+	if (typeof token !== "object" || token === null) return undefined;
+	const expiresAt: unknown = Reflect.get(token, "expiresAt");
+	if (!(expiresAt instanceof Date)) return undefined;
+	const time = expiresAt.getTime();
+	return Number.isNaN(time) ? undefined : time;
 }
 
 /**
@@ -221,13 +254,8 @@ function identityOf(
 		| undefined,
 ): Identity {
 	if (auth?.isAuthenticated !== true) return { kind: "anonymous" };
-	const id = auth.user?.id;
-	if (typeof id === "string" && id !== "") return { kind: "user", id };
-	if (typeof id === "number" && Number.isSafeInteger(id)) {
-		return { kind: "user", id: String(id) };
-	}
-	if (typeof id === "bigint") return { kind: "user", id: String(id) };
-	return { kind: "unusable" };
+	const id = userIdKey(auth.user?.id);
+	return id === undefined ? { kind: "unusable" } : { kind: "user", id };
 }
 
 /**
@@ -296,8 +324,49 @@ export function splitFrames(body: string): string[] {
 }
 
 /**
+ * Frames that arrived together — one WebSocket message, or one POST body —
+ * waiting for the hub.
+ */
+interface Batch {
+	frames: string[];
+	/** The auth each frame is authorized against, read when it runs. */
+	auth: () => HubAuth;
+	resolve: () => void;
+	reject: (error: unknown) => void;
+}
+
+/** One open connection: where its frames go, and what it has sent that waits. */
+interface Connection {
+	readonly downstream: Downstream;
+	/** Batches received and not started, oldest first. */
+	readonly inbox: Batch[];
+	/** Frames received and not started — what `maxQueuedMessages` bounds. */
+	queued: number;
+	/** Whether a batch is being handed to the hub. */
+	running: boolean;
+	/** Set once the connection is over: nothing it sent runs after that. */
+	ended: boolean;
+	/**
+	 * The hub context of a connection whose handshake is still pending:
+	 * `onConnect` runs once the handshake is answered, never before — a frame
+	 * sent ahead of the handshake reply makes the SignalR client refuse the
+	 * connection.
+	 */
+	awaiting: HubContext | undefined;
+	handshakeTimer: ReturnType<typeof setTimeout> | undefined;
+	expiryTimer: ReturnType<typeof setTimeout> | undefined;
+}
+
+/**
  * Register the routes one hub needs: negotiate, the SSE stream and its
  * upstream POST, and — on a router that has them — the WebSocket route.
+ *
+ * The hub's guards (`useGuards`) are what it takes to connect: negotiate, the
+ * stream and the socket's handshake each ask them and answer a refusal with
+ * plain HTTP — `401` or `403` — before a token is issued, a stream opened or
+ * a client registered. As ASP.NET Core SignalR does for `[Authorize]` on a
+ * hub class, and unlike a middleware on the routes, the requirement belongs
+ * to the hub: it does not depend on what else is mounted, or in which order.
  *
  * Returns the route objects so a caller can apply middleware to them the way
  * `relay.registerRoutes()` customizes the relay's own.
@@ -333,14 +402,23 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		});
 		return true;
 	};
-	/** Live connections by connectionId, so an upstream frame can answer downstream. */
-	const connections = new Map<string, Downstream>();
 	/**
-	 * Hub contexts of connections whose handshake is still pending: `onConnect`
-	 * runs once the handshake is answered, never before — a frame sent ahead of
-	 * the handshake reply makes the SignalR client refuse the connection.
+	 * Whether the hub's guards refuse this request, answering the refusal
+	 * itself when they do: `401` for a request that is not authenticated (or
+	 * not through an accepted guard), `403` for one without the role or the
+	 * permissions. Asked before anything else, so a refused request learns
+	 * nothing about tokens and takes no slot.
 	 */
-	const awaitingHandshake = new Map<string, HubContext>();
+	const refusedByGuards = async (ctx: Ctx): Promise<boolean> => {
+		const denial = await hub.authorize(hubAuth(ctx));
+		if (denial === null) return false;
+		ctx.response.status(denial.status).json({
+			error: { code: denial.code, message: denial.message },
+		});
+		return true;
+	};
+	/** Live connections by connectionId, so an upstream frame can answer downstream. */
+	const connections = new Map<string, Connection>();
 	/** Open connections per owner, and the owner each client id counts against. */
 	const perOwner = new Map<string, number>();
 	const ownerOfClient = new Map<string, string>();
@@ -353,6 +431,7 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 
 	const negotiate = router.post(`${path}/negotiate`, async (ctx) => {
 		if (refuseWhileClosed(ctx)) return;
+		if (await refusedByGuards(ctx)) return;
 		const owner = ownerOf(ctx);
 		if (!adapter.admits(owner)) {
 			ctx.response.status(503).json({
@@ -380,15 +459,21 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 	 * itself when not. Both transports answer it BEFORE anything opens: a 400
 	 * written after an SSE upgrade reaches the client as a half-open
 	 * connection, and a refused WebSocket handshake gets plain HTTP, no socket.
+	 *
+	 * The guards are asked again here, not only at negotiate: a token is
+	 * handed out to whoever negotiated, and what opens the connection is this
+	 * request.
 	 */
-	function admit(ctx: Ctx):
+	async function admit(ctx: Ctx): Promise<
 		| {
 				clientId: string;
 				token: string;
 				owner: string | undefined;
-				previous: Downstream | undefined;
+				previous: Connection | undefined;
 		  }
-		| undefined {
+		| undefined
+	> {
+		if (await refusedByGuards(ctx)) return undefined;
 		const token = readConnectionToken(ctx.request.url(true));
 		const clientId = token ? adapter.resolveToken(token) : undefined;
 		if (token === undefined || clientId === undefined) {
@@ -438,40 +523,47 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		return { clientId, token, owner, previous };
 	}
 
-	/**
-	 * Register an admitted connection on the hub. Returns the function its
-	 * close must call.
-	 */
+	/** Register an admitted connection on the hub. */
 	function attach(
 		ctx: Ctx,
-		admitted: NonNullable<ReturnType<typeof admit>>,
+		admitted: NonNullable<Awaited<ReturnType<typeof admit>>>,
 		downstream: Downstream,
-	): () => void {
+	): Connection {
 		const { clientId, token, owner, previous } = admitted;
+		const connection: Connection = {
+			downstream,
+			inbox: [],
+			queued: 0,
+			running: false,
+			ended: false,
+			awaiting: undefined,
+			handshakeTimer: undefined,
+			expiryTimer: undefined,
+		};
 		// The token is in use now, so it stops counting against the unclaimed
 		// budget and stops expiring.
 		adapter.claimToken(token);
-		connections.set(clientId, downstream);
+		connections.set(clientId, connection);
 		// A reopened connection for the same client id takes over its slot.
 		if (previous === undefined && owner !== undefined) {
 			perOwner.set(owner, (perOwner.get(owner) ?? 0) + 1);
 			ownerOfClient.set(clientId, owner);
 		}
 		// The same token opened again: the older connection would stay open and
-		// unused. Its close is ignored below, since it is no longer the one
-		// registered.
-		if (previous?.isOpen()) void previous.end().catch(() => {});
+		// unused. It is no longer the one registered, so ending it leaves the
+		// new one alone.
+		if (previous !== undefined) void end(clientId, previous);
 		// A connection that never completes the handshake is closed: its token
 		// no longer expires, so nothing else would ever end it.
-		const handshakeTimer = setTimeout(() => {
+		connection.handshakeTimer = setTimeout(() => {
 			if (
 				!adapter.hasCompletedHandshake(clientId) &&
-				connections.get(clientId) === downstream
+				connections.get(clientId) === connection
 			) {
-				void downstream.end().catch(() => {});
+				void end(clientId, connection);
 			}
 		}, adapter.handshakeTimeoutMs);
-		handshakeTimer.unref?.();
+		connection.handshakeTimer.unref?.();
 		const send = (event: string, data: unknown): void => {
 			// A hub send is fire-and-forget by contract — the caller returns
 			// nothing — so a rejection here had nobody to reject to and took the
@@ -486,64 +578,152 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 					);
 				});
 		};
-		const context = hub.registerClient({
+		const auth = hubAuth(ctx);
+		connection.awaiting = hub.registerClient({
 			id: clientId,
 			groups: new Set<string>(),
-			auth: hubAuth(ctx),
+			auth,
 			send,
+			close: () => {
+				void end(clientId, connection);
+			},
 		});
-		awaitingHandshake.set(clientId, context);
-		return () => {
-			clearTimeout(handshakeTimer);
-			release(clientId, downstream);
-		};
+		// A connection lives no longer than the access token that opened it:
+		// nothing re-authenticates a stream that only listens, so without this
+		// an expired token went on receiving for as long as it stayed open.
+		const expiresAt = accessTokenExpiry(auth);
+		if (expiresAt !== undefined) endAt(expiresAt, clientId, connection);
+		return connection;
+	}
+
+	/** End `connection` once `time` has come, however far away that is. */
+	function endAt(time: number, clientId: string, connection: Connection): void {
+		const left = Math.max(time - Date.now(), 0);
+		connection.expiryTimer = setTimeout(
+			() => {
+				if (connection.ended) return;
+				// A delay longer than a timer takes is waited in several legs.
+				if (Date.now() < time) endAt(time, clientId, connection);
+				else void end(clientId, connection);
+			},
+			Math.min(left, MAX_TIMER_MS),
+		);
+		connection.expiryTimer.unref?.();
 	}
 
 	/**
-	 * Hand one request's or one message's frames to the hub, in order, and
-	 * write what it answers down the connection's downstream.
+	 * Take what a connection sent into its queue. Resolves once every frame
+	 * has been handled, or dropped because the connection ended; rejects with
+	 * what handling one threw. `undefined` when the queue has no room: nothing
+	 * was taken, and the caller refuses.
+	 *
+	 * A connection's frames are handled one after another, whichever requests
+	 * or messages carried them: an invocation's answer must not overtake the
+	 * handshake reply, and a hub method may rely on the order its client
+	 * called in — one invocation at a time per connection, as SignalR's
+	 * `MaximumParallelInvocationsPerClient` defaults to. So a client that sends
+	 * faster than a hub method answers builds a backlog here, and the server
+	 * under the socket cannot push back for us: it stops reading only while a
+	 * listener BLOCKS, and a hub method that awaits does not. The backlog is
+	 * therefore counted — every frame, however many one message packs — and a
+	 * connection past `maxQueuedMessages` is refused, as ream's JSON-RPC socket
+	 * does.
 	 */
-	async function deliver(
+	function accept(
 		clientId: string,
-		body: string,
-		auth: HubContext["auth"],
+		connection: Connection,
+		frames: string[],
+		auth: () => HubAuth,
+	): Promise<void> | undefined {
+		if (connection.queued + frames.length > adapter.maxQueuedMessages) {
+			return undefined;
+		}
+		connection.queued += frames.length;
+		return new Promise<void>((resolve, reject) => {
+			connection.inbox.push({ frames, auth, resolve, reject });
+			void run(clientId, connection);
+		});
+	}
+
+	/** Hand a connection's waiting batches to the hub, oldest first. */
+	async function run(clientId: string, connection: Connection): Promise<void> {
+		if (connection.running) return;
+		connection.running = true;
+		for (
+			let batch = connection.inbox.shift();
+			batch !== undefined;
+			batch = connection.inbox.shift()
+		) {
+			let started = 0;
+			try {
+				for (const frame of batch.frames) {
+					// What has not started when the connection ends never will:
+					// nobody is left to read the answer.
+					if (connection.ended) break;
+					started++;
+					connection.queued--;
+					await deliverFrame(clientId, connection, frame, batch.auth());
+				}
+				batch.resolve();
+			} catch (error) {
+				batch.reject(error);
+			} finally {
+				connection.queued -= batch.frames.length - started;
+			}
+		}
+		connection.running = false;
+	}
+
+	/** Hand one frame to the hub and write what it answers down the connection. */
+	async function deliverFrame(
+		clientId: string,
+		connection: Connection,
+		frame: string,
+		auth: HubAuth,
 	): Promise<void> {
-		const downstream = connections.get(clientId);
-		for (const frame of splitFrames(body)) {
-			// A Close from the CLIENT is the client saying it is done. The
-			// adapter answers it with nothing — correctly, the protocol asks for
-			// no reply — so watching only the outbound frames meant a graceful
-			// disconnect left the connection open until the socket happened to
-			// drop.
-			const clientClosed = SignalRAdapter.containsClose([frame]);
-			const outbound = await adapter.handleFrame(clientId, frame, auth);
-			for (const out of outbound) {
-				// No downstream yet means the client posted before opening the
-				// GET. The frames are dropped rather than queued: SignalR's own
-				// client opens the stream first, and buffering for a connection
-				// that may never arrive is how a hub leaks memory.
-				if (downstream?.isOpen()) await downstream.send(out);
-			}
-			// The handshake reply is out: the hub may speak now.
-			const pending = awaitingHandshake.get(clientId);
-			if (pending !== undefined && adapter.hasCompletedHandshake(clientId)) {
-				awaitingHandshake.delete(clientId);
+		const { downstream } = connection;
+		// A Close from the CLIENT is the client saying it is done. The
+		// adapter answers it with nothing — correctly, the protocol asks for
+		// no reply — so watching only the outbound frames meant a graceful
+		// disconnect left the connection open until the socket happened to
+		// drop.
+		const clientClosed = SignalRAdapter.containsClose([frame]);
+		const outbound = await adapter.handleFrame(clientId, frame, auth);
+		for (const out of outbound) {
+			if (downstream.isOpen()) await downstream.send(out);
+		}
+		// The handshake reply is out: the hub may speak now.
+		const pending = connection.awaiting;
+		if (pending !== undefined && adapter.hasCompletedHandshake(clientId)) {
+			connection.awaiting = undefined;
+			try {
 				await hub.onConnect(pending);
+			} catch (error) {
+				// A hub that throws from `onConnect` has refused the connection:
+				// it comes off the hub here, and whoever carried the frame closes
+				// the stream or the socket. It used to stay registered — over
+				// Server-Sent Events the POST failed and the stream went on
+				// receiving every broadcast.
+				release(clientId, connection);
+				throw error;
 			}
-			if (clientClosed || SignalRAdapter.containsClose(outbound)) {
-				await downstream?.end();
-				break;
-			}
+		}
+		// A Close in the answer is the adapter ending the connection: a failed
+		// handshake, or guards that refused an invocation.
+		if (clientClosed || SignalRAdapter.containsClose(outbound)) {
+			await end(clientId, connection, { said: true });
 		}
 	}
 
 	const stream = router.get(path, async (ctx) => {
 		if (refuseWhileClosed(ctx)) return;
-		const admitted = admit(ctx);
+		const admitted = await admit(ctx);
 		if (admitted === undefined) return;
 		const sse = await ctx.response.sse();
-		const released = attach(ctx, admitted, sseDownstream(sse));
-		sse.onClose(released);
+		const connection = attach(ctx, admitted, sseDownstream(sse));
+		sse.onClose(() => {
+			release(admitted.clientId, connection);
+		});
 	});
 
 	const send = router.post(path, async (ctx) => {
@@ -573,9 +753,46 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 			return;
 		}
 
+		// Frames are taken for a connection that exists. One posted before its
+		// stream opened used to reach the adapter all the same, which recorded
+		// a handshake for a connection nothing would ever close.
+		const connection = connections.get(clientId);
+		if (connection === undefined || connection.ended) {
+			ctx.response.status(400).json({
+				error: {
+					code: "E_RELAY_NOT_CONNECTED",
+					message: "This connection has no open stream — open it first.",
+				},
+			});
+			return;
+		}
+
 		// Authorized against THIS request, not the one that opened the stream:
-		// a role revoked since then stops working now.
-		await deliver(clientId, ctx.request.raw(), hubAuth(ctx));
+		// a role revoked since then is refused now, and ends the connection.
+		const auth = hubAuth(ctx);
+		const handled = accept(
+			clientId,
+			connection,
+			splitFrames(ctx.request.raw()),
+			() => auth,
+		);
+		if (handled === undefined) {
+			ctx.response.status(429).json({
+				error: {
+					code: "E_RELAY_MAX_QUEUED",
+					message: "Too many messages are waiting on this connection.",
+				},
+			});
+			return;
+		}
+		try {
+			await handled;
+		} catch (error) {
+			// Handling a frame failed: the connection is over, as a socket's is
+			// (closed 1011), and the host answers this POST with the error.
+			await end(clientId, connection);
+			throw error;
+		}
 		// SignalR expects an empty 200 for an accepted upstream batch.
 		ctx.response.status(200).json({});
 	});
@@ -586,42 +803,65 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 	 *
 	 * A socket has one request, its handshake, so every frame on it is
 	 * authorized against the handshake's auth — where an SSE upstream POST is
-	 * authorized against its own. A role revoked mid-connection therefore
-	 * takes effect on the next connection, as in ASP.NET Core SignalR, whose
+	 * authorized against its own. That auth is read again for each frame: a
+	 * `permissions` guard asks the auth layer every time, so a permission
+	 * taken away mid-connection ends the socket at its next invocation. A role
+	 * is what the handshake carried, as in ASP.NET Core SignalR, whose
 	 * WebSocket transport authenticates once too.
 	 */
 	const socket = router.ws?.(path, async (ctx) => {
 		if (refuseWhileClosed(ctx)) return;
-		const admitted = admit(ctx);
+		const admitted = await admit(ctx);
 		if (admitted === undefined) return;
 		const { clientId } = admitted;
 		const ws = ctx.socket;
-		const downstream = socketDownstream(ws);
-		const released = attach(ctx, admitted, downstream);
-		const auth = hubAuth(ctx);
-		// Messages are handled one after another, as SSE posts are: an
-		// invocation's answer must not overtake the handshake reply.
-		let queue: Promise<void> = Promise.resolve();
+		const connection = attach(ctx, admitted, socketDownstream(ws));
+		const auth = (): HubAuth => hubAuth(ctx);
 		ws.on("message", (data, isBinary) => {
+			if (connection.ended) return;
 			if (isBinary || typeof data !== "string") {
 				// The JSON protocol is text; a binary message is a client
 				// speaking something else (MessagePack), refused as such.
 				ws.close(WS_UNSUPPORTED_DATA, "text frames only");
 				return;
 			}
-			queue = queue.then(() =>
-				deliver(clientId, data, auth).catch((error: unknown) => {
-					process.stderr.write(
-						`[relay/signalr] frame from ${clientId} failed: ${
-							error instanceof Error ? error.message : String(error)
-						}\n`,
-					);
-					ws.close(WS_INTERNAL_ERROR);
-				}),
-			);
+			const handled = accept(clientId, connection, splitFrames(data), auth);
+			if (handled === undefined) {
+				// Off the hub before the close is even acknowledged: a client
+				// that floods must not go on receiving meanwhile.
+				release(clientId, connection);
+				ws.close(WS_TRY_AGAIN_LATER, "Too many hub messages waiting");
+				return;
+			}
+			handled.catch((error: unknown) => {
+				process.stderr.write(
+					`[relay/signalr] frame from ${clientId} failed: ${
+						error instanceof Error ? error.message : String(error)
+					}\n`,
+				);
+				release(clientId, connection);
+				ws.close(WS_INTERNAL_ERROR);
+			});
 		});
-		ws.on("close", released);
+		ws.on("close", () => {
+			release(clientId, connection);
+		});
 	});
+
+	/**
+	 * Stop running what a connection sent: it is over. The batches still
+	 * waiting are settled so a POST holding one can answer, and the timers
+	 * that would end the connection later are dropped.
+	 */
+	function discard(connection: Connection): void {
+		connection.ended = true;
+		clearTimeout(connection.handshakeTimer);
+		clearTimeout(connection.expiryTimer);
+		for (const batch of connection.inbox.splice(0)) {
+			connection.queued -= batch.frames.length;
+			batch.resolve();
+		}
+	}
 
 	/**
 	 * Forget a connection that has closed.
@@ -633,10 +873,10 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 	 * dropped its tokens, leaving a socket that was open and could no longer
 	 * receive anything.
 	 */
-	function release(clientId: string, downstream: Downstream): void {
-		if (connections.get(clientId) !== downstream) return;
+	function release(clientId: string, connection: Connection): void {
+		discard(connection);
+		if (connections.get(clientId) !== connection) return;
 		connections.delete(clientId);
-		awaitingHandshake.delete(clientId);
 		const owner = ownerOfClient.get(clientId);
 		if (owner !== undefined) {
 			ownerOfClient.delete(clientId);
@@ -650,15 +890,38 @@ export function registerHubRoutes<Ctx extends HubHttpContext, Route>(
 		adapter.forget(clientId);
 	}
 
+	/**
+	 * End a connection from the server's side: off the hub first — it receives
+	 * nothing from here on — then its stream or socket is closed. A socket
+	 * reports its close later, and by then there is nothing left to release.
+	 *
+	 * The client is told with a Close frame, unless one already went by
+	 * (`said`) or the handshake never completed: a SignalR client stops on a
+	 * Close, where a stream that merely goes quiet leaves it waiting for its
+	 * own timeout.
+	 */
+	async function end(
+		clientId: string,
+		connection: Connection,
+		how: { said?: boolean; goingAway?: boolean } = {},
+	): Promise<void> {
+		const announce =
+			how.said !== true &&
+			connections.get(clientId) === connection &&
+			adapter.hasCompletedHandshake(clientId);
+		release(clientId, connection);
+		const { downstream } = connection;
+		if (!downstream.isOpen()) return;
+		if (announce) await downstream.send(adapter.encodeClose()).catch(() => {});
+		await downstream.end(how.goingAway === true).catch(() => {});
+	}
+
 	const close = async (): Promise<void> => {
 		closed = true;
 		await Promise.all(
-			[...connections].map(async ([clientId, downstream]) => {
-				await downstream.end(true).catch(() => {});
-				// A connection whose end did not report its close is released
-				// here, or its client stays registered on the hub.
-				release(clientId, downstream);
-			}),
+			[...connections].map(([clientId, connection]) =>
+				end(clientId, connection, { goingAway: true }),
+			),
 		);
 	};
 	const reopen = (): void => {
